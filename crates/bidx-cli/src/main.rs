@@ -1,10 +1,34 @@
 use anyhow::{Context, Result};
 use bench::{run_bench, BenchConfig};
+use bidx_core::Network;
 use clap::{Parser, Subcommand};
+
+/// CLI-facing network enum (mirrors bidx_core::Network but is clap-typed).
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum NetworkArg {
+    Mainnet,
+    Testnet3,
+    Testnet4,
+    Signet,
+    Regtest,
+}
+
+impl From<NetworkArg> for Network {
+    fn from(a: NetworkArg) -> Self {
+        match a {
+            NetworkArg::Mainnet => Network::Mainnet,
+            NetworkArg::Testnet3 => Network::Testnet3,
+            NetworkArg::Testnet4 => Network::Testnet4,
+            NetworkArg::Signet => Network::Signet,
+            NetworkArg::Regtest => Network::Regtest,
+        }
+    }
+}
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 mod bench;
+mod diskguard;
 mod live;
 mod pipeline;
 
@@ -50,6 +74,33 @@ enum Cmd {
         /// Parser worker threads. Default: num_cpus.
         #[arg(long)]
         threads: Option<usize>,
+
+        /// If given, run the disk-space pre-flight check: query the node's
+        /// tip over RPC `getblockcount`, project the index's final size from
+        /// the recorded checkpoints, and refuse to start if we'd leave <10 GiB
+        /// free on the index filesystem at completion.
+        #[arg(long)]
+        rpc_url: Option<String>,
+
+        /// Cookie file for the RPC call (used with --rpc-url when no
+        /// user/password are needed separately). Defaults to
+        /// ~/.bitcoin/.cookie for mainnet.
+        #[arg(long)]
+        rpc_cookie: Option<PathBuf>,
+
+        /// Skip the disk-space startup check entirely.
+        #[arg(long)]
+        skip_disk_check: bool,
+
+        /// Chain network override (auto-detected from the first blk file when
+        /// absent: mainnet / testnet3 / testnet4 / signet / regtest).
+        #[arg(long, value_enum)]
+        network: Option<NetworkArg>,
+
+        /// Override the disk-check checkpoint file path. Defaults to
+        /// `<parent-of-utxo>/bidx-disk-checkpoints.txt`.
+        #[arg(long)]
+        checkpoint_file: Option<PathBuf>,
     },
 
     /// Create ClickHouse schema (idempotent).
@@ -110,6 +161,20 @@ enum Cmd {
         /// Max reorg depth to auto-handle before aborting.
         #[arg(long, default_value_t = 100)]
         max_reorg_depth: u32,
+
+        /// Bitcoin Core blocks dir (used only to auto-detect the network for
+        /// the disk-space checkpoint section). If omitted, defaults to mainnet.
+        #[arg(long)]
+        blocks_dir: Option<PathBuf>,
+        /// Chain network override (auto-detected from --blocks-dir if not set).
+        #[arg(long, value_enum)]
+        network: Option<NetworkArg>,
+        /// Skip the disk-space startup check.
+        #[arg(long)]
+        skip_disk_check: bool,
+        /// Override the disk-check checkpoint file path.
+        #[arg(long)]
+        checkpoint_file: Option<PathBuf>,
     },
 
     /// Parse a single block at a height and print it as JSON (debug).
@@ -158,6 +223,11 @@ fn main() -> Result<()> {
             end,
             blocks_per_part,
             threads,
+            rpc_url,
+            rpc_cookie,
+            skip_disk_check,
+            network,
+            checkpoint_file,
         } => {
             pipeline::run_parse(pipeline::ParseConfig {
                 blocks_dir,
@@ -167,6 +237,11 @@ fn main() -> Result<()> {
                 end,
                 blocks_per_part,
                 threads,
+                rpc_url,
+                rpc_cookie,
+                skip_disk_check,
+                network: network.map(Into::into),
+                checkpoint_file,
             })?;
         }
 
@@ -222,6 +297,10 @@ fn main() -> Result<()> {
             utxo,
             out,
             max_reorg_depth,
+            blocks_dir,
+            network,
+            skip_disk_check,
+            checkpoint_file,
         } => {
             live::run_live(live::LiveConfig {
                 rpc_url,
@@ -232,6 +311,10 @@ fn main() -> Result<()> {
                 utxo,
                 out,
                 max_reorg_depth,
+                blocks_dir,
+                network: network.map(Into::into),
+                skip_disk_check,
+                checkpoint_file,
             })?;
         }
     }

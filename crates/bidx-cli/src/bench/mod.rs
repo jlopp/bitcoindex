@@ -16,6 +16,9 @@
 //!
 //! Comparing modes against a given dataset answers:
 //!   "Is the bottleneck parallel parse, sequential UTXO apply, or sink I/O?"
+//!
+//! Note: bench runs deliberately do *not* write disk checkpoints — use
+//! `bidx parse` for real runs that train the disk-space model.
 
 pub mod metrics;
 

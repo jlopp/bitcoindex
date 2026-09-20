@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+use crate::diskguard::{DiskGuardConfig, DiskRecorder, DEFAULT_CHECKPOINT_FILE_NAME};
+
 #[derive(Debug)]
 pub struct LiveConfig {
     pub rpc_url: String,
@@ -21,6 +23,17 @@ pub struct LiveConfig {
     pub utxo: PathBuf,
     pub out: Option<PathBuf>,
     pub max_reorg_depth: u32,
+    /// Blocks directory (used only to auto-detect the network for the
+    /// disk-space checkpoint file's section). If omitted, pass `network`.
+    pub blocks_dir: Option<PathBuf>,
+    /// Chain network override (auto-detected from --blocks-dir if not set;
+    /// defaults to mainnet).
+    pub network: Option<bidx_core::Network>,
+    /// Skip the disk-space startup check entirely.
+    pub skip_disk_check: bool,
+    /// Override disk-check checkpoint file. Default:
+    /// `<parent-of-utxo>/bidx-disk-checkpoints.txt`.
+    pub checkpoint_file: Option<PathBuf>,
 }
 
 /// Blocks per rolling Parquet part in live mode.
@@ -103,6 +116,57 @@ pub fn run_live(cfg: LiveConfig) -> Result<()> {
 
     // Live mode: WAL + undo logging on.
     let utxo = Arc::new(UtxoStore::open_live(&cfg.utxo)?);
+
+    // ---- disk-space startup check (always possible: we have RPC) ----
+    let network = cfg
+        .network
+        .or_else(|| {
+            cfg.blocks_dir
+                .as_deref()
+                .and_then(bidx_core::Network::detect_from_blocks_dir)
+        })
+        .unwrap_or(bidx_core::Network::Mainnet);
+    let parent_of_utxo = cfg
+        .utxo
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let checkpoint_file = cfg
+        .checkpoint_file
+        .clone()
+        .unwrap_or_else(|| parent_of_utxo.join(DEFAULT_CHECKPOINT_FILE_NAME));
+    let mut tracked_dirs = vec![cfg.utxo.clone()];
+    if let Some(out) = &cfg.out {
+        tracked_dirs.push(out.clone());
+    }
+    let disk_cfg = DiskGuardConfig {
+        checkpoint_file,
+        network,
+        index_root: parent_of_utxo.clone(),
+        tracked_dirs,
+    };
+
+    if !cfg.skip_disk_check {
+        let node_tip = node
+            .get_block_count()
+            .context("getblockcount for disk pre-flight")?;
+        let local_tip_ckpt = bidx_core::read_checkpoints(&disk_cfg.checkpoint_file, network)
+            .last()
+            .map(|c| c.height)
+            .unwrap_or(0);
+        let local_tip_utxo = utxo.tip()?.map(|t| t.height).unwrap_or(0);
+        let local_tip = local_tip_ckpt.max(local_tip_utxo);
+        if local_tip == 0 {
+            tracing::info!(
+                network = network.name(),
+                "no disk checkpoints yet — running without growth projection until height \
+                 100,000 is reached for the first time"
+            );
+        }
+        disk_cfg.run_pre_flight(node_tip, local_tip, bidx_core::MIN_FREE_BYTES)?;
+    }
+
+    let recorder = Arc::new(DiskRecorder::new(disk_cfg.clone()));
     match utxo.tip()? {
         Some(t) => info!(height = t.height, hash = %t.hash, "resuming from stored tip"),
         None => warn!("no stored tip in UTXO db — run `bidx parse` first for full history"),
@@ -142,6 +206,12 @@ pub fn run_live(cfg: LiveConfig) -> Result<()> {
                     if let Err(e) = guard.write_block(b, spends) {
                         warn!(error = %e, "failed to write block to parquet");
                     }
+                }
+                if let Err(e) = recorder
+                    .on_block_applied(*height)
+                    .map(|_| ())
+                {
+                    warn!(error = %e, "failed to record disk checkpoint");
                 }
             }
             TrackerEvent::Disconnected { height, hash } => {

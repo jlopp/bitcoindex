@@ -24,7 +24,7 @@ use bidx_core::{Hash32, InputRow, OutputRow, SpendRow};
 use parking_lot::Mutex;
 use rocksdb::{Options, WriteBatch, DB};
 use rustc_hash::FxHashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -195,6 +195,7 @@ fn read_varint(b: &mut &[u8]) -> Option<u64> {
 
 pub struct UtxoStore {
     db: DB,
+    path: PathBuf,
     pending: Mutex<FxHashMap<[u8; 36], UtxoValue>>,
     /// When false, undo records are not written (bulk initial load).
     /// Live mode enables undo so reorgs can be reversed.
@@ -249,6 +250,7 @@ impl UtxoStore {
         let _ = wal; // WAL is always on; bulk mode uses WriteOptions::disable_wal per write.
         Ok(UtxoStore {
             db,
+            path: path.to_path_buf(),
             pending: Mutex::new(FxHashMap::default()),
             undo_enabled,
         })
@@ -429,6 +431,16 @@ impl UtxoStore {
             .flatten()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// Filesystem path of the UTXO db.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Total bytes consumed by this UTXO db on disk, including WAL and MANIFEST.
+    pub fn disk_size_bytes(&self) -> u64 {
+        bidx_core::dir_size_bytes(&self.path)
     }
 }
 

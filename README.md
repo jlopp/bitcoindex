@@ -185,6 +185,38 @@ created outpoints) atomically with its UTXO mutations, keyed by height.
   from a closed part — on load, drop ClickHouse partitions `>=` the reorg
   floor before reloading the affected range.
 
+### Disk-space checkpoints and startup guard
+
+Because loading the full mainnet chain can require more space than the disk
+has available, `bidx parse` and `bidx live` keep a per-network history of
+index size vs height, and refuse to start when the projected final size
+would leave less than 10 GiB free on the index filesystem.
+
+- The checkpoint history lives in
+  `<parent-of-utxo>/bidx-disk-checkpoints.txt` (override with
+  `--checkpoint-file`). One `network <name>` section per chain; lines are
+  `height total_bytes`.
+- **Recording**: every `CHECKPOINT_HEIGHT_STEP` blocks (100,000 by default)
+  the pipeline / live tracker measures the on-disk size of the UTXO db +
+  Parquet out dirs (RocksDB directory size, including WAL/SSTs) and appends
+  `(height, total_bytes)` to the checkpoint file.
+- **Projection**: at startup, `bidx parse --rpc-url <url>` and `bidx live`
+  run a pre-flight check: they read the local indexed tip (the highest
+  recorded checkpoint), fetch the node's tip via `getblockcount`, fit a
+  linear regression through the checkpoint history to get growth in
+  bytes/block, and project the index's total size at the node tip. If the
+  projected size would leave less than 10 GiB free on the index filesystem,
+  the program refuses to start and prints how much additional free space is
+  needed.
+- `bidx parse` without `--rpc-url` logs a notice and skips the projection
+  (we have no chain tip to compare against). Pass `--rpc-url <url>` (plus
+  `--rpc-cookie`) to enable the guard on bulk loads too. `bidx live` always
+  runs the guard since it already has a node connection. Use
+  `--skip-disk-check` to bypass entirely.
+- With no checkpoints yet (first mainnet run at height <100,000), the
+  projection is skipped with a warning — there isn't enough history to
+  extrapolate from.
+
 ### Resumability
 
 Parquet part files are named by block range (`out/blocks/part-00042.parquet`

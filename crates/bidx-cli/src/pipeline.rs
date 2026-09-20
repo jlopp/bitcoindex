@@ -12,6 +12,7 @@
 //!     everything into the Parquet sink, rotating part files every
 //!     `blocks_per_part` blocks.
 
+use crate::diskguard::{DiskGuardConfig, DiskRecorder, DEFAULT_CHECKPOINT_FILE_NAME};
 use anyhow::{Context, Result};
 use bidx_parser::{parse_block_full, BlkFile, FullBlock};
 use bidx_store::{ParquetSink, SinkConfig, UtxoStore};
@@ -35,6 +36,18 @@ pub struct ParseConfig {
     pub end: Option<u32>,
     pub blocks_per_part: u32,
     pub threads: Option<usize>,
+    /// If set, run the disk-space pre-flight check before parsing: query the
+    /// node's tip over this RPC URL and project the index's final size. See
+    /// `diskguard` module. If `None`, skip the check.
+    pub rpc_url: Option<String>,
+    pub rpc_cookie: Option<PathBuf>,
+    /// Allow the user to skip the disk-space guard explicitly.
+    pub skip_disk_check: bool,
+    /// Override the checkpoint-file path. Defaults to
+    /// `<parent-of-utxo>/bidx-disk-checkpoints.txt`.
+    pub checkpoint_file: Option<PathBuf>,
+    /// Network — auto-detected from the first blk file if `None`.
+    pub network: Option<bidx_core::Network>,
 }
 
 /// A parsed block in flight, tagged with its position.
@@ -60,6 +73,56 @@ pub fn run_parse(cfg: ParseConfig) -> Result<()> {
     }
     let total = (end - start) as u64;
     info!(start, end, total, "starting parse");
+
+    // ---- disk-space pre-flight (only meaningful with --rpc-url) ----
+    let network = cfg
+        .network
+        .or_else(|| bidx_core::Network::detect_from_blocks_dir(&cfg.blocks_dir))
+        .context("could not detect network from blocks dir; pass --network")?;
+    let parent_of_utxo = cfg
+        .utxo
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let checkpoint_file = cfg
+        .checkpoint_file
+        .clone()
+        .unwrap_or_else(|| parent_of_utxo.join(DEFAULT_CHECKPOINT_FILE_NAME));
+    let disk_cfg: DiskGuardConfig = DiskGuardConfig {
+        checkpoint_file,
+        network,
+        index_root: parent_of_utxo.clone(),
+        tracked_dirs: vec![cfg.utxo.clone(), cfg.out.clone()],
+    };
+
+    if !cfg.skip_disk_check {
+        if let Some(rpc_url) = &cfg.rpc_url {
+            let node = bidx_live::NodeClient::new(bidx_live::RpcConfig {
+                url: rpc_url.clone(),
+                cookie_path: cfg.rpc_cookie.clone(),
+                user: None,
+                password: None,
+            })
+            .context("init RPC client for disk pre-flight")?;
+            let node_tip = node.get_block_count().context("getblockcount")?;
+            let local_tip = bidx_core::read_checkpoints(&disk_cfg.checkpoint_file, disk_cfg.network)
+                .last()
+                .map(|c| c.height)
+                .unwrap_or(0);
+            if local_tip == 0 && start == 0 {
+                tracing::info!(
+                    network = network.name(),
+                    "no disk checkpoints yet — running without growth projection until \
+                     height 100,000 is reached"
+                );
+            }
+            disk_cfg.run_pre_flight(node_tip, local_tip, bidx_core::MIN_FREE_BYTES)?;
+        } else {
+            tracing::info!(
+                "no --rpc-url given; skipping disk-space projection (use --rpc-url to enable)"
+            );
+        }
+    }
 
     // Group block locations by file so each worker opens each file once.
     // We keep per-thread file caches instead: simpler and lets height order
@@ -90,9 +153,11 @@ pub fn run_parse(cfg: ParseConfig) -> Result<()> {
     // Spawn the ordered consumer on its own thread.
     let out_dir = cfg.out.clone();
     let blocks_per_part = cfg.blocks_per_part;
+    let recorder = Arc::new(DiskRecorder::new(disk_cfg.clone()));
     let consumer = std::thread::spawn({
         let progress = progress.clone();
         let missing_utxos = Arc::clone(&missing_utxos);
+        let recorder = Arc::clone(&recorder);
         move || -> Result<()> {
             consume_ordered(
                 rx,
@@ -103,6 +168,7 @@ pub fn run_parse(cfg: ParseConfig) -> Result<()> {
                 &utxo,
                 &progress,
                 &missing_utxos,
+                recorder.as_ref(),
             )
         }
     });
@@ -195,6 +261,7 @@ fn consume_ordered(
     utxo: &UtxoStore,
     progress: &ProgressBar,
     missing_utxos: &AtomicU64,
+    recorder: &DiskRecorder,
 ) -> Result<()> {
     let mut buffer: BTreeMap<u32, FullBlock> = BTreeMap::new();
     let mut next = start;
@@ -243,6 +310,7 @@ fn consume_ordered(
             }
 
             progress.inc(1);
+            let _ = recorder.on_block_applied(next)?;
             next += 1;
             if next >= end {
                 sink.finish()?;
