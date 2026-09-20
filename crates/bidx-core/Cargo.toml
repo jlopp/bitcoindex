@@ -1,0 +1,18 @@
+[package]
+name = "bidx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types and primitives for the Bitcoin indexer"
+
+[dependencies]
+thiserror.workspace = true
+byteorder.workspace = true
+sha2.workspace = true
+ripemd.workspace = true
+hex.workspace = true
+serde.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

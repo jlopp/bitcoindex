@@ -1,0 +1,23 @@
+[package]
+name = "bidx-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Raw blk*.dat block file reader and parallel parser"
+
+[dependencies]
+bidx-core = { path = "../bidx-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+byteorder.workspace = true
+sha2.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+memmap2.workspace = true
+tracing.workspace = true
+rustc-hash.workspace = true
+indicatif.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

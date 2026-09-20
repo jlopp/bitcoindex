@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bidx-core",
+    "crates/bidx-parser",
+    "crates/bidx-store",
+    "crates/bidx-loader",
+    "crates/bidx-live",
+    "crates/bidx-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/jameson/bitcoindex"
+
+[workspace.dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+thiserror = "2"
+byteorder = "1"
+sha2 = "0.10"
+ripemd = "0.1"
+hex = "0.4"
+rayon = "1"
+crossbeam-channel = "0.5"
+memmap2 = "0.9"
+rocksdb = "0.22"
+arrow = { version = "53", features = ["prettyprint"] }
+parquet = { version = "53", features = ["arrow", "zstd"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+indicatif = { version = "0.17", features = ["rayon"] }
+parking_lot = "0.12"
+rustc-hash = "2"
+zmq = { version = "0.10" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+debug = false

@@ -1,0 +1,20 @@
+[package]
+name = "bidx-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Live tip tracking: ZMQ block notifications, RPC catch-up, reorg handling"
+
+[dependencies]
+bidx-core = { path = "../bidx-core" }
+bidx-parser = { path = "../bidx-parser" }
+bidx-store = { path = "../bidx-store" }
+anyhow.workspace = true
+thiserror.workspace = true
+zmq.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+hex.workspace = true
+tracing.workspace = true

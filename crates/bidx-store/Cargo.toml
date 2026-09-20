@@ -1,0 +1,21 @@
+[package]
+name = "bidx-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RocksDB UTXO store and Parquet intermediate writers"
+
+[dependencies]
+bidx-core = { path = "../bidx-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+rocksdb.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+byteorder.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

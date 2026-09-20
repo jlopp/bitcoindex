@@ -1,0 +1,26 @@
+[package]
+name = "bidx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "bidx command-line interface"
+
+[[bin]]
+name = "bidx"
+path = "src/main.rs"
+
+[dependencies]
+bidx-core = { path = "../bidx-core" }
+bidx-parser = { path = "../bidx-parser" }
+bidx-store = { path = "../bidx-store" }
+bidx-loader = { path = "../bidx-loader" }
+bidx-live = { path = "../bidx-live" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rayon.workspace = true
+indicatif.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+rustc-hash.workspace = true
