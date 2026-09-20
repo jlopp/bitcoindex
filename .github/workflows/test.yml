@@ -1,0 +1,56 @@
+name: Tests
+
+# Run the test suite on every pull request.
+on:
+  pull_request:
+
+# Cancel stale runs when a PR is updated.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # System build dependencies:
+      #   clang / libclang-dev — required by bindgen (librocksdb-sys generates
+      #     RocksDB bindings via bindgen, which needs libclang).
+      #   llvm-dev, llvm, clang — libclang + resource headers (stdbool.h etc.)
+      #     that bindgen needs to parse RocksDB's public C headers.
+      #   libzmq3-dev — the `zmq` crate links the system libzmq via pkg-config
+      #     (we don't enable its `vendored` feature).
+      #   cmake — rocksdb-sys build.
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libclang-dev \
+            llvm-dev \
+            cmake \
+            pkg-config \
+            libzmq3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Debug-profile test run for CI speed. RocksDB + Arrow/Parquet are very
+      # heavy to compile in release mode (the workspace sets lto = "fat");
+      # debug catches the same correctness issues at a fraction of the
+      # compile time. The rust-cache above makes rebuilds incremental.
+      - name: Run test suite
+        env:
+          RUST_BACKTRACE: 1
+        run: cargo test --locked --workspace
