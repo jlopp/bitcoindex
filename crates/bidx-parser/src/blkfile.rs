@@ -1,4 +1,4 @@
-use bidx_core::{BlockHeader, BlockLocation, BLOCK_HEADER_LEN, BLOCK_MAGIC};
+use bidx_core::{is_known_network_magic, BlockHeader, BlockLocation, BLOCK_HEADER_LEN};
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -120,7 +120,10 @@ impl<'a> Iterator for BlkRecordIter<'a> {
         let magic = u32::from_le_bytes(data[self.pos..self.pos + 4].try_into().unwrap());
         let len = u32::from_le_bytes(data[self.pos + 4..self.pos + 8].try_into().unwrap()) as usize;
 
-        if magic != BLOCK_MAGIC {
+        // Accept any of the known Bitcoin network magics — the indexer
+        // itself doesn't validate consensus, so parsing testnet/signet/regtest
+        // files for benchmarking and development is a supported path.
+        if !is_known_network_magic(magic) {
             return Some(Err(BlkError::Corrupt {
                 file_id: self.file_id,
                 offset,

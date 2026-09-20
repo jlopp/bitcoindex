@@ -38,9 +38,9 @@ pub struct ParseConfig {
 }
 
 /// A parsed block in flight, tagged with its position.
-struct WorkItem {
-    height: u32,
-    block: FullBlock,
+pub(crate) struct WorkItem {
+    pub(crate) height: u32,
+    pub(crate) block: FullBlock,
 }
 
 pub fn run_parse(cfg: ParseConfig) -> Result<()> {
@@ -149,20 +149,20 @@ pub fn run_parse(cfg: ParseConfig) -> Result<()> {
 }
 
 /// Per-thread cache of mmap'd blk files, keyed by file id.
-struct ThreadFileCache {
+pub(crate) struct ThreadFileCache {
     blocks_dir: PathBuf,
     files: RefCell<FxHashMap<u32, Arc<BlkFile>>>,
 }
 
 impl ThreadFileCache {
-    fn new(blocks_dir: &Path) -> Self {
+    pub(crate) fn new(blocks_dir: &Path) -> Self {
         ThreadFileCache {
             blocks_dir: blocks_dir.to_path_buf(),
             files: RefCell::new(FxHashMap::default()),
         }
     }
 
-    fn block_bytes(&self, loc: &bidx_core::BlockLocation) -> Result<std::sync::Arc<[u8]>> {
+    pub(crate) fn block_bytes(&self, loc: &bidx_core::BlockLocation) -> Result<std::sync::Arc<[u8]>> {
         // We return an owned Arc<[u8]> copy to keep the API simple and safe;
         // the mmap page-cache copy is cheap relative to parse cost. If this
         // shows up in profiles, switch to returning a guard tied to the map.

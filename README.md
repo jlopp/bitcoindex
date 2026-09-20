@@ -116,7 +116,53 @@ bidx live \
 
 # Debug: dump one block
 bidx inspect --blocks-dir ~/.bitcoin/blocks --height 0
+
+# 6. Benchmark the ingest pipeline — isolate stage bottlenecks
+#    Modes are orthogonal stage toggles so you can attribute time:
+#      headers → header-pass only
+#      parse   → header pass + parallel parse (no UTXO, no sink)
+#      sink    → full stages but UTXO apply skipped (isolates Parquet cost)
+#      utxo    → full stages but sink skipped (isolates RocksDB UTXO cost)
+#      full    → everything
+bidx bench --mode full   --blocks-dir ~/.bitcoin/blocks
+bidx bench --mode parse  --blocks-dir ~/.bitcoin/blocks
+bidx bench --mode sink   --blocks-dir ~/.bitcoin/blocks
+bidx bench --mode utxo   --blocks-dir ~/.bitcoin/blocks
+
+# Repeat trials, JSON report, custom UTXO dir, parser thread cap:
+bidx bench --mode full --blocks-dir ~/.bitcoin/blocks \
+  --repeat 3 --threads 16 --utxo /tmp/bidx-bench-utxo \
+  --csv /tmp/bench.json
 ```
+
+#### What a bench report looks like
+
+Run against testnet4 (`~/.bitcoin/testnet4/blocks`, 24,820 blocks):
+
+```
+=== trial 0 (full) ===
+blocks: 24820
+blocks/s: 23898.0
+stages:
+                     header_pass  wall   0.022s
+        parse (Σ worker CPU-ish)  wall   0.643s
+         utxo_apply (sequential)  wall   0.452s
+                    parquet_sink  wall   0.350s
+             pipeline_wall_total  wall   1.039s  blocks/s 23898
+```
+
+Reading it:
+
+- **Parallel parse is not the bottleneck.** Σ per-block parse time across all
+  workers scales with cores; throughput in `parse` mode was ~280k blocks/s.
+- **The sequential consumer stages dominate.** `utxo_apply` (RocksDB write
+  batch per block) and `parquet_sink` (Arrow encode + zstd) each add
+  ~0.3–0.5 s here, dropping effective throughput from ~280k to ~59k and
+  ~46k blocks/s respectively; together (~12× vs parse-only) they set the
+  end-to-end throughput ceiling on this dataset.
+- Optimizations that matter are therefore on the sequential side:
+  batching UTXO writes across multiple blocks before committing, increasing
+  Parquet row-group size, or overlapping sink I/O with UTXO apply.
 
 ### Live mode & reorgs
 
@@ -174,6 +220,8 @@ WHERE address_hash = <32-byte-hash>;
 - [x] Parquet intermediates (zstd, rotating parts)
 - [x] ClickHouse schema + bulk loader
 - [x] Live tip tracking (ZMQ `hashblock` + RPC catch-up) with undo-log reorg handling
+- [x] `bidx bench` — per-stage timing with orthogonal mode toggles (headers / parse / utxo / sink / full) to attribute bottlenecks
+- [ ] Sink & UTXO overlap: currently both run on the consumer thread; could overlap sink I/O with RocksDB commit
 - [ ] Retraction of live-Parquet rows for disconnected blocks (today: reload affected partition)
 - [ ] Direct ClickHouse live inserts (bypass Parquet) for sub-minute tip freshness
 - [ ] Optional witness payload table (kept out of the hot tables today)

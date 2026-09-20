@@ -2,7 +2,29 @@ use crate::hash::Hash32;
 use serde::{Deserialize, Serialize};
 
 /// Magic prefix preceding each block record in blk*.dat files (mainnet).
-pub const BLOCK_MAGIC: u32 = 0xD9B4_BEF9;
+// Magic values are stored as the little-endian u32 read from the wire.
+// Bitcoin source lists them in reverse (endianness) order; e.g. testnet4's
+// chainparams constant 0x1c163f28 appears on disk as bytes 1c 16 3f 28,
+// which u32::from_le_bytes reads as 0x283f161c.
+pub const BLOCK_MAGIC: u32 = 0xD9B4_BEF9; // mainnet
+pub const BLOCK_MAGIC_TESTNET3: u32 = 0x0709_110B;
+pub const BLOCK_MAGIC_SIGNET: u32 = 0x40CF_030A;
+pub const BLOCK_MAGIC_TESTNET4: u32 = 0x283F_161C;
+pub const BLOCK_MAGIC_REGTEST: u32 = 0xDAB5_BFFA;
+
+/// Returns true if `magic` is the wire magic of any known Bitcoin network.
+/// The indexer does not validate consensus, so parsing testnet/signet/regtest
+/// files is supported (useful for benchmarking & development).
+pub fn is_known_network_magic(magic: u32) -> bool {
+    matches!(
+        magic,
+        BLOCK_MAGIC
+            | BLOCK_MAGIC_TESTNET3
+            | BLOCK_MAGIC_SIGNET
+            | BLOCK_MAGIC_TESTNET4
+            | BLOCK_MAGIC_REGTEST
+    )
+}
 pub const BLOCK_HEADER_LEN: usize = 80;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

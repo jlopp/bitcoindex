@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use bench::{run_bench, BenchConfig};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
+mod bench;
 mod live;
 mod pipeline;
 
@@ -117,6 +119,12 @@ enum Cmd {
         #[arg(long)]
         height: u32,
     },
+
+    /// Benchmark the ingest pipeline: run bidx against a blocks directory
+    /// and report per-stage timing (header pass, parallel parse, sequential
+    /// UTXO apply, Parquet sink) plus wall-clock throughput, CPU utilisation,
+    /// and peak RSS. Use mode=headers/parse/utxo/sink to isolate stages.
+    Bench(BenchConfig),
 }
 
 fn main() -> Result<()> {
@@ -202,6 +210,8 @@ fn main() -> Result<()> {
         Cmd::Inspect { blocks_dir, height } => {
             pipeline::inspect_block(&blocks_dir, height)?;
         }
+
+        Cmd::Bench(cfg) => run_bench(cfg)?,
 
         Cmd::Live {
             rpc_url,
