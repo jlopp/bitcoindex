@@ -1,0 +1,105 @@
+---
+description: Rust + indexer performance directives for maximum ingest throughput
+globs: "**/*.rs"
+alwaysApply: true
+---
+
+# Rust performance directives
+
+This project is a Bitcoin blockchain indexer. Ingest throughput is the
+product; every code change should be evaluated against it. Default to
+performance unless there is a concrete correctness or maintainability reason
+to do otherwise. When in doubt, benchmark with `bidx bench` before and after
+you change something on the hot path.
+
+## Never
+
+- Never allocate per-byte or per-item on the parse hot path. Reuse buffers,
+  or read directly into a fixed-size array. A `Vec::with_capacity` outside a
+  loop is cheap; a fresh `Vec::new()` in a tight loop is not.
+- Never `format!` / `to_string()` on the hot path. Skip logging in loops
+  unless gated behind `tracing::enabled!`.
+- Never use `HashMap` / `HashSet` with the default `std` hasher
+  (`SipHash`). Use `rustc_hash::FxHashMap` for in-memory, non-persistent
+  lookups — we already have `rustc-hash` as a workspace dep.
+- Never hold a `Mutex` across `.await` or while doing I/O. Compute first,
+  lock only to swap/append results. We use `parking_lot::Mutex` for the UTXO
+  pending-table for this reason.
+- Never copy a slice you only need to read. Pass `&[u8]`; only `Arc<[u8]>`
+  when the data must outlive the borrow (see `ThreadFileCache`).
+- Never convert `Hash32` to a hex string on any hot path. Use `to_hex()` only
+  for logging/debugging/CLI output. Storage and comparison are always the
+  32 raw bytes.
+- Never call `.unwrap()` or `.expect()` in production code paths. Only in
+  tests. Use `?` with a contextual `anyhow::Context`.
+
+## Prefer
+
+- Prefer `u32`/`u64` arithmetic to byte-order gymnastics; convert once at
+  the parse boundary with `u32::from_le_bytes` / `u64::from_le_bytes`.
+- Prefer struct-of-arrays / columnar building (see
+  `bidx_store::parquet_writers::Col`) over row-by-row pushes when batching
+  for Parquet — the whole point of IntermediateFiles is per-column reuse.
+- Prefer a bounded `crossbeam_channel` to an unbounded one on any pipeline
+  stage; unbounded channels are memory-leaks under backpressure.
+- Prefer `Rayon::par_iter` over manual threads for the parse workers; the
+  per-thread `ThreadFileCache` pattern in `pipeline.rs` is the shape to copy
+  (per-thread init via `try_for_each_init`, lazy file opens, no shared
+  state).
+- Prefer `assert_eq!` / explicit comparison of fixed-size arrays to
+  capturing and comparing formatted strings in tests. Use
+  `assert!(left == right, "msg: {:?}", ...)` with raw bytes.
+- Prefer `Iterator` adaptors to `for` loops when the result is consumed
+  once. Do not combine `.collect::<Vec<_>>` + `sort` when
+  `.sort_unstable_by_key` on an existing Vec will do.
+- Prefer `[u8; 32]` / `[u8; 36]` fixed-size outpoint/txid keys over `Vec<u8>`
+  or `Box<[u8]>`. They are `Copy` and go on the stack.
+
+## RocksDB / storage
+
+- Writes into `UtxoStore` must go through `WriteBatch`, not per-key `put_cf`.
+  Undo records must be written atomically with the batch that mutates the
+  UTXO set — never write the UTXO change first and the undo second.
+- Never open two `UtxoStore` instances to the same path. RocksDB does not
+  allow it and will lock the DB.
+- RocksDB write batches in the sequential consumer must be as large as
+  possible within one block — the whole point of the ordered consumer is
+  that each block is one `WriteBatch`. Never split per-transaction.
+- `live` mode enables the WAL for durability; `parse` mode uses bulk-load
+  settings (no WAL). The disk-space checkpoint measurement
+  (`DiskGuardConfig.current_total_bytes`) always includes the WAL, so never
+  keep a WAL file outside the measured dir.
+
+## Parquet / Arrow
+
+- Batch as large as the configured `batch_size` — the consumer keeps
+  building across blocks until the batch is full. Never force-flush per
+  block; that defeats zstd compression and row-group size targets.
+- Parquet write batches must be consumed column-by-column (see the `Col`
+  type-erased builder in `parquet_writers.rs`). Do not allocate per-row
+  Arrow arrays for the normal path.
+- New columns go at the END of a table's column list; never reorder
+  existing columns (the Parquet schema is positional and the ClickHouse
+  DDL maps by name).
+- Hashes in Parquet are `FixedSizeBinary(32)`; never `Utf8` hex strings.
+
+## CLI / network / general
+
+- Buffer all file/network writes. Anything that appends to a file in a
+  loop should take a `&mut impl Write` or use a `BufWriter`.
+- For ZMQ / RPC in `bidx-live`: block the minimum possible on the
+  receive side; do the catch_up work after receiving, not while holding
+  the receive handle. Keep ZMQ subscriptions to the single
+  `hashblock` topic — we already idempotently re-run `catch_up` so extra
+  topics buy nothing.
+- `logs` on the hot path go through `tracing` with structured fields and
+  are only emitted at `info` or coarser; use `debug!` for per-block
+  details behind a feature flag. Never `println!` in library code.
+
+## What "done" looks like for perf changes
+
+- For changes touching `bidx-parser`, `bidx-store`, the `pipeline` module,
+  `ThreadFileCache`, or the `consume_ordered` consumer thread: run
+  `bidx bench --mode full --blocks-dir <test blocks>` before and after
+  your change and confirm no throughput regression. Record before/after in
+  the PR/commit message if the difference is >2%.

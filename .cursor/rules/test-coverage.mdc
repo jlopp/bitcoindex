@@ -1,0 +1,60 @@
+---
+description: 100% test coverage requirement for every Rust file you change
+globs: "**/*.rs"
+alwaysApply: true
+---
+
+# Test coverage — non-negotiable
+
+> **Directive: whenever you change a Rust file in this repository, that
+> file must have 100% test coverage before the change is considered
+> complete.**
+
+This is not advisory. If you touched a file, you are responsible for
+proving every code path in it is exercised by tests. The point is corrosion
+resistance: one bad parse breaks a chain run that takes hours to redo, and
+a wrong UTXO undo entry corrupts live reorg handling in ways that only
+show up on a real mainnet reorg.
+
+## How to satisfy it for a file you changed
+
+1. Run the file's existing tests: `cargo test --release <module name>`
+2. For any uncovered branch, add a unit test in the same file (`mod tests`)
+   or an integration test under `tests/` if the path crosses crate
+   boundaries (we already do this for `utxo_reorg` and `parquet_roundtrip`).
+3. Every public function you added or changed needs at least one test that
+   exercises the happy path and one that exercises a failure mode —
+   e.g. `parse_tx` needs a test for a truncated/script-invalid block.
+4. Corner-case code paths that exist to mirror consensus or endianness
+   quirks (e.g. wire-vs-display hash hex, varint size classes) need
+   *assertions on both directions*, not just the happy path.
+
+## Patterns already in this repo that you should follow
+
+- **Roundtrip tests** for every encode/decode pair
+  (`UtxoValue::encode/decode`, `BlockUndo::encode/decode`).
+- **Truncation/bounds tests** for every parser entry point
+  (`BlockUndo::decode` rejects truncated input).
+- **Synthetic full-flow tests** via a fake-UTXO store entry
+  (`tests/utxo_reorg.rs` constructs tiny in-memory blocks, runs
+  `apply_block` then `disconnect_block`, asserts the UTXO set equals the
+  genesis fixture).
+- **Round-trip through real I/O** for anything persisted
+  (`tests/parquet_roundtrip.rs` reads the genesis Parquet back with
+  `parquet-arrow` and checks the field values).
+
+## If coverage is impractical
+
+You may only leave a path untested if it is provably unreachable in the
+module's domain (e.g. `match` arms guarded by the type system). When you do
+this, leave a comment on the line explaining WHY and reference the compile-
+time guarantee (e.g. "`unreachable!()` because Foo::Bar is the only
+remaining variant"). Do not use `#[allow(unreachable_code)]` to get out of
+writing a test.
+
+## Do NOT count these as coverage
+
+- Tests that only call a function and assert its return without verifying
+  the state it mutated or the file it wrote.
+- Tests that pass "because nothing crashed".
+- Coverage measured only by line-count but never asserting a corner case.
