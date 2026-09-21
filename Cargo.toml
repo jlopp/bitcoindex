@@ -48,5 +48,19 @@ panic = "abort"
 opt-level = 3
 
 [profile.dev]
+# Tarpaulin needs debug info AND low opt so inline fns don't disappear from
+# the coverage report. opt-level=0 keeps the parser hot path slow for real
+# runs but correct for coverage. Tests run `cargo test --release`.
+opt-level = 0
+debug = true
+debug-assertions = true
+overflow-checks = true
+
+[profile.coverage]
+inherits = "dev"
+lto = "no"
+debug = true
+
+[profile.dev.package."*"]
+# Third-party deps still build fast but DON'T need to be coverage-visible.
 opt-level = 1
-debug = false

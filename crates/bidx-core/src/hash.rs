@@ -128,4 +128,65 @@ mod tests {
         let h = hash160(b"");
         assert_eq!(hex::encode(h), "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb");
     }
+
+    #[test]
+    fn default_is_zero_and_debug_display_format() {
+        let h = Hash32::default();
+        assert_eq!(*h.as_bytes(), [0u8; 32]);
+        assert_eq!(format!("{:?}", h), format!("Hash32({})", h.to_hex()));
+        assert_eq!(format!("{}", h), h.to_hex());
+        assert_eq!(Hash32::ZERO, Hash32::default());
+        assert_eq!(h, Hash32::from_bytes(*h.as_bytes()));
+    }
+
+    #[test]
+    fn raw_hex_is_unreversed_and_display_is_reversed() {
+        // Distinct bytes so reversal is observable.
+        let mut b = [0u8; 32];
+        for (i, b) in b.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let h = Hash32::from_bytes(b);
+        assert_eq!(
+            h.to_raw_hex(),
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+        assert_eq!(
+            h.to_hex(),
+            "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"
+        );
+    }
+
+    #[test]
+    fn from_hex_rejects_bad_input() {
+        // Odd length, non-hex, wrong length all must error (we don't silently
+        // zero-pad — a hex parsing bug silently shifts every hash).
+        assert!(Hash32::from_hex("abc").is_err());
+        assert!(Hash32::from_hex("zz").is_err());
+        assert!(Hash32::from_hex(&"00".repeat(31)).is_err());
+        assert!(Hash32::from_hex(&"00".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn ordering_and_hash_trait_stable() {
+        let a = Hash32::from_bytes([1u8; 32]);
+        let b = Hash32::from_bytes([2u8; 32]);
+        assert!(a < b);
+        let mut set = std::collections::HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&a));
+        assert!(!set.contains(&b));
+    }
+
+    #[test]
+    fn serde_json_roundtrip() {
+        let h = Hash32::from_bytes([0x5A; 32]);
+        let s = serde_json::to_string(&h).unwrap();
+        assert_eq!(s, format!("\"{}\"", h.to_hex()));
+        let back: Hash32 = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, h);
+        assert!(serde_json::from_str::<Hash32>("123").is_err());
+        assert!(serde_json::from_str::<Hash32>("\"zz\"").is_err());
+        assert!(serde_json::from_str::<Hash32>(&format!("\"{}\"", "00".repeat(31))).is_err());
+    }
 }

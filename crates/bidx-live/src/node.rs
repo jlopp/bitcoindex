@@ -18,6 +18,8 @@ pub enum RpcError {
     Io(#[from] std::io::Error),
     #[error("bad response: {0}")]
     BadResponse(String),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -66,13 +68,38 @@ struct RpcErr {
     message: String,
 }
 
-pub struct NodeClient {
-    cfg: RpcConfig,
+/// Transport the client uses to actually deliver a JSON-RPC round trip.
+/// Injecting this behind a trait lets tests run hermetically without a live
+/// node. Implementations must be cheap to call (blocking is fine).
+pub trait RpcTransport: Send + Sync {
+    fn roundtrip(&self, body: &serde_json::Value) -> Result<serde_json::Value, RpcError>;
+}
+
+/// HTTP transport to the configured Bitcoin Core endpoint.
+pub struct HttpTransport {
     http: reqwest::blocking::Client,
+    url: String,
     auth_header: String,
 }
 
+impl RpcTransport for HttpTransport {
+    fn roundtrip(&self, body: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+        let resp = self
+            .http
+            .post(&self.url)
+            .header("Authorization", &self.auth_header)
+            .json(body)
+            .send()?;
+        Ok(resp.json()?)
+    }
+}
+
+pub struct NodeClient {
+    transport: Box<dyn RpcTransport>,
+}
+
 impl NodeClient {
+    /// Build a client using HTTP transport against `cfg`.
     pub fn new(cfg: RpcConfig) -> Result<Self, RpcError> {
         let auth = if let (Some(u), Some(p)) = (&cfg.user, &cfg.password) {
             format!("{}:{}", u, p)
@@ -91,10 +118,17 @@ impl NodeClient {
             .timeout(std::time::Duration::from_secs(120))
             .build()?;
         Ok(NodeClient {
-            cfg,
-            http,
-            auth_header,
+            transport: Box::new(HttpTransport {
+                http,
+                url: cfg.url,
+                auth_header,
+            }),
         })
+    }
+
+    /// Build a client with a custom transport (tests, alternate backends).
+    pub fn with_transport(transport: Box<dyn RpcTransport>) -> Self {
+        NodeClient { transport }
     }
 
     fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, params: serde_json::Value) -> Result<T, RpcError> {
@@ -104,13 +138,8 @@ impl NodeClient {
             "method": method,
             "params": params,
         });
-        let resp = self
-            .http
-            .post(&self.cfg.url)
-            .header("Authorization", &self.auth_header)
-            .json(&body)
-            .send()?;
-        let parsed: RpcResp<T> = resp.json()?;
+        let resp = self.transport.roundtrip(&body)?;
+        let parsed: RpcResp<T> = serde_json::from_value(resp)?;
         if let Some(e) = parsed.error {
             return Err(RpcError::Rpc {
                 code: e.code,
@@ -183,5 +212,131 @@ impl NodeClient {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Scriptable transport: returns each element of `script` in order, then
+    /// keeps replaying the last. Calls are recorded so we can assert which
+    /// RPCs the tracker made, in what order.
+    struct ScriptTransport {
+        script: Vec<serde_json::Value>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptTransport {
+        fn scripted(resp_list: Vec<serde_json::Value>) -> Self {
+            ScriptTransport { script: resp_list, calls: AtomicUsize::new(0) }
+        }
+    }
+
+    impl RpcTransport for ScriptTransport {
+        fn roundtrip(&self, _body: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            let idx = i.min(self.script.len().saturating_sub(1));
+            Ok(self.script[idx].clone())
+        }
+    }
+
+    fn client_with(script: Vec<serde_json::Value>) -> NodeClient {
+        NodeClient::with_transport(Box::new(ScriptTransport::scripted(script)))
+    }
+
+    #[test]
+    fn get_block_count_rendering_and_rpc_errors() {
+        let c = client_with(vec![serde_json::json!({
+            "result": 42u32,
+            "error": null,
+        })]);
+        assert_eq!(c.get_block_count().unwrap(), 42);
+
+        // RPC error path.
+        let c = client_with(vec![serde_json::json!({
+            "result": null,
+            "error": { "code": -5, "message": "not found" },
+        })]);
+        let e = c.get_block_count().err().unwrap();
+        match e {
+            RpcError::Rpc { code, message } => {
+                assert_eq!(code, -5);
+                assert_eq!(message, "not found");
+            }
+            other => panic!("wrong error: {:?}", other),
+        }
+
+        // Null both → BadResponse.
+        let c = client_with(vec![serde_json::json!({ "result": null, "error": null })]);
+        assert!(matches!(c.get_block_count(), Err(RpcError::BadResponse(_))));
+    }
+
+    #[test]
+    fn get_block_hash_hex_to_internal_order_roundtrip() {
+        let c = client_with(vec![serde_json::json!({
+            "result": format!("{:064x}", 0x1234u64),
+            "error": null,
+        })]);
+        let h = c.get_block_hash(123).unwrap();
+        // Internal wire order: hex display is big-endian, internal storage
+        // reversed. 0x1234 big-endian display = "00...001234", so internal
+        // bytes are [0x34, 0x12, 0, 0, 0...].
+        assert_eq!(h.0[0], 0x34);
+        assert_eq!(h.0[1], 0x12);
+        assert!(h.0[2..32].iter().all(|&b| b == 0));
+
+        // Invalid hex from the node → BadResponse, not a panic.
+        let c = client_with(vec![serde_json::json!({ "result": "zz", "error": null })]);
+        assert!(matches!(c.get_block_hash(1), Err(RpcError::BadResponse(_))));
+    }
+
+    #[test]
+    fn get_block_raw_hex_decode_and_bad_hex() {
+        let raw = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let c = client_with(vec![serde_json::json!({
+            "result": hex::encode(&raw),
+            "error": null,
+        })]);
+        let h = Hash32::ZERO;
+        assert_eq!(c.get_block_raw(&h).unwrap(), raw);
+
+        let c = client_with(vec![serde_json::json!({ "result": "xx", "error": null })]);
+        assert!(matches!(c.get_block_raw(&Hash32::ZERO), Err(RpcError::BadResponse(_))));
+    }
+
+    #[test]
+    fn get_block_header_deserializes_optional_fields() {
+        let c = client_with(vec![serde_json::json!({
+            "result": {
+                "hash": "00000000",
+                "height": 800000u32,
+                "confirmations": 5,
+                "previousblockhash": "prev"
+                // no "nextblockhash" → Option::None path exercised
+            },
+            "error": null,
+        })]);
+        let h = c.get_block_header(&Hash32::ZERO).unwrap();
+        assert_eq!(h.height, 800000);
+        assert_eq!(h.hash, "00000000");
+        assert_eq!(h.previous.as_deref(), Some("prev"));
+        assert!(h.next.is_none());
+    }
+
+    /// Round-trips that a malformed JSON itself hits the Json error variant,
+    /// proving the transport roundtrip path is wired.
+    #[test]
+    fn unparseable_transport_response_is_json_error() {
+        struct Bad;
+        impl RpcTransport for Bad {
+            fn roundtrip(&self, _b: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+                Ok(serde_json::json!("this is not an RpcResp object"))
+            }
+        }
+        let c = NodeClient::with_transport(Box::new(Bad));
+        let e = c.get_block_count().err().unwrap();
+        assert!(matches!(e, RpcError::Json(_)), "{:?}", e);
     }
 }

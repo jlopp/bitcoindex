@@ -113,3 +113,54 @@ fn spends(db: &str) -> String {
          ORDER BY (height, spending_tx_index, spending_input_index)"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_ddl_covers_every_entity_and_reorg_views() {
+        let ddls = all_ddl("testdb");
+        // 5 entity tables + 2 relational projections = 8 DDL statements.
+        assert_eq!(ddls.len(), 8);
+        let body = ddls.join("\n");
+        for entity in ENTITIES {
+            assert!(body.contains(&format!("testdb.{entity}")), "missing {entity}: {body}");
+        }
+        // Common ClickHouse idempotency marker.
+        assert!(body.matches("CREATE TABLE IF NOT EXISTS").count() == 8);
+        // FixedString(32) is the only hash-storage type we use; bare
+        // `String` (variable-length) would blow up index size for hashes.
+        assert!(body.contains("FixedString(32)"));
+        assert!(!body.contains(" String "), "must not use variable-length String for hashes");
+        assert!(!body.contains("(String"), "no bare String columns");
+        // Distance between write pattern and order key is preserved.
+        assert!(body.contains("PARTITION BY intDiv(height, 10000)"));
+        // Query-optimized projections that the indexer advertises.
+        assert!(body.contains("transactions_by_txid"));
+        assert!(body.contains("outputs_by_address"));
+        assert!(body.contains("inputs_by_prev_output"));
+    }
+
+    #[test]
+    fn entities_array_matches_all_ddl_entities() {
+        // The ENTITIES array drives both bidx.loader's load_all walk and the
+        // schema check; ensure each is present as a table in the DDL set.
+        let body = all_ddl("db").join("\n");
+        for entity in ENTITIES {
+            // The DDL for the table matches {db}.{entity}. Don't suffix-match
+            // a projection's "{entity}_by_*" variant here.
+            let needle = format!("db.{entity} ");
+            assert!(body.contains(&needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn txs_and_by_txid_schemas_are_compatible() {
+        // The by_txid projection must accept the same row shape: txid is first,
+        // then location columns (height, tx_index), mirroring what the
+        // materialized view / INSERT SELECT will push.
+        let body = all_ddl("db").join("\n");
+        assert!(body.find("transactions_by_txid").unwrap() < body.find("ORDER BY txid").unwrap());
+    }
+}

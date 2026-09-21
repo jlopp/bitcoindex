@@ -193,3 +193,64 @@ pub struct SpendRow {
     /// never occurs in practice; used as sentinel for missing UTXO).
     pub spent_height: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Genesis block header bytes: 01000000 || 32 zero prev || merkle ||
+    /// time=1231006505 || bits=0x1d00ffff || nonce=2083236893.
+    fn genesis_header_raw() -> [u8; 80] {
+        let mut raw = [0u8; 80];
+        raw[0] = 1;
+        raw[4..36].copy_from_slice(&[0u8; 32]);
+        // Genesis merkle root, wire order (little-endian on disk).
+        let merkle = hex::decode(
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+        )
+        .unwrap();
+        let mut wire = [0u8; 32];
+        for i in 0..32 {
+            wire[31 - i] = merkle[i];
+        }
+        raw[36..68].copy_from_slice(&wire);
+        raw[68..72].copy_from_slice(&1231006505u32.to_le_bytes());
+        raw[72..76].copy_from_slice(&0x1d00ffffu32.to_le_bytes());
+        raw[76..80].copy_from_slice(&2083236893u32.to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn parse_genesis_header_fields() {
+        let raw = genesis_header_raw();
+        let h = BlockHeader::parse(&raw);
+        assert_eq!(h.version, 1);
+        assert_eq!(h.time, 1231006505);
+        assert_eq!(h.bits, 0x1d00ffff);
+        assert_eq!(h.nonce, 2083236893);
+        assert_eq!(h.prev_hash.0, [0u8; 32]);
+        // Genesis merkle == genesis coinbase txid. Wire order is the
+        // little-endian byte-reversed form of the display hex.
+        let want = hex::decode("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+            .unwrap();
+        let mut want_rev = [0u8; 32];
+        for (i, b) in want.iter().enumerate() {
+            want_rev[31 - i] = *b;
+        }
+        assert_eq!(h.merkle_root.0, want_rev);
+    }
+
+    #[test]
+    fn header_hash_matches_dsha256_of_raw() {
+        let raw = genesis_header_raw();
+        let h = BlockHeader::parse(&raw);
+        let direct = crate::dsha256(&raw);
+        assert_eq!(h.hash(&raw), direct);
+    }
+
+    #[test]
+    fn block_location_data_offset() {
+        let l = BlockLocation { file_id: 3, offset: 42, record_len: 100 };
+        assert_eq!(l.data_offset(), 50);
+    }
+}
