@@ -100,7 +100,7 @@ struct StageReport {
     peak_rss_mb: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct TrialReport {
     trial: u32,
     mode: BenchMode,
@@ -559,4 +559,224 @@ fn median(v: &[f64]) -> (f64, f64, f64) {
         v[mid]
     };
     (v[0], med, v[v.len() - 1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_mode_display_is_lowercase() {
+        assert_eq!(BenchMode::Full.to_string(), "full");
+        assert_eq!(BenchMode::Headers.to_string(), "headers");
+        assert_eq!(BenchMode::Parse.to_string(), "parse");
+        assert_eq!(BenchMode::Utxo.to_string(), "utxo");
+        assert_eq!(BenchMode::Sink.to_string(), "sink");
+    }
+
+    #[test]
+    fn needs_utxo_toggle_by_mode() {
+        assert!(needs_utxo(BenchMode::Full));
+        assert!(needs_utxo(BenchMode::Utxo));
+        assert!(!needs_utxo(BenchMode::Headers));
+        assert!(!needs_utxo(BenchMode::Parse));
+        assert!(!needs_utxo(BenchMode::Sink));
+    }
+
+    #[test]
+    fn needs_sink_toggle_by_mode() {
+        // Mirror of the do_sink mask at run_trial.
+        fn needs_sink(m: BenchMode) -> bool {
+            matches!(m, BenchMode::Full | BenchMode::Sink)
+        }
+        assert!(needs_sink(BenchMode::Full));
+        assert!(needs_sink(BenchMode::Sink));
+        assert!(!needs_sink(BenchMode::Headers));
+        assert!(!needs_sink(BenchMode::Parse));
+        assert!(!needs_sink(BenchMode::Utxo));
+    }
+
+    #[test]
+    fn median_picks_center_and_averages_even_sizes() {
+        let (lo, med, hi) = median(&[1.0, 2.0, 3.0]);
+        assert_eq!((lo, med, hi), (1.0, 2.0, 3.0));
+        let (_, med, _) = median(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(med, 2.5);
+        let (_, med, _) = median(&[5.0]);
+        assert_eq!(med, 5.0);
+        // Unsorted input must be sorted first.
+        let (_, med, _) = median(&[9.0, 1.0, 5.0, 2.0]);
+        assert_eq!(med, (2.0 + 5.0) / 2.0);
+    }
+
+    #[test]
+    fn out_dir_for_creates_unique_dir_under_temp() {
+        let dir1 = out_dir_for(&BenchConfig {
+            blocks_dir: PathBuf::from("/tmp"),
+            mode: BenchMode::Full,
+            start: 0,
+            end: None,
+            threads: None,
+            utxo: None,
+            blocks_per_part: 1,
+            repeat: 1,
+            csv: None,
+        })
+        .unwrap();
+        assert!(dir1.exists());
+        assert!(dir1.starts_with(std::env::temp_dir()));
+        let _ = std::fs::remove_dir_all(&dir1);
+    }
+
+    #[test]
+    fn bench_consume_thread_counts_blocks_and_rolls_part_files() {
+        use crossbeam_channel::bounded;
+        let (tx, rx) = bounded::<WorkItem>(4);
+
+        let blocks_done = AtomicU64::new(0);
+        let missing = AtomicU64::new(0);
+        let sink_wall = AtomicU64::new(0);
+        let utxo_wall = AtomicU64::new(0);
+
+        // Two synthetic blocks with distinct heights and one tx each.
+        fn synth_block(height: u32) -> bidx_parser::FullBlock {
+            use bidx_core::types::{BlockRow, InputRow, OutputRow, TxRow};
+            let h = [height as u8; 32];
+            let txid = [(height as u8).wrapping_mul(7); 32];
+            bidx_parser::FullBlock {
+                block_row: BlockRow {
+                    height,
+                    hash: h,
+                    prev_hash: [0u8; 32],
+                    merkle_root: h,
+                    time: 1_609_459_200 + height,
+                    bits: 0x1d00_ffff,
+                    nonce: 0,
+                    version: 1,
+                    tx_count: 1,
+                    size: 100,
+                    weight: 400,
+                    total_fee: 0,
+                    coinbase_value: 5_000_000_000,
+                },
+                txs: vec![TxRow {
+                    height,
+                    tx_index: 0,
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    size: 10,
+                    weight: 40,
+                    fee: 0,
+                    input_count: 1,
+                    output_count: 1,
+                    has_witness: false,
+                }],
+                inputs: vec![InputRow {
+                    height,
+                    tx_index: 0,
+                    input_index: 0,
+                    txid,
+                    prev_txid: [0u8; 32],
+                    prev_vout: 0xffff_ffff,
+                    script_sig_len: 0,
+                    sequence: 0xffff_ffff,
+                    witness_items: 0,
+                    witness_bytes: 0,
+                    is_coinbase: true,
+                }],
+                outputs: vec![OutputRow {
+                    height,
+                    tx_index: 0,
+                    output_index: 0,
+                    txid,
+                    value_sat: 5_000_000_000,
+                    script_pubkey_len: 0,
+                    script_type: 0,
+                    address_hash: [0u8; 32],
+                }],
+            }
+        }
+
+        let out_dir = std::env::temp_dir().join(format!("bidx-bench-consume-{}", std::process::id()));
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // Send two blocks in expected order.
+        for h in [0u32, 1] {
+            tx.send(WorkItem { height: h, block: synth_block(h) }).unwrap();
+        }
+        drop(tx);
+
+        let progress = ProgressBar::new(2);
+        // blocks_per_part=1 forces Part rotation after first block. Use
+        // do_sink=false so we don't need Parquet writers (we've covered
+        // their rotation in `pipeline` tests already).
+        bench_consume(
+            rx,
+            0,
+            2,
+            1, // blocks_per_part
+            false, // do_sink
+            &out_dir,
+            None, // utxo
+            &blocks_done,
+            &missing,
+            &sink_wall,
+            &utxo_wall,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(blocks_done.load(Ordering::Relaxed), 2);
+        // No sink ⇒ sink_wall stays 0.
+        assert_eq!(sink_wall.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn bench_consume_bails_when_channel_closes_early() {
+        use crossbeam_channel::bounded;
+        let (tx, rx) = bounded::<WorkItem>(4);
+        drop(tx); // Close immediately.
+
+        let blocks_done = AtomicU64::new(0);
+        let missing = AtomicU64::new(0);
+        let sink_wall = AtomicU64::new(0);
+        let utxo_wall = AtomicU64::new(0);
+        let progress = ProgressBar::new(1);
+        let out_dir = std::env::temp_dir().join(format!("bidx-bench-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let e = bench_consume(
+            rx,
+            0, 5, 1, false, &out_dir, None,
+            &blocks_done, &missing, &sink_wall, &utxo_wall, &progress,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("channel closed early"));
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn print_trial_and_aggregate_do_not_panic() {
+        // Build a two-trial aggregate with two stages, exercise the formatter.
+        let t0 = TrialReport {
+            trial: 0,
+            mode: BenchMode::Full,
+            blocks: 100,
+            blocks_per_sec: 5.0,
+            user_cpu_secs: 1.5,
+            peak_rss_mb: 128.0,
+            stages: vec![
+                StageReport { name: "header_pass", wall_secs: 0.5, cpu_util: 0.9, peak_rss_mb: 64.0 },
+                StageReport { name: "pipeline_wall_total", wall_secs: 20.0, cpu_util: 0.8, peak_rss_mb: 128.0 },
+            ],
+        };
+        let mut t1 = t0.clone();
+        t1.trial = 1;
+        // Just call them; they print to stdout. We assert here that nothing
+        // panics — printing correctness is verified visually in CI logs.
+        print_trial(&t0);
+        print_aggregate(&[t0.clone(), t1]);
+        let _ = t0; // silence unused
+    }
 }

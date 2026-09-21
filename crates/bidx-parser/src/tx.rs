@@ -257,3 +257,292 @@ fn parse_tx<'a>(
     };
     Ok((tx, inputs, outputs))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_for(version: i32) -> bidx_core::BlockHeader {
+        bidx_core::BlockHeader {
+            version,
+            prev_hash: Hash32::ZERO,
+            merkle_root: Hash32::ZERO,
+            time: 0,
+            bits: 0,
+            nonce: 0,
+        }
+    }
+
+    /// Non-witness, single-input, single-output synthetic tx body. Used both
+    /// standalone and embedded in block payloads. Returns the tx bytes.
+    fn synth_tx_body(value_sat: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1i32.to_le_bytes()); // version
+        b.push(1u8); // input_count
+        b.extend_from_slice(&[0xABu8; 32]); // prev_txid
+        b.extend_from_slice(&0u32.to_le_bytes()); // prev_vout
+        b.push(0u8); // script_len = 0
+        b.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+        b.push(1u8); // output_count
+        b.extend_from_slice(&value_sat.to_le_bytes());
+        b.push(0u8); // script_pubkey_len = 0
+        b.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        b
+    }
+
+    /// Build a block payload: 80-byte header + varint tx_count + tx bytes.
+    fn block_with(txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = vec![0u8; 80];
+        b.extend_from_slice(&(txs.len() as u64 as u8).to_le_bytes()); // varint, small counts
+        for t in txs {
+            b.extend_from_slice(t);
+        }
+        b
+    }
+
+    #[test]
+    fn parses_simple_block_weight_size_and_txid_fields() {
+        let tx0 = synth_tx_body(42_000);
+        let payload = block_with(&[tx0.clone()]);
+        let hash = dsha256(&payload[..80]);
+        let header = header_for(1);
+        let block = parse_block_full(&payload, 5, hash, &header).expect("parse");
+        // BlockRow fields.
+        assert_eq!(block.block_row.height, 5);
+        assert_eq!(block.block_row.tx_count, 1);
+        assert_eq!(block.block_row.size, payload.len() as u32);
+        assert_eq!(block.block_row.coinbase_value, 42_000);
+        assert_eq!(block.block_row.total_fee, 0);
+        assert_eq!(block.block_row.hash, *hash.as_bytes());
+        // TxRow fields.
+        let tx = &block.txs[0];
+        assert_eq!(tx.tx_index, 0);
+        assert_eq!(tx.height, 5);
+        assert_eq!(tx.version, 1);
+        assert_eq!(tx.locktime, 0);
+        assert_eq!(tx.input_count, 1);
+        assert_eq!(tx.output_count, 1);
+        assert!(!tx.has_witness);
+        assert_eq!(tx.size, tx0.len() as u32);
+        assert_eq!(tx.weight, tx0.len() as u32 * 4);
+        // txid = dsha256(stripped = full tx since no witness).
+        assert_eq!(tx.txid, *dsha256(&tx0).as_bytes());
+        // Input row.
+        let inp = &block.inputs[0];
+        assert_eq!(inp.prev_txid, [0xABu8; 32]);
+        assert_eq!(inp.prev_vout, 0);
+        assert_eq!(inp.sequence, 0xffff_ffff);
+        assert_eq!(inp.txid, tx.txid);
+        // Prev txid non-zero and vout not 0xffff_ffff so this is NOT coinbase.
+        assert!(!inp.is_coinbase);
+        // Output row.
+        let out = &block.outputs[0];
+        assert_eq!(out.value_sat, 42_000);
+        assert_eq!(out.txid, tx.txid);
+    }
+
+    #[test]
+    fn detects_coinbase_via_prev_out_pattern() {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(1u8);
+        tx.extend_from_slice(&[0u8; 32]); // prev_txid = zero
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prev_vout = max
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(1u8);
+        tx.extend_from_slice(&50_0000_0000u64.to_le_bytes()); // 50 BTC
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+        let block = parse_block_full(&payload, 0, hash, &header_for(1)).unwrap();
+        assert!(block.inputs[0].is_coinbase);
+        assert_eq!(block.outputs[0].value_sat, 50_0000_0000);
+        assert_eq!(block.block_row.coinbase_value, 50_0000_0000);
+    }
+
+    #[test]
+    fn rejects_value_above_21m_btc() {
+        let tx = synth_tx_body(21_000_001u64 * 100_000_000);
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        assert!(matches!(e, TxParseError::BadValue(_)), "got {:?}", e);
+    }
+
+    #[test]
+    fn tx_count_mismatch_when_payload_truncated() {
+        // Varint says 2 txs but only 1 tx is present.
+        let mut payload = vec![0u8; 80];
+        payload.extend_from_slice(&2u64.to_le_bytes()[..1]); // count = 2 (varint)
+        payload.extend_from_slice(&synth_tx_body(1_000));
+        let hash = dsha256(&payload[..80]);
+        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        // Either an EOF in cursor machinery or the explicit TxCountMismatch.
+        match e {
+            TxParseError::Cursor(_) | TxParseError::TxCountMismatch { .. } => {}
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn segwit_tx_parses_witness_bytes_and_weight() {
+        // Hand-built segwit tx:
+        //   version(4) | marker(0x00) | flag(0x01) | inputs(1) | ... | outputs(1) | ... |
+        //   witness (item_count=1, item_len=2, [0xAA, 0xBB]) | locktime
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0x00); // marker
+        tx.push(0x01); // flag
+        tx.push(1u8); // input_count
+        tx.extend_from_slice(&[0xCDu8; 32]);
+        tx.extend_from_slice(&7u32.to_le_bytes()); // vout=7
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(1u8); // output_count
+        tx.extend_from_slice(&10_000u64.to_le_bytes());
+        tx.push(0u8);
+        // witness for input 0: 1 item, 2 bytes
+        tx.push(1u8);
+        tx.push(2u8);
+        tx.push(0xAA);
+        tx.push(0xBB);
+        tx.extend_from_slice(&0x1122_3344u32.to_le_bytes()); // locktime
+
+        let payload = block_with(&[tx.clone()]);
+        let hash = dsha256(&payload[..80]);
+        let block = parse_block_full(&payload, 9, hash, &header_for(2)).unwrap();
+        let txrow = &block.txs[0];
+        assert!(txrow.has_witness);
+        assert_eq!(txrow.locktime, 0x1122_3344);
+        assert_eq!(block.inputs[0].witness_items, 1);
+        assert_eq!(block.inputs[0].witness_bytes, 2);
+        // BIP141 weight math, computed directly from the wire bytes we built:
+        //   tx        = 66 bytes (4+1+1+1+41+1+9+4+4)
+        //   stripped  = 60 bytes  (4+1+41+1+9+4, marker+flag and witness removed)
+        //   weight    = stripped*3 + total = 60*3 + 66 = 246
+        let stripped = 4 + 1 + 41 + 1 + 9 + 4;
+        let total = tx.len();
+        assert_eq!(txrow.size, total as u32);
+        assert_eq!(txrow.weight, (stripped * 3 + total) as u32);
+
+        // Recompute the expected segwit txid using the explicit witnessless
+        // stripped serialization and assert the parser's incremental hash matches.
+        let mut stripped_bytes = Vec::new();
+        stripped_bytes.extend_from_slice(&1i32.to_le_bytes()); // version
+        stripped_bytes.push(1u8); // input_count (no marker/flag)
+        stripped_bytes.extend_from_slice(&[0xCDu8; 32]);
+        stripped_bytes.extend_from_slice(&7u32.to_le_bytes());
+        stripped_bytes.push(0u8);
+        stripped_bytes.extend_from_slice(&0u32.to_le_bytes());
+        stripped_bytes.push(1u8); // output_count
+        stripped_bytes.extend_from_slice(&10_000u64.to_le_bytes());
+        stripped_bytes.push(0u8);
+        stripped_bytes.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        let want_txid = dsha256(&stripped_bytes);
+        assert_eq!(txrow.txid, *want_txid.as_bytes());
+    }
+
+    #[test]
+    fn segwit_flag_zero_rejected() {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0x00); // marker
+        tx.push(0x00); // flag = 0 — invalid
+        // Whatever follows doesn't matter; the parser must reject before reading.
+        tx.extend_from_slice(&[0u8; 32]);
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        assert!(matches!(e, TxParseError::BadSegwitFlag { .. }));
+    }
+
+    #[test]
+    fn multi_tx_block_rolls_up_counts_and_weight() {
+        let tx0 = synth_tx_body(1_000);
+        let tx1 = synth_tx_body(2_000);
+        let payload = block_with(&[tx0.clone(), tx1.clone()]);
+        let hash = dsha256(&payload[..80]);
+        let block = parse_block_full(&payload, 7, hash, &header_for(1)).unwrap();
+        assert_eq!(block.txs.len(), 2);
+        assert_eq!(block.inputs.len(), 2);
+        assert_eq!(block.outputs.len(), 2);
+        assert_eq!(block.txs[0].tx_index, 0);
+        assert_eq!(block.txs[1].tx_index, 1);
+        assert_ne!(block.txs[0].txid, block.txs[1].txid);
+        assert_eq!(block.block_row.tx_count, 2);
+        // Block weight = sum(tx weights) + 80*4 (header); enforced by parse_block_full.
+        let expect_w = (tx0.len() * 4 + tx1.len() * 4 + 80 * 4) as u32;
+        assert_eq!(block.block_row.weight, expect_w);
+    }
+
+    #[test]
+    fn varint_multi_byte_lengths_for_in_out_counts() {
+        // 0xfd (u16) multi-byte varint for input_count path.
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0xfd);
+        tx.extend_from_slice(&1u16.to_le_bytes()); // input_count = 1 via 0xfd varint
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        // 0xfe (u32) varint for output_count path.
+        tx.push(0xfe);
+        tx.extend_from_slice(&1u32.to_le_bytes()); // output_count = 1 via 0xfe varint
+        tx.extend_from_slice(&5_000u64.to_le_bytes());
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+        let block = parse_block_full(&payload, 4, hash, &header_for(1)).unwrap();
+        assert_eq!(block.inputs.len(), 1);
+        assert_eq!(block.outputs.len(), 1);
+    }
+
+    #[test]
+    fn multi_input_witness_each_tracked_independently() {
+        // Two-input segwit tx: first input has 0 witness items, second has 2.
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0x00);
+        tx.push(0x01);
+        tx.push(2u8); // two inputs
+        for _ in 0..2 {
+            tx.extend_from_slice(&[0xEEu8; 32]);
+            tx.extend_from_slice(&0u32.to_le_bytes());
+            tx.push(0u8); // script_len
+            tx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        tx.push(1u8); // one output
+        tx.extend_from_slice(&1_000u64.to_le_bytes());
+        tx.push(0u8);
+        // Witness for input 0: 0 items.
+        tx.push(0u8);
+        // Witness for input 1: 2 items, sizes 1 and 3 -> witness_bytes=4, items=2.
+        tx.push(2u8);
+        tx.push(1u8);
+        tx.push(0xAA);
+        tx.push(3u8);
+        tx.extend_from_slice(&[0xBB, 0xCC, 0xDD]);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        let payload = block_with(&[tx.clone()]);
+        let hash = dsha256(&payload[..80]);
+        let block = parse_block_full(&payload, 8, hash, &header_for(1)).unwrap();
+        assert_eq!(block.inputs.len(), 2);
+        assert_eq!(block.inputs[0].witness_items, 0);
+        assert_eq!(block.inputs[0].witness_bytes, 0);
+        assert_eq!(block.inputs[1].witness_items, 2);
+        assert_eq!(block.inputs[1].witness_bytes, 4);
+
+        // Each input is 41 bytes (32+4+1+4); strip marker+flag (2), witness
+        // encodings (1 + 1+1+1+3 = 7), and we have:
+        //   stripped = 4(version) + 1(cnt) + 2*41(ins) + 1(cnt) + 9(out) + 4(lock) = 101
+        let stripped: u32 = 4 + 1 + 2 * 41 + 1 + 9 + 4;
+        let total = tx.len() as u32;
+        assert_eq!(block.txs[0].size, total);
+        assert_eq!(block.txs[0].weight, stripped * 3 + total);
+    }
+}

@@ -551,4 +551,261 @@ mod tests {
         // Truncate mid-record.
         assert!(BlockUndo::decode(&enc[..20]).is_none());
     }
+
+    #[test]
+    fn read_varint_all_classes_and_eof() {
+        for (bytes, want) in [
+            (&[0u8][..], Some(0u64)),
+            (&[0xfc][..], Some(252u64)),
+            (&[0xfd, 0xfd, 0x00][..], Some(253u64)),
+            (&[0xfe, 0x00, 0x00, 0x01, 0x00][..], Some(65_536u64)),
+            (&[0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00][..], Some(1u64)),
+            // Truncations of each multi-byte form.
+            (&[0xfd][..], None),
+            (&[0xfd, 0xaa][..], None),
+            (&[0xfe][..], None),
+            (&[0xfe, 0, 0, 0][..], None),
+            (&[0xff][..], None),
+            (&[0xff, 0, 0, 0, 0, 0, 0, 0][..], None),
+            // Empty input.
+            (&[][..], None),
+        ] {
+            let mut s: &[u8] = bytes;
+            assert_eq!(read_varint(&mut s), want, "case {:?}", bytes);
+        }
+        // put_varint ↔ read_varint roundtrips for big values.
+        for n in [0u64, 252, 253, 65_535, 65_536, u32::MAX as u64, u64::MAX - 1] {
+            let mut buf = Vec::new();
+            put_varint(&mut buf, n);
+            let mut s: &[u8] = &buf;
+            assert_eq!(read_varint(&mut s), Some(n));
+        }
+    }
+
+    #[test]
+    fn utxo_value_decode_rejects_wrong_len() {
+        for n in 0..45usize {
+            assert!(UtxoValue::decode(&vec![0u8; n]).is_none());
+        }
+        assert!(UtxoValue::decode(&vec![0u8; 46]).is_none());
+    }
+
+    #[test]
+    fn undo_key_is_big_endian_height_ordering() {
+        // BE ordering lets prefix-scan cleanup work when we add it.
+        assert!(undo_key(100) < undo_key(200));
+        assert!(undo_key(u32::MAX - 1) < undo_key(u32::MAX));
+        assert_eq!(undo_key(0xDEADBEEF_u32), [0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// Synthetic OutputRow for tests.
+    fn out_row(
+        height: u32,
+        tx_index: u32,
+        output_index: u32,
+        txid: [u8; 32],
+        value_sat: u64,
+    ) -> OutputRow {
+        OutputRow {
+            height,
+            tx_index,
+            output_index,
+            txid,
+            value_sat,
+            script_pubkey_len: 25,
+            script_type: 1,
+            address_hash: [0xEEu8; 32],
+        }
+    }
+
+    fn inp_row(
+        height: u32,
+        tx_index: u32,
+        input_index: u32,
+        txid: [u8; 32],
+        prev_txid: [u8; 32],
+        prev_vout: u32,
+        is_coinbase: bool,
+    ) -> InputRow {
+        InputRow {
+            height,
+            tx_index,
+            input_index,
+            txid,
+            prev_txid,
+            prev_vout,
+            script_sig_len: 0,
+            sequence: 0,
+            witness_items: 0,
+            witness_bytes: 0,
+            is_coinbase,
+        }
+    }
+
+    fn tx_row(height: u32, tx_index: u32, txid: [u8; 32]) -> bidx_core::TxRow {
+        bidx_core::TxRow {
+            height,
+            tx_index,
+            txid,
+            version: 1,
+            locktime: 0,
+            size: 0,
+            weight: 0,
+            fee: 0,
+            input_count: 1,
+            output_count: 1,
+            has_witness: false,
+        }
+    }
+
+    /// Temp rocksdb path per test; unique to avoid race collisions.
+    fn tmp_path(kind: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "bidx-utxo-{}-{}-{}",
+            kind,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // RocksDB needs the parent dir to exist.
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Apply a block whose only output is sent to a later block which spends it.
+    /// Confirms spend linking, fees, and missing UTXO accounting.
+    /// the sparse fields we added. heavily Covered elsewhere; we focus on the
+    /// previously branches: set_tip/tip roundtrip, missing-UTXO accounting,
+    /// disconnect_block's "NoUndo" path, disk_size_bytes and path().
+    #[test]
+    fn apply_link_spend_disconnect_roundtrip() {
+        let dir = tmp_path("live");
+        let db = UtxoStore::open_live(&dir).unwrap();
+        let fund_txid = [0x11u8; 32];
+        let fund = out_row(0, 0, 0, fund_txid, 50_000);
+        let b0_outputs = vec![fund.clone()];
+        let r = db.apply_block(0, &[tx_row(0, 0, fund_txid)], &[], &b0_outputs).unwrap();
+        assert!(r.spends.is_empty());
+        assert_eq!(r.missing, 0);
+
+        // Block 1 spends block 0's output via a coinbase + one regular input.
+        let spend_txid = [0x22u8; 32];
+        let spend_cb = inp_row(1, 0, 0, spend_txid, [0u8; 32], 0xFFFF_FFFF, true);
+        let spend_in = inp_row(1, 1, 0, spend_txid, fund_txid, 0, false);
+        let b1_inputs = vec![spend_cb.clone(), spend_in.clone()];
+        let b1_outputs = vec![out_row(1, 1, 0, spend_txid, 45_000)];
+        let r = db
+            .apply_block(1, &[tx_row(1, 0, [0u8; 32]), tx_row(1, 1, spend_txid)], &b1_inputs, &b1_outputs)
+            .unwrap();
+        assert_eq!(r.spends.len(), 1, "coinbase inputs record no spend");
+        let s = &r.spends[0];
+        assert_eq!(s.spent_txid, fund_txid);
+        assert_eq!(s.spent_vout, 0);
+        assert_eq!(s.spent_value_sat, 50_000);
+        assert_eq!(s.spent_height, 0);
+        assert_eq!(s.spending_txid, spend_txid);
+        assert_eq!(s.spending_tx_index, 1);
+        // Fee = inputs(50k) - outputs(45k) = 5000 sat for tx_index=1 row only.
+        assert_eq!(r.fees[1], 5_000);
+
+        // tip roundtrip
+        db.set_tip(&TipState { height: 1, hash: Hash32::from_bytes([0xEE; 32]) }).unwrap();
+        let t = db.tip().unwrap().unwrap();
+        assert_eq!(t.height, 1);
+        assert_eq!(t.hash.0, [0xEE; 32]);
+
+        // Disconnect block 1 and verify the funded output comes back.
+        db.disconnect_block(1).unwrap();
+        let (v, _) = db.db.get_pinned(make_key(&fund_txid, 0)).unwrap().map(|b| (b.len(), 0i8)).unwrap();
+        assert_eq!(v, 45);
+        // Created outpoint in block 1 should be gone.
+        let gone = db.db.get_pinned(make_key(&spend_txid, 0)).unwrap();
+        assert!(gone.is_none());
+        // Undo record must be consumed: disconnecting again is an error.
+        assert!(matches!(db.disconnect_block(1), Err(UtxoError::NoUndo(1))));
+        // But live-mode set_tip still works after disconnect.
+        let t2 = db.tip().unwrap().unwrap();
+        assert_eq!(t2.height, 1); // it's the caller's job to roll tip back
+
+        // path / disk_size_bytes / flush / approx size (approx_size just queries a RocksDB prop).
+        assert_eq!(db.path(), dir.as_path());
+        db.flush().unwrap();
+        let _ = db.approx_size_on_disk();
+        let sz = db.disk_size_bytes();
+        assert!(sz > 0, "expected non-zero on-disk size after apply+flush");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Missing (prev_txid, prev_vout) reference increments `missing` without
+    /// failing the whole block.
+    #[test]
+    fn missing_utxo_counted_not_fatal() {
+        let dir = tmp_path("miss");
+        let db = UtxoStore::open(&dir).unwrap();
+        let inputs = vec![inp_row(
+            0, 0, 0, [0x33u8; 32], [0x44u8; 32], 0, false,
+        )];
+        let r = db
+            .apply_block(0, &[tx_row(0, 0, [0x33u8; 32])], &inputs, &[])
+            .unwrap();
+        assert_eq!(r.missing, 1);
+        assert!(r.spends.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bulk mode (no undo): apply_block returns no undo log, disconnect fails
+    /// with NoUndo, and all spend + fee paths still work.
+    #[test]
+    fn bulk_mode_no_undo_recorded() {
+        let dir = tmp_path("bulk");
+        let db = UtxoStore::open(&dir).unwrap();
+        let out_txid = [0xAAu8; 32];
+        db.apply_block(0, &[tx_row(0, 0, out_txid)], &[], &[out_row(0, 0, 0, out_txid, 100)])
+            .unwrap();
+        let inp = inp_row(1, 0, 0, [0xBBu8; 32], out_txid, 0, false);
+        let r = db.apply_block(1, &[tx_row(1, 0, [0xBBu8; 32])], std::slice::from_ref(&inp), &[]).unwrap();
+        assert_eq!(r.spends.len(), 1);
+        assert_eq!(r.fees[0], 100);
+        // No undo logged; disconnect must fail.
+        assert!(matches!(db.disconnect_block(1), Err(UtxoError::NoUndo(1))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same-block spend: output created and spent within one block. The
+    /// created outpoint must be removed from `undo.created` (otherwise
+    /// disconnect would delete a key that re-exists in `spent`).
+    #[test]
+    fn same_block_spend_affects_undo_correctly() {
+        let dir = tmp_path("same");
+        let db = UtxoStore::open_live(&dir).unwrap();
+        let txid = [0x99u8; 32];
+        let out = out_row(0, 0, 0, txid, 1000);
+        let inp = inp_row(0, 1, 0, txid, txid, 0, false); // spends own tx's vout=0 in same block
+        let tx0 = tx_row(0, 0, txid);
+        let tx1 = tx_row(0, 1, [0x88u8; 32]);
+        let r = db
+            .apply_block(0, &[tx0, tx1], std::slice::from_ref(&inp), std::slice::from_ref(&out))
+            .unwrap();
+        assert_eq!(r.spends.len(), 1);
+        // Now disconnect: the undo should handle the same-block spend cleanly.
+        db.disconnect_block(0).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// set_tip twice → latest wins; tip() with no prior write returns None.
+    #[test]
+    fn tip_set_get_overwrite_and_empty() {
+        let dir = tmp_path("tip");
+        let db = UtxoStore::open_live(&dir).unwrap();
+        assert!(db.tip().unwrap().is_none());
+        let a = TipState { height: 10, hash: Hash32::from_bytes([1; 32]) };
+        let b = TipState { height: 11, hash: Hash32::from_bytes([2; 32]) };
+        db.set_tip(&a).unwrap();
+        assert_eq!(db.tip().unwrap().unwrap(), a);
+        db.set_tip(&b).unwrap();
+        assert_eq!(db.tip().unwrap().unwrap(), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
