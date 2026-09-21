@@ -31,13 +31,20 @@ pub struct BlkRecord {
 }
 
 /// Memory-mapped view over a single blkNNNNN.dat file.
+///
+/// Supports Bitcoin Core v28+ **blocks XOR obfuscation**: if `xor.dat` is
+/// present next to the blk file, the payload is XOR-decoded at open time
+/// into an owned buffer (one bulk decode per file). Otherwise we keep the
+/// zero-copy mmap view.
 pub struct BlkFile {
     pub file_id: u32,
     pub path: PathBuf,
-    mmap: Mmap,
+    data: Vec<u8>,
 }
 
 impl BlkFile {
+    /// Open the blk file, applying XOR de-obfuscation if `xor.dat` is
+    /// present beside it (Bitcoin Core v28).
     pub fn open(path: &Path, file_id: u32) -> Result<Self, BlkError> {
         let file = File::open(path).map_err(|e| BlkError::Io {
             path: path.to_path_buf(),
@@ -50,33 +57,37 @@ impl BlkFile {
             path: path.to_path_buf(),
             source: e,
         })?;
+        let data = match read_xor_key(path) {
+            Some(key) => xor_decode(&mmap, &key),
+            None => mmap.to_vec(),
+        };
         Ok(BlkFile {
             file_id,
             path: path.to_path_buf(),
-            mmap,
+            data,
         })
     }
 
     #[inline]
     pub fn data(&self) -> &[u8] {
-        &self.mmap
+        &self.data
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.mmap.len()
+        self.data.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.mmap.is_empty()
+        self.data.is_empty()
     }
 
     /// Iterate all block records in file order (NOT chain order).
     pub fn records(&self) -> BlkRecordIter<'_> {
         BlkRecordIter {
             file_id: self.file_id,
-            data: &self.mmap,
+            data: &self.data,
             pos: 0,
         }
     }
@@ -87,15 +98,55 @@ impl BlkFile {
         let start = loc.data_offset() as usize;
         let len = loc.record_len as usize - 8;
         let end = start + len;
-        if end > self.mmap.len() {
+        if end > self.data.len() {
             return Err(BlkError::Corrupt {
                 file_id: self.file_id,
                 offset: loc.offset,
-                reason: format!("record overruns file: end {end}, file len {}", self.mmap.len()),
+                reason: format!("record overruns file: end {end}, file len {}", self.data.len()),
             });
         }
-        Ok(&self.mmap[start..end])
+        Ok(&self.data[start..end])
     }
+}
+
+/// Read the 8-byte XOR key from `xor.dat` in the same directory as
+/// `blk_path`, if present and well-formed.
+fn read_xor_key(blk_path: &Path) -> Option<[u8; 8]> {
+    let dir = blk_path.parent()?;
+    let p = dir.join("xor.dat");
+    let raw = std::fs::read(&p).ok()?;
+    if raw.len() != 8 {
+        return None;
+    }
+    let mut k = [0u8; 8];
+    k.copy_from_slice(&raw);
+    // An all-zero key would be a no-op; treat as "no obfuscation".
+    if k == [0u8; 8] {
+        None
+    } else {
+        Some(k)
+    }
+}
+
+/// XOR-decode `buf` against an 8-byte repeating key.
+/// Perf note: 8 bytes at a time using a u64 keeps this ~memory-bandwidth
+/// bound, on par with the mmap page-in cost the caller is replacing.
+fn xor_decode(buf: &[u8], key: &[u8; 8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut key8 = [0u8; 8];
+    key8.copy_from_slice(key);
+    let k64 = u64::from_le_bytes(key8);
+    let mut chunks = buf.chunks_exact(8);
+    for c in &mut chunks {
+        let v = u64::from_le_bytes(c.try_into().unwrap());
+        out.extend_from_slice(&(v ^ k64).to_le_bytes());
+    }
+    let rem = chunks.remainder();
+    let start = buf.len() - rem.len();
+    for (i, b) in rem.iter().enumerate() {
+        out.push(b ^ key8[(start + i) % 8]);
+    }
+    out
 }
 
 pub struct BlkRecordIter<'a> {
@@ -204,5 +255,47 @@ mod tests {
         assert_eq!(parse_blk_name("blk0000.dat"), None);
         assert_eq!(parse_blk_name("blk00000.dat.bak"), None);
         assert_eq!(parse_blk_name("rev00000.dat"), None);
+    }
+
+    #[test]
+    fn xor_decode_roundtrip_and_partial_tail() {
+        let key: [u8; 8] = [0x99, 0x73, 0xa9, 0x54, 0x4c, 0x10, 0x97, 0x0c];
+        let plaintext: Vec<u8> = (0..100u8).collect();
+        let obfuscated: Vec<u8> = plaintext
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 8])
+            .collect();
+        let back = xor_decode(&obfuscated, &key);
+        assert_eq!(back, plaintext);
+        // Empty input → empty output (no panics on chunks_exact(8)=0).
+        assert!(xor_decode(&[], &key).is_empty());
+        // Length not divisible by 8 exercises the remainder path.
+        let tiny = vec![0xAAu8; 5];
+        let xored: Vec<u8> = tiny.iter().enumerate().map(|(i, b)| b ^ key[i % 8]).collect();
+        let back = xor_decode(&xored, &key);
+        assert_eq!(back, tiny);
+    }
+
+    #[test]
+    fn read_xor_key_treats_all_zero_as_none() {
+        let dir = std::env::temp_dir().join(format!("bidx-xor-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blk = dir.join("blk00000.dat");
+        std::fs::write(&blk, b"xyz").unwrap();
+        // No xor.dat → None.
+        assert_eq!(read_xor_key(&blk), None);
+        // Wrong length → None.
+        std::fs::write(dir.join("xor.dat"), b"short").unwrap();
+        assert_eq!(read_xor_key(&blk), None);
+        // All zeros → None (no-op key).
+        std::fs::write(dir.join("xor.dat"), [0u8; 8]).unwrap();
+        assert_eq!(read_xor_key(&blk), None);
+        // Real key → Some.
+        let k = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        std::fs::write(dir.join("xor.dat"), k).unwrap();
+        assert_eq!(read_xor_key(&blk), Some(k));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

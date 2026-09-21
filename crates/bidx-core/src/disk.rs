@@ -279,6 +279,29 @@ mod tests {
     }
 
     #[test]
+    fn from_magic_covers_all_known_networks() {
+        assert_eq!(Network::from_magic(BLOCK_MAGIC), Some(Network::Mainnet));
+        assert_eq!(Network::from_magic(BLOCK_MAGIC_TESTNET3), Some(Network::Testnet3));
+        assert_eq!(Network::from_magic(BLOCK_MAGIC_SIGNET), Some(Network::Signet));
+        assert_eq!(Network::from_magic(BLOCK_MAGIC_TESTNET4), Some(Network::Testnet4));
+        assert_eq!(Network::from_magic(BLOCK_MAGIC_REGTEST), Some(Network::Regtest));
+        assert_eq!(Network::from_magic(0xDEAD_BEEF), None);
+    }
+
+    #[test]
+    fn detect_from_blocks_dir_returns_none_on_missing_or_garbage() {
+        let empty = std::env::temp_dir().join(format!("bidx-detect-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        // Empty directory → None.
+        assert_eq!(Network::detect_from_blocks_dir(&empty), None);
+        // Garbage (too short) → None.
+        std::fs::write(empty.join("blk00000.dat"), b"ab").unwrap();
+        assert_eq!(Network::detect_from_blocks_dir(&empty), None);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
     fn checkpoints_roundtrip_and_growth() {
         let tmp = std::env::temp_dir().join(format!("bidx-disk-ckpt-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);

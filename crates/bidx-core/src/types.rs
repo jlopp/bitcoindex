@@ -15,6 +15,10 @@ pub const BLOCK_MAGIC_REGTEST: u32 = 0xDAB5_BFFA;
 /// Returns true if `magic` is the wire magic of any known Bitcoin network.
 /// The indexer does not validate consensus, so parsing testnet/signet/regtest
 /// files is supported (useful for benchmarking & development).
+///
+/// Note: nodes running with `-blocksxor=1` (Bitcoin Core v28+) write
+/// obfuscated blk files; bidx-parser de-obfuscates at open time, so the
+/// values compared here are always post-decode.
 pub fn is_known_network_magic(magic: u32) -> bool {
     matches!(
         magic,
