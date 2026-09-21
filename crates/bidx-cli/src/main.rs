@@ -242,6 +242,7 @@ fn main() -> Result<()> {
                 skip_disk_check,
                 network: network.map(Into::into),
                 checkpoint_file,
+                orphan_blocks: None,
             })?;
         }
 

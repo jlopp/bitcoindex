@@ -25,4 +25,5 @@ serde_json.workspace = true
 crossbeam-channel.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
+parking_lot.workspace = true
 libc = "0.2"

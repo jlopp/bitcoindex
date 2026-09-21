@@ -18,3 +18,4 @@ serde_json.workspace = true
 base64.workspace = true
 hex.workspace = true
 tracing.workspace = true
+rustc-hash.workspace = true

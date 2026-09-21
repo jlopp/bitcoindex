@@ -36,15 +36,25 @@ pub struct BlkRecord {
 /// present next to the blk file, the payload is XOR-decoded at open time
 /// into an owned buffer (one bulk decode per file). Otherwise we keep the
 /// zero-copy mmap view.
+///
+/// Bitcoin Core preallocates blk files to 128 MiB with trailing zero
+/// padding; we trim at open time so iterators see "no more records" as
+/// `None` rather than a fake corrupted record parsed out of the padding.
 pub struct BlkFile {
     pub file_id: u32,
     pub path: PathBuf,
-    data: Vec<u8>,
+    /// Raw mmap of the original file (full file, including trailing
+    /// preallocated zero padding when Bitcoin Core preallocated).
+    mmap: Mmap,
+    /// XOR-obfuscated payload, decoded at open. `None` when file is plain.
+    decoded: Option<Vec<u8>>,
+    /// End of meaningful data, i.e., the file length minus trailing
+    /// preallocated zero padding. Slice with `data()`.
+    data_end: usize,
 }
 
 impl BlkFile {
-    /// Open the blk file, applying XOR de-obfuscation if `xor.dat` is
-    /// present beside it (Bitcoin Core v28).
+    /// Open the blk file following Bitcoin Core's blk*.dat convention.
     pub fn open(path: &Path, file_id: u32) -> Result<Self, BlkError> {
         let file = File::open(path).map_err(|e| BlkError::Io {
             path: path.to_path_buf(),
@@ -57,37 +67,52 @@ impl BlkFile {
             path: path.to_path_buf(),
             source: e,
         })?;
-        let data = match read_xor_key(path) {
-            Some(key) => xor_decode(&mmap, &key),
-            None => mmap.to_vec(),
+        let xor_key = read_xor_key(path);
+        // Trim trailing preallocated zero padding against the RAW view —
+        // after XOR decode those zeros turn into the key pattern and are
+        // indistinguishable from real data.
+        let data_end = last_raw_nonzero(&mmap);
+        let decoded = match &xor_key {
+            Some(key) => {
+                let mut decoded = xor_decode(&mmap, key);
+                decoded.truncate(data_end);
+                Some(decoded)
+            }
+            None => None,
         };
         Ok(BlkFile {
             file_id,
             path: path.to_path_buf(),
-            data,
+            mmap,
+            decoded,
+            data_end,
         })
     }
 
+    /// Return the slice of meaningful (post-trim) bytes.
     #[inline]
     pub fn data(&self) -> &[u8] {
-        &self.data
+        match &self.decoded {
+            Some(v) => v.as_slice(),
+            None => &self.mmap[..self.data_end],
+        }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.data().len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.data().is_empty()
     }
 
     /// Iterate all block records in file order (NOT chain order).
     pub fn records(&self) -> BlkRecordIter<'_> {
         BlkRecordIter {
             file_id: self.file_id,
-            data: &self.data,
+            data: self.data(),
             pos: 0,
         }
     }
@@ -98,15 +123,24 @@ impl BlkFile {
         let start = loc.data_offset() as usize;
         let len = loc.record_len as usize - 8;
         let end = start + len;
-        if end > self.data.len() {
+        let buf = self.data();
+        if end > buf.len() {
             return Err(BlkError::Corrupt {
                 file_id: self.file_id,
                 offset: loc.offset,
-                reason: format!("record overruns file: end {end}, file len {}", self.data.len()),
+                reason: format!("record overruns file: end {end}, file len {}", buf.len()),
             });
         }
-        Ok(&self.data[start..end])
+        Ok(&buf[start..end])
     }
+}
+
+/// Find the highest offset in the RAW (pre-decode) file that isn't zero.
+/// Bitcoin Core preallocates blk files with trailing zero padding; XOR
+/// decode turns raw zeros into the key pattern, so we must trim against
+/// the raw view BEFORE decoding, then decode the trimmed region.
+fn last_raw_nonzero(raw: &[u8]) -> usize {
+    raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0)
 }
 
 /// Read the 8-byte XOR key from `xor.dat` in the same directory as
@@ -275,6 +309,16 @@ mod tests {
         let xored: Vec<u8> = tiny.iter().enumerate().map(|(i, b)| b ^ key[i % 8]).collect();
         let back = xor_decode(&xored, &key);
         assert_eq!(back, tiny);
+    }
+
+    #[test]
+    fn last_raw_nonzero_trims_trailing_zeros_only() {
+        assert_eq!(last_raw_nonzero(&[]), 0);
+        assert_eq!(last_raw_nonzero(&[0u8]), 0);
+        assert_eq!(last_raw_nonzero(&[1u8]), 1);
+        assert_eq!(last_raw_nonzero(&[1u8, 2, 0, 0, 0]), 2);
+        // Leading zeros must NOT be trimmed — only trailing.
+        assert_eq!(last_raw_nonzero(&[0u8, 0, 1]), 3);
     }
 
     #[test]

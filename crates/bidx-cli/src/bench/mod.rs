@@ -290,7 +290,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                     let hash = bidx_core::dsha256(&header_raw);
                     let block = bidx_parser::parse_block_full(&bytes, height, hash, &header)?;
                     parse_wall.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    tx.send(WorkItem { height, block })
+                    tx.send(WorkItem::Block { height, block })
                         .map_err(|_| anyhow::anyhow!("consumer dropped"))?;
                     Ok(())
                 },
@@ -409,6 +409,45 @@ fn out_dir_for(_cfg: &BenchConfig) -> Result<PathBuf> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Watchdog that bails if RSS grows past `max_rss_kb`. Runs on a dedicated
+/// thread; on trip it sets `tripped` and logs. The caller is expected to
+/// check `tripped` periodically (in the consumer loop) and abort cleanly.
+///
+/// This is the user's safety net against one slow early height blowing up
+/// the consumer's reorder buffer into GB-sized territory before our
+/// backpressure counter kicks in.
+pub(crate) struct OomWatchdog {
+    tripped: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OomWatchdog {
+    pub(crate) fn start(max_rss_kb: u64) -> Self {
+        let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t2 = Arc::clone(&tripped);
+        let handle = std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let rss = ResourceSample::now().rss_kb;
+            if rss > max_rss_kb {
+                t2.store(true, Ordering::SeqCst);
+                return;
+            }
+        });
+        OomWatchdog { tripped, handle: Some(handle) }
+    }
+
+    pub(crate) fn is_tripped(&self) -> bool {
+        self.tripped.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for OomWatchdog {
+    fn drop(&mut self) {
+        // Don't wait if watchdog is still alive — just detach.
+        let _ = self.handle.take();
+    }
+}
+
 fn bench_consume(
     rx: crossbeam_channel::Receiver<WorkItem>,
     start: u32,
@@ -434,7 +473,14 @@ fn bench_consume(
     };
 
     while let Ok(item) = rx.recv() {
-        buffer.insert(item.height, item.block);
+        match item {
+            WorkItem::Block { height, block } => {
+                buffer.insert(height, block);
+            }
+            WorkItem::Skipped { height } => {
+                anyhow::bail!("bench did not expect a skipped height {height}");
+            }
+        }
         while let Some(block) = buffer.remove(&next) {
             if sink.is_some() {
                 let wanted_part = next / blocks_per_part;
