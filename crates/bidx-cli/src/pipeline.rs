@@ -352,3 +352,192 @@ pub fn inspect_block(blocks_dir: &Path, height: u32) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bidx_core::{BlockLocation, BLOCK_HEADER_LEN};
+    use std::fs;
+
+    /// Build a synthetic blocks dir with a single blk file containing N
+    /// coinbase-only blocks. Returns (dir, [heights]).
+    fn make_chain(n: u32) -> (PathBuf, Vec<bidx_core::Hash32>) {
+        let tmp = std::env::temp_dir().join(format!(
+            "bidx-pipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let blk_path = tmp.join("blk00000.dat");
+
+        let mut data = Vec::new();
+        let mut prev = bidx_core::Hash32::ZERO;
+        let mut hashes = Vec::new();
+        for i in 0..n {
+            let mut hdr = [0u8; BLOCK_HEADER_LEN];
+            hdr[0] = (1 + i) as u8; // version; distinct per height so hashes differ
+            hdr[4..36].copy_from_slice(prev.as_bytes());
+            for j in 0..32 {
+                hdr[36 + j] = (i as u8).wrapping_add(j as u8);
+            }
+            hdr[68..72].copy_from_slice(&(1000u32 + i).to_le_bytes());
+            hdr[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes());
+            hdr[76..80].copy_from_slice(&i.to_le_bytes()); // nonce = height
+
+            // One coinbase tx per block (same byte layout bidx-parser uses
+            // for its own unit tests: version|1in{spk=0,0xffffffff,0} → 1out
+            // (value only, empty spk) → locktime).
+            let mut tx = Vec::new();
+            tx.extend_from_slice(&1i32.to_le_bytes()); // version
+            tx.push(1u8); // 1 input
+            tx.extend_from_slice(&[0u8; 32]); // prev_txid = zero
+            tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prev_vout = max
+            tx.push(0u8); // script_sig_len = 0
+            tx.extend_from_slice(&0u32.to_le_bytes()); // sequence
+            tx.push(1u8); // 1 output
+            tx.extend_from_slice(&100u64.to_le_bytes()); // value
+            tx.push(0u8); // spk len 0
+            tx.extend_from_slice(&0u32.to_le_bytes()); // locktime
+
+            let payload_len = (BLOCK_HEADER_LEN + 1 + tx.len()) as u32;
+            data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+            data.extend_from_slice(&payload_len.to_le_bytes());
+            data.extend_from_slice(&hdr);
+            data.push(1u8); // tx_count
+            data.extend_from_slice(&tx);
+            prev = bidx_core::dsha256(&hdr);
+            hashes.push(prev);
+        }
+        fs::write(&blk_path, &data).unwrap();
+        (tmp, hashes)
+    }
+
+    #[test]
+    fn inspect_block_prints_rows_for_existing_height() {
+        let (dir, _) = make_chain(4);
+        // Should print the block without panicking. We can't easily assert
+        // on stdout under `cargo test`, but a successful return + no panic
+        // is what we verify.
+        inspect_block(&dir, 0).expect("inspect 0");
+        inspect_block(&dir, 2).expect("inspect 2");
+        inspect_block(&dir, 3).expect("inspect 3");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inspect_block_out_of_range_returns_err() {
+        let (dir, _) = make_chain(2);
+        let e = inspect_block(&dir, 99).err().expect("should error");
+        assert!(format!("{:#}", e).contains("out of range"), "got {}", e);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_parse_writes_parquet_files_in_range() {
+        let (blocks_dir, _) = make_chain(3);
+        let out = std::env::temp_dir().join(format!(
+            "bidx-pipe-out-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let utxo = std::env::temp_dir().join(format!(
+            "bidx-pipe-utxo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&utxo).unwrap();
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(3),
+            blocks_per_part: 2, // forces rotation: part 0 = [0,1], part 1 = [2]
+            threads: Some(2),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true, // no real disk-check against /tmp
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+        })
+        .expect("run_parse");
+        // Layout: out/<entity>/part-NNNNN.parquet, one entity dir per kind.
+        // With 3 blocks and blocks_per_part=2 we expect part-000000 (b0,b1)
+        // and part-000001 (b2) to exist for each of the 5 kinds.
+        let mut walk = Vec::new();
+        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+            let dir = out.join(entity);
+            if dir.exists() {
+                for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                    walk.push(format!("{}/{}", entity, e.file_name().to_string_lossy()));
+                }
+            }
+        }
+        let has_part0 = walk.iter().filter(|n| n.contains("part-00000.parquet")).count();
+        let has_part1 = walk.iter().filter(|n| n.contains("part-00001.parquet")).count();
+        assert_eq!(has_part0, 5, "expected all 5 entites to have part-00000: {:?}", walk);
+        // With blocks_per_part=2 the 3rd block (h=2) lands in part 1.
+        assert_eq!(has_part1, 5, "expected all 5 entities to have part-00001: {:?}", walk);
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
+    fn run_parse_rejects_empty_range() {
+        let (blocks_dir, _) = make_chain(3);
+        let out = std::env::temp_dir().join(format!("bo-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bu-{}", std::process::id()));
+        std::fs::create_dir_all(&utxo).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        // start=10 clamps to tip=2; end=0 stays. Therefore start(2) >= end(0).
+        let e = run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 10,
+            end: Some(0),
+            blocks_per_part: 1000,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("c")),
+        })
+        .err()
+        .expect("should error");
+        assert!(format!("{:#}", e).contains("empty range"));
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
+    fn thread_file_cache_opens_and_caches() {
+        let (blocks_dir, _hashes) = make_chain(2);
+        // Build a location pointing into blk00000.dat.
+        let loc = BlockLocation {
+            file_id: 0,
+            offset: 0,
+            record_len: (BLOCK_HEADER_LEN + 1 + 47 + 8) as u32, // header + cnt + coinbase(50ish) + record prefix
+        };
+        let cache = ThreadFileCache::new(&blocks_dir);
+        let b1 = cache.block_bytes(&loc).expect("first read");
+        assert_eq!(b1.len() as u32, loc.record_len - 8);
+        // Second call pulls from the per-thread cache.
+        let b2 = cache.block_bytes(&loc).expect("second read");
+        assert_eq!(b1.len(), b2.len());
+        let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+}

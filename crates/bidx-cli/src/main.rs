@@ -320,3 +320,75 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_arg_maps_to_bidx_core_network() {
+        let pairs = [
+            (NetworkArg::Mainnet, Network::Mainnet),
+            (NetworkArg::Testnet3, Network::Testnet3),
+            (NetworkArg::Testnet4, Network::Testnet4),
+            (NetworkArg::Signet, Network::Signet),
+            (NetworkArg::Regtest, Network::Regtest),
+        ];
+        for (a, expected) in pairs {
+            let back: Network = a.into();
+            assert_eq!(back, expected);
+        }
+    }
+
+    #[test]
+    fn cli_parses_all_subcommand_shapes() {
+        // Headers
+        let c = Cli::try_parse_from(["bidx", "headers", "--blocks-dir", "/tmp/x"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Inspect
+        let c = Cli::try_parse_from(["bidx", "inspect", "--blocks-dir", "/tmp/x", "--height", "7"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Parse (minimal)
+        let c = Cli::try_parse_from([
+            "bidx", "parse",
+            "--blocks-dir", "/tmp/x",
+            "--out", "/tmp/y",
+            "--utxo", "/tmp/z",
+        ]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Load
+        let c = Cli::try_parse_from(["bidx", "load", "--input", "/tmp/y"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // InitDb
+        let c = Cli::try_parse_from(["bidx", "init-db", "--host", "db.example"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Live (minimal)
+        let c = Cli::try_parse_from(["bidx", "live", "--utxo", "/tmp/z"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Bench with sensible args
+        let c = Cli::try_parse_from([
+            "bidx", "bench",
+            "--blocks-dir", "/tmp/x",
+            "--mode", "full",
+        ]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Reject unknown
+        assert!(Cli::try_parse_from(["bidx", "bogus-command"]).is_err());
+    }
+
+    #[test]
+    fn cli_parse_rejects_conflicting_or_missing_args() {
+        // Parse requires --out and --utxo.
+        let c = Cli::try_parse_from(["bidx", "parse", "--blocks-dir", "/tmp/x"]);
+        assert!(c.is_err());
+        // Inspect requires a height.
+        let c = Cli::try_parse_from(["bidx", "inspect", "--blocks-dir", "/tmp/x"]);
+        assert!(c.is_err());
+        // Global log filter accepted.
+        let c = Cli::try_parse_from([
+            "bidx", "--log", "bidx=debug", "headers", "--blocks-dir", "/tmp/x",
+        ]);
+        assert!(c.is_ok());
+        assert_eq!(c.unwrap().log, "bidx=debug");
+    }
+}

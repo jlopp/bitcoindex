@@ -256,6 +256,15 @@ pub fn default_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes tests that mutate BIDX_DISK_CHECKPOINT_STEP so their env
+    /// mutations don't leak into each other (tests run threads in parallel
+    /// by default).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static G: OnceLock<Mutex<()>> = OnceLock::new();
+        G.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn tmp_cfg(id: &str) -> (DiskGuardConfig, PathBuf) {
         let tmp = std::env::temp_dir().join(format!("bidx-guard-test-{}-{}", std::process::id(), id));
@@ -273,7 +282,7 @@ mod tests {
 
     #[test]
     fn pre_flight_bails_on_insufficient_disk() {
-        // Serialise to avoid env-var races with the other test.
+        let _g = env_lock();
         std::env::set_var("BIDX_DISK_CHECKPOINT_STEP", "1");
         let (cfg, ck) = tmp_cfg("bails");
         // One 100k checkpoint of 1 GiB → growth rate 0.01 B/blk ⇒ at tip
@@ -298,5 +307,104 @@ mod tests {
         // No checkpoints: projection unavailable, but must not crash.
         let r = cfg.run_pre_flight(900_000, 0, bidx_core::MIN_FREE_BYTES).unwrap();
         assert_eq!(r.checkpoints_used, 0);
+        // Fields are populated sensibly.
+        assert_eq!(r.network, Network::Mainnet);
+        assert_eq!(r.node_tip, 900_000);
+        assert_eq!(r.additional_needed_bytes, 0);
+        assert!(r.free_bytes_now > 0);
+        assert_eq!(r.free_bytes_at_completion, r.free_bytes_now);
+    }
+
+    #[test]
+    fn pre_flight_projection_positive_when_checkpoints_show_growth() {
+        let (mut cfg, ck) = tmp_cfg("slope");
+        // Use a minimal, controlled tracked dir so current_total_bytes is tiny
+        // (not the whole system /tmp).
+        let tiny = std::env::temp_dir().join(format!("bidx-tiny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tiny);
+        std::fs::create_dir_all(&tiny).unwrap();
+        std::fs::write(tiny.join("only"), [0u8; 64]).unwrap();
+        cfg.tracked_dirs = vec![tiny.clone()];
+        // Historical growth: 0.5 GiB per 100k blocks — 0.005 B/blk.
+        for (h, bytes) in [(100_000u32, 1u64 << 29), (200_000u32, 1u64 << 30)] {
+            append_checkpoint(&ck, Network::Mainnet, DiskCheckpoint { height: h, total_bytes: bytes })
+                .unwrap();
+        }
+        // Currently indexed 200k, total 1 GiB on disk; project another 200k blocks.
+        let r = cfg.run_pre_flight(400_000, 200_000, 0).unwrap();
+        assert_eq!(r.checkpoints_used, 2);
+        // Fit through (100k,0.5G) (200k,1G) projects 2G at 400k — much more
+        // than the 64-byte current dir we just wrote.
+        assert!(r.projected_total_bytes > r.current_total_bytes);
+        assert!(r.additional_needed_bytes > 0);
+        let _ = std::fs::remove_dir_all(&tiny);
+    }
+
+    #[test]
+    fn recorder_on_block_applied_respects_step_and_dedup() {
+        let _g = env_lock();
+        std::env::set_var("BIDX_DISK_CHECKPOINT_STEP", "5");
+        let (cfg, ck) = tmp_cfg("recorder");
+        let rec = DiskRecorder::new(cfg.clone());
+        // h=0 never records.
+        assert!(!rec.on_block_applied(0).unwrap());
+        // h=1,2,3,4,6 not multiple of 5 → no write.
+        for h in [1, 2, 3, 4, 6] {
+            assert!(!rec.on_block_applied(h).unwrap());
+        }
+        // h=5 and h=10 write.
+        assert!(rec.on_block_applied(5).unwrap());
+        assert!(rec.on_block_applied(10).unwrap());
+        // Re-playing h=5 ≤ last_dur must NOT write (dedup guard).
+        assert!(!rec.on_block_applied(5).unwrap());
+        let read = read_checkpoints(&ck, Network::Mainnet);
+        assert_eq!(read.len(), 2, "expected 2 checkpoints, got {:?}", read);
+        assert_eq!(read[0].height, 5);
+        assert_eq!(read[1].height, 10);
+        std::env::remove_var("BIDX_DISK_CHECKPOINT_STEP");
+    }
+
+    #[test]
+    fn current_total_bytes_sums_tracked_dirs() {
+        let (mut cfg, _ck) = tmp_cfg("total");
+        let tmp = std::env::temp_dir().join(format!("bidx-guard-total-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("a")).unwrap();
+        std::fs::create_dir_all(tmp.join("b")).unwrap();
+        std::fs::write(tmp.join("a/x"), [1u8; 16]).unwrap();
+        std::fs::write(tmp.join("b/y"), [1u8; 32]).unwrap();
+        cfg.tracked_dirs = vec![tmp.join("a"), tmp.join("b")];
+        let t = cfg.current_total_bytes();
+        assert!(t >= 48, "got {}", t);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn default_layout_builds_expected_paths() {
+        let root = std::path::PathBuf::from("/tmp/bidx-root");
+        let utxo = std::path::PathBuf::from("/tmp/bidx-root/utxo");
+        let out = std::path::PathBuf::from("/tmp/bidx-root/out");
+        let cfg = default_layout(&root, Network::Testnet4, &utxo, std::slice::from_ref(&out));
+        assert_eq!(cfg.network, Network::Testnet4);
+        assert_eq!(cfg.index_root, root);
+        assert_eq!(cfg.checkpoint_file, root.join("bidx-disk-checkpoints.txt"));
+        assert_eq!(cfg.tracked_dirs, vec![utxo, out]);
+    }
+
+    #[test]
+    fn recorder_boots_up_last_known_checkpoint_skips_rewrites() {
+        let _g = env_lock();
+        std::env::set_var("BIDX_DISK_CHECKPOINT_STEP", "10");
+        let (cfg, ck) = tmp_cfg("boots");
+        append_checkpoint(&ck, Network::Mainnet, DiskCheckpoint { height: 20, total_bytes: 1 }).unwrap();
+        let rec = DiskRecorder::new(cfg);
+        // Re-seeded from existing file: below-max h is rejected.
+        assert!(!rec.on_block_applied(10).unwrap());
+        // New, higher boundary is accepted.
+        assert!(rec.on_block_applied(30).unwrap());
+        let read = read_checkpoints(&ck, Network::Mainnet);
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1].height, 30);
+        std::env::remove_var("BIDX_DISK_CHECKPOINT_STEP");
     }
 }

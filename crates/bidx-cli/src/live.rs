@@ -92,6 +92,194 @@ impl LiveSink {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "bidx-live-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn synthetic_block(height: u32) -> bidx_parser::FullBlock {
+        let coinbase_txid = [0x11u8; 32];
+        let hdr = bidx_core::BlockHeader {
+            version: 1,
+            prev_hash: bidx_core::Hash32::ZERO,
+            merkle_root: bidx_core::Hash32::ZERO,
+            time: 0,
+            bits: 0,
+            nonce: 0,
+        };
+        bidx_parser::FullBlock {
+            block_row: bidx_core::BlockRow {
+                height,
+                hash: [0xAAu8; 32],
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0,
+                nonce: 0,
+                version: hdr.version,
+                tx_count: 1,
+                size: 0,
+                weight: 0,
+                total_fee: 0,
+                coinbase_value: 100,
+            },
+            txs: vec![bidx_core::TxRow {
+                height,
+                tx_index: 0,
+                txid: coinbase_txid,
+                version: 1,
+                locktime: 0,
+                size: 0,
+                weight: 0,
+                fee: 0,
+                input_count: 1,
+                output_count: 1,
+                has_witness: false,
+            }],
+            inputs: vec![bidx_core::InputRow {
+                height,
+                tx_index: 0,
+                input_index: 0,
+                txid: coinbase_txid,
+                prev_txid: [0u8; 32],
+                prev_vout: 0xFFFF_FFFF,
+                script_sig_len: 0,
+                sequence: 0,
+                witness_items: 0,
+                witness_bytes: 0,
+                is_coinbase: true,
+            }],
+            outputs: vec![bidx_core::OutputRow {
+                height,
+                tx_index: 0,
+                output_index: 0,
+                txid: coinbase_txid,
+                value_sat: 100,
+                script_pubkey_len: 0,
+                script_type: 0,
+                address_hash: [0u8; 32],
+            }],
+        }
+    }
+
+    #[test]
+    fn live_sink_rotates_every_live_blocks_per_part() {
+        let dir = tmp("rotate");
+        let mut sink = LiveSink::create(&dir, 0).unwrap();
+        // First block at h=0 lands in part-0.
+        sink.write_block(&synthetic_block(0), &[]).unwrap();
+        assert_eq!(sink.part, 0);
+        // Still part-0 while height < LIVE_BLOCKS_PER_PART.
+        sink.write_block(&synthetic_block(500), &[]).unwrap();
+        assert_eq!(sink.part, 0, "h=500 still part 0 (< {})", LIVE_BLOCKS_PER_PART);
+        // h = LIVE_BLOCKS_PER_PART rolls to part 1.
+        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART), &[]).unwrap();
+        assert_eq!(sink.part, 1);
+        // h = 2 × LIVE_BLOCKS_PER_PART rolls to part 2.
+        sink.write_block(&synthetic_block(2 * LIVE_BLOCKS_PER_PART), &[]).unwrap();
+        assert_eq!(sink.part, 2);
+        if let Some(s) = sink.sink.take() {
+            s.finish().unwrap();
+        }
+        // Walk entity dirs and count part files across them (files are named
+        // part-NNNNN.parquet with 5 digits).
+        let mut parts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+            for e in std::fs::read_dir(dir.join(entity)).unwrap().flatten() {
+                parts.insert(e.file_name().to_string_lossy().to_string());
+            }
+        }
+        assert_eq!(
+            parts.iter().cloned().collect::<Vec<_>>(),
+            vec!["part-00000.parquet", "part-00001.parquet", "part-00002.parquet"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_sink_write_block_emits_all_row_kinds() {
+        let dir = tmp("kinds");
+        let mut sink = LiveSink::create(&dir, 0).unwrap();
+        let mut block = synthetic_block(7);
+        // Add a 2nd tx + regular input + spend row so every sink's write loop
+        // is exercised.
+        block.block_row.tx_count = 2;
+        let txid_s = [0x22u8; 32];
+        block.txs.push(bidx_core::TxRow {
+            height: 7,
+            tx_index: 1,
+            txid: txid_s,
+            version: 1,
+            locktime: 0,
+            size: 0,
+            weight: 0,
+            fee: 5,
+            input_count: 1,
+            output_count: 1,
+            has_witness: false,
+        });
+        block.inputs.push(bidx_core::InputRow {
+            height: 7,
+            tx_index: 1,
+            input_index: 0,
+            txid: txid_s,
+            prev_txid: [0xEE; 32],
+            prev_vout: 3,
+            script_sig_len: 0,
+            sequence: 1,
+            witness_items: 0,
+            witness_bytes: 0,
+            is_coinbase: false,
+        });
+        block.outputs.push(bidx_core::OutputRow {
+            height: 7,
+            tx_index: 1,
+            output_index: 0,
+            txid: txid_s,
+            value_sat: 50,
+            script_pubkey_len: 0,
+            script_type: 1,
+            address_hash: [0xBB; 32],
+        });
+        let spends = vec![bidx_core::SpendRow {
+            height: 7,
+            spending_tx_index: 1,
+            spending_input_index: 0,
+            spending_txid: txid_s,
+            spent_txid: [0xEE; 32],
+            spent_vout: 3,
+            spent_value_sat: 55,
+            spent_script_type: 1,
+            spent_address_hash: [0xCC; 32],
+            spent_height: 0,
+        }];
+        sink.write_block(&block, &spends).unwrap();
+        if let Some(s) = sink.sink.take() {
+            s.finish().unwrap();
+        }
+        // Each of the 5 entities must have produced its part-00000 file.
+        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+            let p = dir.join(entity).join("part-00000.parquet");
+            assert!(p.exists(), "missing {:?}", p);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 pub fn run_live(cfg: LiveConfig) -> Result<()> {
     let node = NodeClient::new(RpcConfig {
         url: cfg.rpc_url.clone(),
