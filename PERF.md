@@ -531,6 +531,162 @@ lookup at all** — i.e. keep more of the UTXO working set in memory and consult
 RocksDB less often, rather than asking RocksDB the same number of questions
 faster. That is a different design (a hot-set cache in front of the store, or
 restructuring the apply path around an in-memory delta), not a batching tweak.
+See §10 for what that would concretely look like.
+
+## 10. Why the lookups exist, and the one that can be removed
+
+### The lookups are not optional
+
+A transaction input in the raw block data carries only *pointers*: `prev_txid`,
+`prev_vout`, and the unlocking script (`script_sig_len`, `witness_items`, …). It
+does **not** carry the value being spent, the address it belonged to, the script
+type, or the height it was created at. That is the definition of the UTXO model:
+a block references outputs of *other* blocks, so the information is simply not
+in the block being parsed.
+
+But `SpendRow` — the analytical payload of this index — requires exactly those
+missing fields. `record_spend` copies four of them straight out of the stored
+entry (`v.value_sat`, `v.script_type`, `v.address_hash`, `v.height`), and fees
+are `Σ(inputs) − Σ(outputs)` where only the outputs are in the block:
+
+```
+fees[tx] += v.value_sat     // the input value, known only from the store
+```
+
+So there are three distinct consumers of each lookup:
+
+1. **Spend enrichment** — value, script type, address hash, spent height. Four
+   fields, all needed for the schema. `address_hash` is always populated at
+   parse time via `classify_script`, so it is not optional.
+2. **Fee computation** — needs *only* `value_sat` (8 bytes).
+3. **UTXO set maintenance** — the delete, and in undo-enabled mode the old value
+   needed to reverse it on a reorg.
+
+### The lever: most of that does not need a 45-byte entry
+
+Consumers 2 and 3 are satisfied by far less than the full 36-byte-key →
+45-byte-value lookup:
+
+- Consumer 2 needs 8 bytes.
+- Consumer 3 needs the value *only* when undo logging is on; in bulk mode the
+  entry is just deleted.
+
+So a plausible design is to keep a compact in-memory map alongside RocksDB:
+
+| map | key | value | rough size at 180M UTXOs |
+|---|---|---|---|
+| value-only | 36 B | 8 B | ~8 GB |
+| value + script/address | 36 B | 45 B | ~15 GB |
+
+The second row is the whole set in RAM, which is only worth it on a big box. The
+first row is the interesting one: it serves fees and set maintenance from memory
+and leaves RocksDB to answer only the enrichment reads.
+
+**Be honest about the arithmetic.** At 180M UTXOs even a value-only map is ~8 GB,
+which is not obviously cheaper than the page cache the 1 GiB block cache is
+already using. The win is not free memory; it is (a) no per-key RocksDB search,
+(b) no `PinnableSlice` construction, and (c) a predictable hot set rather than an
+LRU guessing. Whether that beats the cache depends on the machine, and it should
+be measured with the §9 counters before anyone builds it — specifically, watch
+`db_time` as a share of apply on a mainnet-sized store.
+
+**Also note the interaction with undo.** A memory-resident map must stay
+consistent with the RocksDB set across a reorg, which is what `BlockUndo` exists
+to guarantee. Any such cache has to be driven from the same `WriteBatch`
+ordering, or reorg handling breaks in exactly the way `test-coverage.mdc` warns
+about. This is a real design cost, not a footnote.
+
+This is the direction to explore on mainnet, not another batching tweak.
+
+## 11. The in-memory recent-UTXO cache: implemented and measured
+
+§10 argued the lever was to *remove* lookups rather than batch them. That was
+built as a minimum viable cache and A/B-tested.
+
+### Design
+
+`RecentUtxoCache` — a bounded `FxHashMap<[u8;36], UtxoValue>` plus a creation-
+ordered `VecDeque` for eviction. `--utxo-cache-mb <N>` enables it (default 0 =
+disabled, i.e. the baseline).
+
+Decisions worth recording, because each was a fork in the road:
+
+- **Insert at block end, from `pending`.** `pending` is seeded with every output
+  before the input loop runs and has same-block spends removed, so at block end
+  it holds exactly the outputs that survived — the true new UTXOs. Inserting
+  earlier would risk caching an outpoint the same block is about to spend, making
+  the cache and `pending` disagree. At block end it is both correct and minimal.
+- **Removal is eviction-blind.** A spent outpoint leaves the cache on a hit. The
+  key is left in the order queue; eviction tolerates a stale key. This mirrors
+  store semantics: a spent outpoint is gone from the UTXO set, so a later block
+  cannot legitimately spend it again.
+- **Only in bulk (non-undo) mode.** Live mode must keep `BlockUndo` byte-exact
+  for reorgs, and threading an in-memory view through that path adds correctness
+  risk for no benchmarkable benefit.
+- **Entries are full `UtxoValue`s — nothing was slimmed.** The brief was to strip
+  fields down, but that turned out to be unsafe, not merely risky:
+  `spent_value_sat`, `spent_script_type`, `spent_address_hash` and
+  `spent_height` are all written into `SpendRow`. Truncating the address hash
+  would **corrupt the index**, not just risk a lookup collision. The key cannot
+  be truncated either: the cache is keyed on the full outpoint, and a false hit
+  would return the wrong value. So the win comes from avoiding the RocksDB
+  lookup, not from smaller entries.
+
+### A/B (testnet4, full chain, 158,602 blocks, sequential, fresh stores)
+
+| | no cache | cache (2048 MiB) |
+|---|---:|---:|
+| `utxo_apply` wall | 159.728 s | **137.749 s** |
+| blocks/s | 640.5 | **740.7** |
+| apply p50 | 0.01 ms | 0.01 ms |
+| apply p99 | 23.11 ms | **17.66 ms** |
+| apply max | 155.26 ms | 8426.53 ms |
+| **database lookups** | **23,754,999** | **5,123** |
+| cache hits | — | 23,749,876 |
+| db_time | 53.412 s (33.4% of apply) | **2.586 s (1.9%)** |
+| peak RSS | 4773 MB | 8164 MB |
+
+**Apply wall −13.8%, throughput +15.7%.** Database lookups fell by **99.98%** —
+from 23.75M to 5,123, a 99.98% cache hit rate — and db_time fell from 33.4% of
+apply to 1.9%.
+
+### Correctness verified, not assumed
+
+A 99.98% hit rate is exactly the situation where a wrong cache value would hide
+in plain sight, so the outputs were compared rather than trusted. All five
+Parquet tables are **byte-identical** (sha256) between the two runs:
+
+```
+blocks         fbeff9f51ca0c708  == fbeff9f51ca0c708
+transactions   c1a9674e71d09bac  == c1a9674e71d09bac
+inputs         fcec6dd94946f022  == fcec6dd94946f022
+outputs        176043e5eec756ae  == 176043e5eec756ae
+spends         54b806006c715f36  == 54b806006c715f36
+```
+
+Row counts also match exactly (158,602 blocks / 14,901,533 tx / 33,335,503
+inputs / 57,353,179 outputs / 33,176,901 spends). Five unit tests cover the
+cache: hit fidelity against the expected `SpendRow` fields, the disabled
+control, eviction-to-budget with a correct DB fallback, exhaustive accounting
+(`pending + db + cache` == input count), and hit-rate sanity.
+
+### Caveats
+
+- **Peak RSS +3.4 GB** for a 2 GiB budget (the budget plus hash-map and queue
+  overhead, and the figure is a kernel high-water mark including transient
+  allocations). On a memory-constrained box, size it down; the hit rate is what
+  you are trading.
+- **apply max regressed to 8.4 s** on one block. That is compaction, not the
+  cache — the cached run reached 2.9 GB of SST data vs 2.6 GB without, so it
+  compacted harder. It did not affect the total, but it is visible in the tail.
+- **`CACHE_ENTRY_COST` (112 B) is an estimate**, so the budget is approximate.
+  Fine for a cache, but do not read `bytes` as exact.
+- **Testnet4 only.** The hit rate is a property of this chain's spend pattern:
+  a 2 GiB window covers a large fraction of testnet4's small UTXO set. On mainnet
+  a 2 GiB window will cover a much smaller fraction and the hit rate will be
+  lower — this must be re-measured before trusting the gain.
+- **Not enabled in live mode**, so production `bidx live` does not get this yet.
+  Enabling it there needs the reorg/undo path to be reconciled deliberately.
 
 ### Tests
 

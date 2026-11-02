@@ -5,4 +5,6 @@ pub mod parquet_writers;
 pub mod utxo;
 
 pub use parquet_writers::{ParquetSink, SinkConfig};
-pub use utxo::{BlockUndo, SpendResult, TipState, UtxoError, UtxoStore, UtxoValue};
+pub use utxo::{
+    BlockUndo, CacheStats, SpendResult, TipState, UtxoError, UtxoStore, UtxoValue,
+};

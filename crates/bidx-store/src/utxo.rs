@@ -90,6 +90,115 @@ fn make_key(txid: &[u8; 32], vout: u32) -> [u8; 36] {
     k
 }
 
+/// Approximate in-memory cost of one cache entry, used for eviction accounting.
+///
+/// The exact allocator overhead is unknowable, so this is a deliberate fixed
+/// estimate: key 36 + `UtxoValue` 45 = 81 bytes of payload, plus the hash-map
+/// and recency-queue overhead. Budgets are therefore approximate, which is fine
+/// for a cache whose whole purpose is bounded memory.
+const CACHE_ENTRY_COST: usize = 112;
+
+/// A bounded cache of the most recently created UTXOs, kept in memory.
+///
+/// Why this exists: `apply_block` must read the *previous* output for every
+/// spent input, because a transaction input carries only a pointer (`prev_txid`,
+/// `prev_vout`) — not the value, address, script type, or height. Those four
+/// fields are required by `SpendRow` and by fee computation, and they live only
+/// in the UTXO store. On testnet4 that was 23.7M database lookups costing ~35%
+/// of apply wall time (PERF.md §9), and the cost is per-key RocksDB work rather
+/// than I/O, so batching it did not help.
+///
+/// This cache removes the RocksDB lookup for the *most recently created*
+/// outputs, which are the ones most likely to be spent soon. It is a plain hash
+/// lookup instead of a block-index search, bloom check and value construction.
+///
+/// Entry size cannot be reduced below `UtxoValue`: `spent_value_sat`,
+/// `spent_script_type`, `spent_address_hash` and `spent_height` are all written
+/// into `SpendRow`, so truncating the address hash (or any other field) would
+/// corrupt the index rather than merely risk a lookup collision. The key cannot
+/// be truncated either — the cache is keyed on the full outpoint, and a false
+/// hit would return the wrong value.
+struct RecentUtxoCache {
+    map: FxHashMap<[u8; 36], UtxoValue>,
+    /// Creation order, oldest at the front. Used to evict the least recently
+    /// created entries once the budget is exceeded. An outpoint is created at
+    /// most once and spent at most once, so this is a faithful recency order.
+    order: std::collections::VecDeque<[u8; 36]>,
+    budget_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl RecentUtxoCache {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            map: FxHashMap::default(),
+            order: std::collections::VecDeque::new(),
+            budget_bytes,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Insert a newly created outpoint. Called for every output of every block.
+    ///
+    /// The caller only invokes this when the cache is enabled and undo is off,
+    /// so there is no "already present" case in practice; if one occurs the
+    /// entry is refreshed without being re-queued, so the recency order stays
+    /// consistent with creation order.
+    fn insert(&mut self, key: [u8; 36], val: UtxoValue) {
+        if self.map.insert(key, val).is_none() {
+            self.order.push_back(key);
+            self.evict_to_budget();
+        }
+    }
+
+    /// Look up a spent outpoint, removing it on a hit.
+    ///
+    /// Removal mirrors the store semantics: a spent outpoint leaves the UTXO
+    /// set, so a later block cannot legitimately spend it again. Keeping it
+    /// would risk serving a stale value if the outpoint were somehow recreated.
+    fn remove(&mut self, key: &[u8; 36]) -> Option<UtxoValue> {
+        match self.map.remove(key) {
+            Some(v) => {
+                self.hits += 1;
+                // Leave the key in `order`; eviction tolerates a stale key.
+                Some(v)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Drop the least recently created entries until the budget is met.
+    ///
+    /// `order` may contain keys that were already removed by a spend, so
+    /// eviction skips those rather than assuming the front key is resident.
+    fn evict_to_budget(&mut self) {
+        while self.map.len() * CACHE_ENTRY_COST > self.budget_bytes {
+            match self.order.pop_front() {
+                Some(k) => {
+                    self.map.remove(&k);
+                }
+                // Order exhausted but still over budget: cannot happen while
+                // every resident key was pushed to `order`, but stop rather
+                // than spin if it ever did.
+                None => break,
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.map.len() * CACHE_ENTRY_COST
+    }
+}
+
 #[inline]
 fn undo_key(height: u32) -> [u8; 4] {
     height.to_be_bytes()
@@ -197,6 +306,10 @@ pub struct UtxoStore {
     db: DB,
     path: PathBuf,
     pending: Mutex<FxHashMap<[u8; 36], UtxoValue>>,
+    /// Bounded in-memory cache of the most recently created UTXOs. `None` when
+    /// disabled (undo-enabled/live mode, where correctness is worth more than
+    /// speed, and benchmarking the baseline). See `RecentUtxoCache`.
+    recent: Option<Mutex<RecentUtxoCache>>,
     /// When false, undo records are not written (bulk initial load).
     /// Live mode enables undo so reorgs can be reversed.
     undo_enabled: bool,
@@ -235,12 +348,38 @@ pub struct SpendResult {
     /// Inputs resolved from `pending` without a database read (same-block
     /// spends). `pending_hits + db_lookups` == non-coinbase input count.
     pub pending_hits: u64,
+    /// Inputs resolved from the in-memory recent-UTXO cache, i.e. database
+    /// lookups the cache removed. Always 0 when the cache is disabled.
+    pub cache_hits: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TipState {
     pub height: u32,
     pub hash: Hash32,
+}
+
+/// Snapshot of the in-memory recent-UTXO cache, for reporting and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub budget_bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CacheStats {
+    /// Cache hit rate over all lookups the cache was consulted for, or `None`
+    /// before any lookup has happened.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            None
+        } else {
+            Some(self.hits as f64 / total as f64)
+        }
+    }
 }
 
 /// Block cache capacity, shared by every column family.
@@ -318,6 +457,26 @@ impl UtxoStore {
         Self::open_with(path, false, false, true)
     }
 
+    /// Open in bulk-load mode with the in-memory recent-UTXO cache enabled.
+    ///
+    /// The cache is a pure performance layer: it holds a copy of recently
+    /// created outputs so a spend of a recent output can be answered from memory
+    /// instead of RocksDB. Disabled in live mode because `BlockUndo` must be
+    /// byte-exact for reorgs, and mixing an in-memory view into that path adds
+    /// a correctness risk for no benchmarkable benefit.
+    pub fn open_cached(path: &Path, cache_bytes: usize) -> Result<Self, UtxoError> {
+        let mut store = Self::open_with(path, false, false, false)?;
+        store.recent = Some(Mutex::new(RecentUtxoCache::new(cache_bytes)));
+        Ok(store)
+    }
+
+    /// Open in bulk-load mode with both the cache and RocksDB statistics.
+    pub fn open_cached_statistics(path: &Path, cache_bytes: usize) -> Result<Self, UtxoError> {
+        let mut store = Self::open_with(path, false, false, true)?;
+        store.recent = Some(Mutex::new(RecentUtxoCache::new(cache_bytes)));
+        Ok(store)
+    }
+
     fn open_with(
         path: &Path,
         wal: bool,
@@ -351,6 +510,7 @@ impl UtxoStore {
             db,
             path: path.to_path_buf(),
             pending: Mutex::new(FxHashMap::default()),
+            recent: None,
             undo_enabled,
             statistics,
         })
@@ -361,11 +521,6 @@ impl UtxoStore {
     }
     fn cf_meta(&self) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(CF_META).expect("meta cf")
-    }
-    fn cf_default(&self) -> &rocksdb::ColumnFamily {
-        self.db
-            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
-            .expect("default cf")
     }
 
     /// Apply one block forward. In undo-enabled (live) mode, also writes the
@@ -413,6 +568,7 @@ impl UtxoStore {
         let mut db_lookups = 0u64;
         let mut db_nanos = 0u64;
         let mut pending_hits = 0u64;
+        let mut cache_hits = 0u64;
 
         for inp in inputs {
             if inp.is_coinbase {
@@ -434,6 +590,17 @@ impl UtxoStore {
                 pending_hits += 1;
                 record_spend(&mut spends, &mut fees, height, inp, v);
             } else {
+                // Cache-first: a recently created output can be answered from
+                // memory instead of a RocksDB point lookup. On a miss we fall
+                // through to the database, which is the baseline path.
+                if let Some(ref cache) = self.recent {
+                    if let Some(v) = cache.lock().remove(&key) {
+                        cache_hits += 1;
+                        batch.delete(key);
+                        record_spend(&mut spends, &mut fees, height, inp, v);
+                        continue;
+                    }
+                }
                 db_lookups += 1;
                 let t0 = std::time::Instant::now();
                 let got = self.db.get_pinned(key);
@@ -454,6 +621,26 @@ impl UtxoStore {
                         missing += 1;
                     }
                 }
+            }
+        }
+
+        // Publish this block's outputs into the cache once the block is done.
+        //
+        // Deliberately not interleaved with the input loop. `pending` is seeded
+        // with every output before the loop starts, so a same-block spend is
+        // resolved from `pending` and never reaches the cache anyway; inserting
+        // earlier would only risk the cache holding an outpoint that this same
+        // block is about to spend, which would make the cache and `pending`
+        // disagree. At block end, `pending` holds exactly the outputs that
+        // survived — the true new UTXOs — so it is both correct and minimal.
+        //
+        // Only reachable when the cache is enabled, which is bulk (non-undo)
+        // mode; `undo_enabled` is false here by construction, so no undo entry
+        // is needed for these.
+        if let Some(ref cache) = self.recent {
+            let mut c = cache.lock();
+            for (key, val) in pending.iter() {
+                c.insert(*key, *val);
             }
         }
 
@@ -495,6 +682,7 @@ impl UtxoStore {
             db_lookups,
             db_nanos,
             pending_hits,
+            cache_hits,
         })
     }
 
@@ -554,9 +742,37 @@ impl UtxoStore {
         }
     }
 
+    /// Current in-memory cache footprint in bytes, and its cumulative hit/miss
+    /// counters. `None` when the cache is disabled.
+    ///
+    /// The byte figure is an estimate (`CACHE_ENTRY_COST` per entry) because the
+    /// allocator's exact overhead is not observable; it is accurate enough to
+    /// confirm the budget is being respected.
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        let c = self.recent.as_ref()?.lock();
+        Some(CacheStats {
+            entries: c.len(),
+            bytes: c.bytes(),
+            budget_bytes: c.budget_bytes,
+            hits: c.hits,
+            misses: c.misses,
+        })
+    }
+
     pub fn flush(&self) -> Result<(), UtxoError> {
         self.db.flush()?;
         Ok(())
+    }
+
+    /// Test-only: empty the in-memory cache so a subsequent spend is forced to
+    /// the database. Used to exercise the DB fallback without a second store.
+    #[cfg(test)]
+    fn cache_clear_for_test(&self) {
+        if let Some(ref c) = self.recent {
+            let mut c = c.lock();
+            c.map.clear();
+            c.order.clear();
+        }
     }
 
     pub fn approx_size_on_disk(&self) -> u64 {
@@ -1172,6 +1388,189 @@ mod tests {
         assert_eq!(r.db_lookups, 0);
         assert_eq!(r.pending_hits, 0);
         assert_eq!(r.spends.len(), 0, "coinbase produces no spend row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cache must answer a spend of a recently created output without a
+    /// database lookup, and must produce the *same* `SpendRow` a database read
+    /// would. Fidelity is the point: a wrong value here silently corrupts the
+    /// spend index, which is why the entry keeps the full `UtxoValue`.
+    #[test]
+    fn recent_cache_serves_recent_spend_without_db_lookup() {
+        let dir = tmp_path("cachehit");
+        let db = UtxoStore::open_cached(&dir, 8 << 20).unwrap();
+        let a = [0xE1u8; 32];
+
+        // Block 0 creates A:0 (goes into the cache at block end).
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 4_242)])
+            .unwrap();
+
+        // Block 1 spends A:0. The cache should satisfy it.
+        let tx1 = [0xE2u8; 32];
+        let r = db
+            .apply_block(
+                1,
+                &[tx_row(1, 0, tx1)],
+                &[inp_row(1, 0, 0, tx1, a, 0, false)],
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(r.cache_hits, 1, "spend of a recent output must hit the cache");
+        assert_eq!(r.db_lookups, 0, "no database read should have been needed");
+        assert_eq!(r.missing, 0);
+        // Fidelity: the same fields a DB read would have produced.
+        assert_eq!(r.spends.len(), 1);
+        assert_eq!(r.spends[0].spent_value_sat, 4_242);
+        assert_eq!(r.spends[0].spent_height, 0);
+        assert_eq!(r.spends[0].spent_address_hash, [0xEEu8; 32]);
+        assert_eq!(r.fees[0], 4_242, "fee comes from the cached input value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the cache disabled, the same spend costs a database lookup and
+    /// reports no cache hits. This is the A/B control.
+    #[test]
+    fn recent_cache_disabled_uses_db_lookup() {
+        let dir = tmp_path("cachemiss");
+        let db = UtxoStore::open(&dir).unwrap();
+        let a = [0xE3u8; 32];
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 100)])
+            .unwrap();
+        let tx1 = [0xE4u8; 32];
+        let r = db
+            .apply_block(
+                1,
+                &[tx_row(1, 0, tx1)],
+                &[inp_row(1, 0, 0, tx1, a, 0, false)],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(r.cache_hits, 0);
+        assert_eq!(r.db_lookups, 1, "no cache means the database must be read");
+        assert_eq!(r.spends[0].spent_value_sat, 100);
+        assert!(db.cache_stats().is_none(), "cache is disabled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cache must respect its budget, and evicting an entry must degrade to
+    /// a correct database lookup — never a wrong value or a `missing` count.
+    #[test]
+    fn recent_cache_evicts_to_budget_and_still_resolves() {
+        let dir = tmp_path("cacheevict");
+        // Budget for ~4 entries; create many more so eviction is forced.
+        let db = UtxoStore::open_cached(&dir, 4 * CACHE_ENTRY_COST).unwrap();
+        let a = [0xE5u8; 32];
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 999)])
+            .unwrap();
+
+        // 40 more single-output blocks, each evicting older entries.
+        for h in 1..41u32 {
+            let t = [h as u8; 32];
+            db.apply_block(h, &[tx_row(h, 0, t)], &[], &[out_row(h, 0, 0, t, 10)])
+                .unwrap();
+        }
+        let stats = db.cache_stats().expect("cache enabled");
+        assert!(
+            stats.bytes <= stats.budget_bytes,
+            "cache exceeded budget: {} > {}",
+            stats.bytes,
+            stats.budget_bytes
+        );
+
+        // A:0 was evicted, so spending it must still work via the database.
+        let tx1 = [0xE6u8; 32];
+        let r = db
+            .apply_block(
+                41,
+                &[tx_row(41, 0, tx1)],
+                &[inp_row(41, 0, 0, tx1, a, 0, false)],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(r.missing, 0, "eviction must not lose data");
+        assert_eq!(r.spends[0].spent_value_sat, 999);
+        assert_eq!(r.spends[0].spent_height, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A same-block spend must still be resolved from `pending`, not the cache,
+    /// and must not be double counted. `pending_hits + db_lookups + cache_hits`
+    /// must equal the non-coinbase input count exactly.
+    #[test]
+    fn recent_cache_accounting_is_exhaustive() {
+        let dir = tmp_path("cacheacct");
+        let db = UtxoStore::open_cached(&dir, 8 << 20).unwrap();
+        // Fund A:0 in block 0 (cached).
+        let a = [0xE7u8; 32];
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 100)])
+            .unwrap();
+
+        // Block 1: creates B:0 and spends it same-block (pending), spends A:0
+        // (cache), and spends an outpoint that exists only in the database.
+        let d = [0xE8u8; 32];
+        db.apply_block(1, &[tx_row(1, 0, d)], &[], &[out_row(1, 0, 0, d, 77)])
+            .unwrap();
+        // Drop the cache so D:0 must come from RocksDB.
+        db.cache_clear_for_test();
+
+        let b = [0xE9u8; 32];
+        let tx1 = [0xEAu8; 32];
+        let tx2 = [0xEBu8; 32];
+        let tx3 = [0xECu8; 32];
+        let inputs = [
+            inp_row(2, 1, 0, tx1, b, 0, false), // same-block -> pending
+            inp_row(2, 2, 0, tx2, a, 0, false), // in DB (cache cleared)
+            inp_row(2, 3, 0, tx3, d, 0, false), // in DB
+        ];
+        let outputs = [out_row(2, 0, 0, b, 5)];
+        let txs = [
+            tx_row(2, 0, b),
+            tx_row(2, 1, tx1),
+            tx_row(2, 2, tx2),
+            tx_row(2, 3, tx3),
+        ];
+        let r = db.apply_block(2, &txs, &inputs, &outputs).unwrap();
+        assert_eq!(
+            r.pending_hits + r.db_lookups + r.cache_hits,
+            3,
+            "every non-coinbase input accounted for exactly once"
+        );
+        assert_eq!(r.pending_hits, 1);
+        assert_eq!(r.db_lookups, 2);
+        assert_eq!(r.cache_hits, 0);
+        assert_eq!(r.missing, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cache stats must report a sane hit rate, and `hit_rate` must be `None`
+    /// before any lookup rather than a bogus 0% or NaN.
+    #[test]
+    fn recent_cache_stats_and_hit_rate() {
+        let dir = tmp_path("cachestats");
+        let db = UtxoStore::open_cached(&dir, 8 << 20).unwrap();
+        let stats = db.cache_stats().expect("cache enabled");
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.hit_rate(), None, "no lookups yet");
+
+        // Create and spend, then miss once.
+        let a = [0xF1u8; 32];
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 1)])
+            .unwrap();
+        let t1 = [0xF2u8; 32];
+        db.apply_block(1, &[tx_row(1, 0, t1)], &[inp_row(1, 0, 0, t1, a, 0, false)], &[])
+            .unwrap();
+        let t2 = [0xF3u8; 32];
+        db.apply_block(2, &[tx_row(2, 0, t2)], &[inp_row(2, 0, 0, t2, a, 0, false)], &[])
+            .unwrap();
+
+        let stats = db.cache_stats().expect("cache enabled");
+        assert_eq!(stats.hits, 1, "first spend hit");
+        assert!(stats.misses >= 1, "second spend of a spent outpoint missed");
+        let rate = stats.hit_rate().expect("lookups happened");
+        assert!((0.0..=1.0).contains(&rate));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
