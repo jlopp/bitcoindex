@@ -231,6 +231,14 @@ struct TrialReport {
     /// Non-coinbase inputs whose outpoint was absent from the UTXO set. Must
     /// be 0 for a trustworthy apply-path measurement.
     missing_utxos: u64,
+    /// H2 instrumentation. `db_lookups` is the number of non-coinbase inputs
+    /// that had to be read from RocksDB (i.e. were not resolved from the
+    /// in-block `pending` map) — the exact set a batched prefetch would cover.
+    /// `db_nanos` is the time spent inside those point lookups. If
+    /// `db_lookups == 0`, no prefetch could help this run at all.
+    db_lookups: u64,
+    db_nanos: u64,
+    pending_hits: u64,
     stages: Vec<StageReport>,
     parse_latency: LatencyReport,
     utxo_latency: LatencyReport,
@@ -357,6 +365,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
             user_cpu_secs: jiffies_to_secs(header_m.cpu_jiffies),
             peak_rss_mb: header_m.peak_rss_kb as f64 / 1024.0,
             missing_utxos: 0,
+            db_lookups: 0,
+            db_nanos: 0,
+            pending_hits: 0,
             stages,
             parse_latency: LatencyReport::default(),
             utxo_latency: LatencyReport::default(),
@@ -402,6 +413,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     let sink_wall = Arc::new(AtomicU64::new(0));
     let blocks_done = Arc::new(AtomicU64::new(0));
     let missing_utxos = Arc::new(AtomicU64::new(0));
+    let db_lookups = Arc::new(AtomicU64::new(0));
+    let db_nanos = Arc::new(AtomicU64::new(0));
+    let pending_hits = Arc::new(AtomicU64::new(0));
     // Per-block samples for the latency distribution. Only populated on the
     // consumer thread, so a plain Vec behind a mutex would do; we keep them
     // in the closure and return them with the join handle.
@@ -452,6 +466,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         let (tx, rx) = crossbeam_channel::bounded::<WorkItem>(tuning.channel_depth);
         let parsed = Arc::clone(&blocks_done);
         let missing = Arc::clone(&missing_utxos);
+        let db_lookups_c = Arc::clone(&db_lookups);
+        let db_nanos_c = Arc::clone(&db_nanos);
+        let pending_hits_c = Arc::clone(&pending_hits);
         let sink_wall_c = Arc::clone(&sink_wall);
         let utxo_wall_c = Arc::clone(&utxo_wall);
         let utxo_c = utxo.clone();
@@ -486,6 +503,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                 utxo_c.as_deref(),
                 &parsed,
                 &missing,
+                &db_lookups_c,
+                &db_nanos_c,
+                &pending_hits_c,
                 &sink_wall_c,
                 &utxo_wall_c,
                 &progress_c,
@@ -696,6 +716,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         ),
         peak_rss_mb: peak_rss_kb() as f64 / 1024.0,
         missing_utxos: missing,
+        db_lookups: db_lookups.load(Ordering::Relaxed),
+        db_nanos: db_nanos.load(Ordering::Relaxed),
+        pending_hits: pending_hits.load(Ordering::Relaxed),
         stages,
         parse_latency: LatencyReport::from_samples(parse_samples),
         utxo_latency: LatencyReport::from_samples(utxo_samples),
@@ -853,6 +876,9 @@ fn bench_consume(
     utxo: Option<&UtxoStore>,
     blocks_done: &AtomicU64,
     missing_utxos: &AtomicU64,
+    db_lookups: &AtomicU64,
+    db_nanos: &AtomicU64,
+    pending_hits: &AtomicU64,
     sink_wall: &AtomicU64,
     utxo_wall: &AtomicU64,
     progress: &ProgressBar,
@@ -934,6 +960,9 @@ fn bench_consume(
 
             if let Some(ref res) = res {
                 missing_utxos.fetch_add(res.missing, Ordering::Relaxed);
+                db_lookups.fetch_add(res.db_lookups, Ordering::Relaxed);
+                db_nanos.fetch_add(res.db_nanos, Ordering::Relaxed);
+                pending_hits.fetch_add(res.pending_hits, Ordering::Relaxed);
                 if do_fees {
                     // Same O(txs x inputs) fix as `pipeline::consume_ordered`:
                     // derive the coinbase flags in one pass over inputs instead
@@ -1015,6 +1044,33 @@ fn print_trial(r: &TrialReport) {
     );
     println!("user cpu: {:.1}s peak rss: {:.1} MB", r.user_cpu_secs, r.peak_rss_mb);
     println!("missing utxos: {}", r.missing_utxos);
+    // H2 instrumentation. Read this before considering a batched prefetch:
+    // `db_lookups` is the only set a prefetch could cover, and `db_nanos` is
+    // the ceiling on what removing it could save. The share is against the
+    // apply stage, which is where those lookups live.
+    let apply_ns = r
+        .stages
+        .iter()
+        .find(|s| s.name.starts_with("utxo_apply"))
+        .map(|s| (s.wall_secs * 1e9) as u64)
+        .unwrap_or(0);
+    let share = if apply_ns > 0 {
+        100.0 * r.db_nanos as f64 / apply_ns as f64
+    } else {
+        0.0
+    };
+    println!(
+        "utxo lookups: {} db / {} pending ({}% db)  db_time: {:.3}s ({:.1}% of apply)",
+        r.db_lookups,
+        r.pending_hits,
+        if r.db_lookups + r.pending_hits > 0 {
+            100.0 * r.db_lookups as f64 / (r.db_lookups + r.pending_hits) as f64
+        } else {
+            0.0
+        },
+        r.db_nanos as f64 / 1e9,
+        share,
+    );
     println!("stages:");
     for s in &r.stages {
         println!(
@@ -1499,6 +1555,9 @@ mod tests {
 
         let blocks_done = AtomicU64::new(0);
         let missing = AtomicU64::new(0);
+        let db_lookups = AtomicU64::new(0);
+        let db_nanos = AtomicU64::new(0);
+        let pending_hits = AtomicU64::new(0);
         let sink_wall = AtomicU64::new(0);
         let utxo_wall = AtomicU64::new(0);
         let progress = ProgressBar::new(end as u64);
@@ -1515,6 +1574,9 @@ mod tests {
             utxo,
             &blocks_done,
             &missing,
+            &db_lookups,
+            &db_nanos,
+            &pending_hits,
             &sink_wall,
             &utxo_wall,
             &progress,
@@ -1569,6 +1631,9 @@ mod tests {
 
         let blocks_done = AtomicU64::new(0);
         let missing = AtomicU64::new(0);
+        let db_lookups = AtomicU64::new(0);
+        let db_nanos = AtomicU64::new(0);
+        let pending_hits = AtomicU64::new(0);
         let sink_wall = AtomicU64::new(0);
         let utxo_wall = AtomicU64::new(0);
         let progress = ProgressBar::new(3);
@@ -1590,6 +1655,9 @@ mod tests {
             None,
             &blocks_done,
             &missing,
+            &db_lookups,
+            &db_nanos,
+            &pending_hits,
             &sink_wall,
             &utxo_wall,
             &progress,
@@ -1619,6 +1687,9 @@ mod tests {
 
         let blocks_done = AtomicU64::new(0);
         let missing = AtomicU64::new(0);
+        let db_lookups = AtomicU64::new(0);
+        let db_nanos = AtomicU64::new(0);
+        let pending_hits = AtomicU64::new(0);
         let sink_wall = AtomicU64::new(0);
         let utxo_wall = AtomicU64::new(0);
         let progress = ProgressBar::new(1);
@@ -1637,6 +1708,9 @@ mod tests {
             None,
             &blocks_done,
             &missing,
+            &db_lookups,
+            &db_nanos,
+            &pending_hits,
             &sink_wall,
             &utxo_wall,
             &progress,
@@ -1658,6 +1732,9 @@ mod tests {
 
         let blocks_done = AtomicU64::new(0);
         let missing = AtomicU64::new(0);
+        let db_lookups = AtomicU64::new(0);
+        let db_nanos = AtomicU64::new(0);
+        let pending_hits = AtomicU64::new(0);
         let sink_wall = AtomicU64::new(0);
         let utxo_wall = AtomicU64::new(0);
         let progress = ProgressBar::new(1);
@@ -1676,6 +1753,9 @@ mod tests {
             None,
             &blocks_done,
             &missing,
+            &db_lookups,
+            &db_nanos,
+            &pending_hits,
             &sink_wall,
             &utxo_wall,
             &progress,
@@ -1904,6 +1984,9 @@ mod tests {
 
         let blocks_done = AtomicU64::new(0);
         let missing = AtomicU64::new(0);
+        let db_lookups = AtomicU64::new(0);
+        let db_nanos = AtomicU64::new(0);
+        let pending_hits = AtomicU64::new(0);
         let sink_wall = AtomicU64::new(0);
         let utxo_wall = AtomicU64::new(0);
         let progress = ProgressBar::new(1);
@@ -1928,6 +2011,9 @@ mod tests {
             Some(&store),
             &blocks_done,
             &missing,
+            &db_lookups,
+            &db_nanos,
+            &pending_hits,
             &sink_wall,
             &utxo_wall,
             &progress,
@@ -2064,6 +2150,9 @@ mod tests {
             user_cpu_secs: 1.5,
             peak_rss_mb: 128.0,
             missing_utxos: 0,
+            db_lookups: 0,
+            db_nanos: 0,
+            pending_hits: 0,
             stages: vec![
                 StageReport { name: "header_pass", wall_secs: 0.5, cpu_util: 0.9, peak_rss_mb: 64.0 },
                 StageReport { name: "pipeline_wall_total", wall_secs: 20.0, cpu_util: 0.8, peak_rss_mb: 128.0 },
@@ -2094,6 +2183,9 @@ mod tests {
             user_cpu_secs: 0.1,
             peak_rss_mb: 8.0,
             missing_utxos: 0,
+            db_lookups: 0,
+            db_nanos: 0,
+            pending_hits: 0,
             stages: vec![StageReport {
                 name: "header_pass",
                 wall_secs: 1.0,

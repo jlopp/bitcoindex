@@ -122,11 +122,13 @@ stalls (memtable flush / L0 compaction) on a growing UTXO set, and it is why
   `write_buffer_size` and level compaction tuning, or a bulk-load path for the
   initial index. **→ CONFIRMED and fixed; see §6.**
 - **H2 — per-input point lookups are unbatched.** `apply_block` does
-  `db.get_pinned` per spent outpoint. These cannot be batched directly (each
-  read depends on prior writes within the block), but a multi-threaded
-  prefetch/`MultiGet` for the read-only prefix of a block is worth measuring.
-  **→ CONFIRMED, and worse than expected: the lookups were missing a 32 MiB
-  cache 99% of the time. Fixed by the same change as H1; see §6.**
+  `db.get_pinned` per spent outpoint: one FFI call, one `Result`, one
+  `PinnableSlice` each, with no chance to share a data-block read between keys.
+  **→ The cache half of this was the real bug and is fixed (§6): the lookups
+  were missing a 32 MiB cache 99% of the time.** The batching half was
+  implemented and measured, and it did **not** help — see §9. H2 is closed.
+  The original note here was wrong when it said these "cannot be batched
+  directly"; they can, it simply does not pay.
 - **H4 — O(txs × inputs) fee enrichment** in `consume_ordered`: for every tx it
   re-scans `block.inputs` to find the coinbase input. Quadratic in block size,
   and it runs on the consumer thread. Cheap to fix, but bounded by the 8%
@@ -403,4 +405,138 @@ not read the p50 as evidence the apply path is free.
 Still open: mainnet. Signet and testnet4 are both small compared to mainnet's
 ~100x larger UTXO set, so `BLOCK_CACHE_BYTES` will likely need to grow again,
 and the `MultiGet`/prefetch idea (H2) remains unexplored.
+
+## 8. H2 in detail: the batched prefetch (not yet implemented)
+
+### Correcting the record
+
+An earlier note in this file said the per-input lookups "cannot be batched
+directly (each read depends on prior writes within the block)". That is wrong,
+and the reason it is wrong is the thing that makes the whole idea work:
+
+**Every output of the block is inserted into `pending` *before* the input loop
+begins.** A same-block spend is therefore resolved entirely from the in-memory
+`pending` map and never touches the database — the DB is consulted only when
+`pending.remove(key)` returns `None`. The decision to hit the DB is a function
+of `pending`, not of position in the input loop, so it is *window-independent*
+and can be computed ahead of time. A prefetched value is simply discarded when
+`pending` turns out to satisfy that input.
+
+### API choice
+
+Use `DB::batched_multi_get_cf(cf, keys, sorted_input)`, which returns
+`Vec<Result<Option<DBPinnableSlice>, Error>>` — zero-copy. Do **not** use plain
+`multi_get`, which returns `Vec<Result<Option<Vec<u8>>, Error>>` and allocates a
+`Vec<u8>` per key, violating the repo's no-per-item-allocation rule. The crate
+documents `batched_multi_get_cf` as "a more optimized version of multi_get_cf".
+
+`apply_block` currently has no default-CF handle (only `cf_undo()`/`cf_meta()`);
+one would be needed, since this call takes an explicit CF.
+
+### Shape
+
+1. Build the key list once: `inputs` where `!is_coinbase` **and**
+   `!pending.contains_key(&key)`.
+2. `batched_multi_get_cf` over that list in windows, keeping index
+   correspondence (`sorted_input = false`).
+3. Walk the window; if `pending.remove(key)` hits, discard the prefetched value
+   and take the same-block path unchanged.
+
+Step 1 is the refinement that makes it cheap. Because `pending` only ever
+shrinks during the input loop, a key absent from `pending` when the batch is
+built can never appear in it later — so the filtered set is *exactly* the keys
+that will be DB-consulted. No wasted lookups for same-block spends, and no
+pointless reads fired at outpoints that do not exist in the DB yet.
+
+### Why this is low priority, not next
+
+**→ ANSWERED, NEGATIVE. H2 is closed. See §9.**
+
+## 9. H2 closed: the prefetch was implemented, measured, and reverted
+
+The instrumentation above was built and run first, then the prefetch was
+actually implemented and A/B-tested. It did not help.
+
+### The measurement (testnet4, full chain, 158,602 blocks)
+
+```
+utxo lookups: 23754999 db / 9421902 pending (71.6% db)  db_time: 57.337s (35.4% of apply)
+```
+
+So the hypothesis looked *strong*: 71.6% of non-coinbase inputs need a database
+read, and 35.4% of apply wall time is spent inside those point lookups. That is
+far more headroom than the "probably not worth it" guess in §8 predicted, which
+is exactly why it was worth implementing rather than estimating.
+
+### The A/B
+
+`batched_multi_get_cf` over exactly the keys that will be consulted (filtered by
+absence from `pending`, which is provably the exact set — see §8), windows
+discarded as values are decoded into a `Vec<Option<UtxoValue>>`, walked by index
+in the input loop. Baseline is the same code with the original per-key
+`get_pinned` and *no* per-lookup timing, so the timing overhead does not
+penalize the baseline.
+
+| | baseline (per-key) | prefetch (batched) |
+|---|---:|---:|
+| `utxo_apply` wall | 160.553 s | 160.493 s |
+| blocks/s | 639.0 | 629.8 |
+| apply p50 | 0.01 ms | 0.01 ms |
+| apply p99 | 23.66 ms | 22.83 ms |
+| apply max | 146.58 ms | 149.64 ms |
+| `db_lookups` | 23,754,999 | 23,754,999 |
+| `pending_hits` | 9,421,902 | 9,421,902 |
+
+**No improvement.** 0.04% on apply wall is noise, and the run-to-run spread on
+this workload is larger than that. Note the two variants report *identical*
+lookup counts, which independently confirms the filter in §8 selects exactly the
+right key set — the implementation was correct, it just did not help.
+
+### Why it did not help
+
+This is the actual finding, and it is more useful than the negative result:
+
+**The 35% spent in point lookups is per-key work, not I/O.** `batched_multi_get_cf`
+batches the *block reads* — which is the part that matters when the data is not
+cached. Once the 1 GiB block cache (§6) made the working set resident, the cost
+inside those lookups is the per-key RocksDB path itself: memtable and SST
+search, bloom-filter check, `PinnableSlice` construction. A batched API still
+does that work once per key; it only avoids redundant *I/O*, and there was no
+redundant I/O left to avoid.
+
+So the two halves of H2 were not independent. The cache fix was the whole win,
+and it consumed the entire upside of the batching. That is consistent with §6's
+before/after: the p99 improvement came from cache hits, not from anything about
+how the lookups were issued.
+
+### What was kept
+
+The prefetch is **reverted**. The instrumentation is kept, because it is cheap
+(counters plus one `Instant` per database lookup) and it is the right question
+to re-ask on mainnet, where the UTXO set is ~100x larger and the working set may
+not fit in a 1 GiB cache:
+
+```
+utxo lookups: <db> db / <pending> pending (<pct>% db)  db_time: <s>s (<pct>% of apply)
+```
+
+If a mainnet run shows `db_time` climbing well above ~35% of apply *and* the
+block cache is not saturated, that would indicate real I/O again — and the
+prefetch would then be worth another look. On testnet4 and signet, it is not.
+
+### The more promising direction
+
+If per-key lookup work is the cost, the way to remove it is to **not do the
+lookup at all** — i.e. keep more of the UTXO working set in memory and consult
+RocksDB less often, rather than asking RocksDB the same number of questions
+faster. That is a different design (a hot-set cache in front of the store, or
+restructuring the apply path around an in-memory delta), not a batching tweak.
+
+### Tests
+
+Three unit tests pin the instrumentation, so the numbers above can be trusted:
+`apply_block_reports_db_and_pending_lookup_counts` (one DB lookup and one
+`pending` hit in the same block, asserting the split sums to the input count),
+`apply_block_reports_no_db_lookups_when_all_spends_are_same_block`, and
+`apply_block_excludes_coinbase_from_lookup_counts`.
 

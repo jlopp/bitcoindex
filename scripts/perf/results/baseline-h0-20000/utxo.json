@@ -1,0 +1,121 @@
+[
+  {
+    "trial": 0,
+    "mode": "utxo",
+    "blocks": 20000,
+    "blocks_per_sec": 35576.564639613505,
+    "user_cpu_secs": 2.77,
+    "peak_rss_mb": 122.69921875,
+    "missing_utxos": 0,
+    "stages": [
+      {
+        "name": "header_pass",
+        "wall_secs": 16.972674877,
+        "cpu_util": 0.05762939590184905,
+        "peak_rss_mb": 92.27734375
+      },
+      {
+        "name": "parse (Σ worker CPU-ish)",
+        "wall_secs": 7.602393882,
+        "cpu_util": 0.0,
+        "peak_rss_mb": 0.0
+      },
+      {
+        "name": "utxo_apply (sequential)",
+        "wall_secs": 0.052846197,
+        "cpu_util": 0.0,
+        "peak_rss_mb": 0.0
+      },
+      {
+        "name": "pipeline_wall_total",
+        "wall_secs": 0.562167826,
+        "cpu_util": 0.3079596376616544,
+        "peak_rss_mb": 122.69921875
+      }
+    ],
+    "parse_latency": {
+      "n": 20000,
+      "p50_ms": 0.000791,
+      "p99_ms": 0.010038,
+      "max_ms": 473.622388,
+      "sum_secs": 7.602393882
+    },
+    "utxo_latency": {
+      "n": 20000,
+      "p50_ms": 0.001583,
+      "p99_ms": 0.006091,
+      "max_ms": 11.95289,
+      "sum_secs": 0.052846197
+    },
+    "rocksdb": [
+      {
+        "name": "cur_size_all_mem_tables",
+        "value": "5244928"
+      },
+      {
+        "name": "size_all_mem_tables",
+        "value": "5244928"
+      },
+      {
+        "name": "cur_size_active_mem_table",
+        "value": "5244928"
+      },
+      {
+        "name": "num_immutable_mem_table",
+        "value": "0"
+      },
+      {
+        "name": "mem_table_flush_pending",
+        "value": "0"
+      },
+      {
+        "name": "num_running_flushes",
+        "value": "0"
+      },
+      {
+        "name": "compaction_pending",
+        "value": "0"
+      },
+      {
+        "name": "num_running_compactions",
+        "value": "0"
+      },
+      {
+        "name": "is_write_stopped",
+        "value": "0"
+      },
+      {
+        "name": "actual_delayed_write_rate",
+        "value": "0"
+      },
+      {
+        "name": "estimate_num_keys",
+        "value": "37842"
+      },
+      {
+        "name": "estimate_live_data_size",
+        "value": "0"
+      },
+      {
+        "name": "total_sst_files_size",
+        "value": "0"
+      },
+      {
+        "name": "block_cache_capacity",
+        "value": "33554432"
+      },
+      {
+        "name": "block_cache_usage",
+        "value": "87"
+      },
+      {
+        "name": "num_files_at_level0",
+        "value": "0"
+      },
+      {
+        "name": "stall_lines",
+        "value": "Write Stall (count): cf-l0-file-count-limit-delays-with-ongoing-compaction: 0, cf-l0-file-count-limit-stops-with-ongoing-compaction: 0, l0-file-count-limit-delays: 0, l0-file-count-limit-stops: 0, memtable-limit-delays: 0, memtable-limit-stops: 0, pending-compaction-bytes-delays: 0, pending-compaction-bytes-stops: 0, total-delays: 0, total-stops: 0 | Cumulative stall: 00:00:0.000 H:M:S, 0.0 percent | Interval stall: 00:00:0.000 H:M:S, 0.0 percent | Write Stall (count): write-buffer-manager-limit-stops: 0"
+      }
+    ]
+  }
+]

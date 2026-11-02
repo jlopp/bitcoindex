@@ -1,0 +1,45 @@
+[
+  {
+    "trial": 0,
+    "mode": "parse",
+    "blocks": 20000,
+    "blocks_per_sec": 37436.02239926,
+    "user_cpu_secs": 2.85,
+    "peak_rss_mb": 114.7421875,
+    "missing_utxos": 0,
+    "stages": [
+      {
+        "name": "header_pass",
+        "wall_secs": 15.272391367,
+        "cpu_util": 0.05852063233078095,
+        "peak_rss_mb": 93.15625
+      },
+      {
+        "name": "parse (Σ worker CPU-ish)",
+        "wall_secs": 7.759091367,
+        "cpu_util": 0.0,
+        "peak_rss_mb": 0.0
+      },
+      {
+        "name": "pipeline_wall_total",
+        "wall_secs": 0.534244792,
+        "cpu_util": 0.3334145744934094,
+        "peak_rss_mb": 114.7421875
+      }
+    ],
+    "parse_latency": {
+      "n": 20000,
+      "p50_ms": 0.000751,
+      "p99_ms": 0.007594,
+      "max_ms": 488.78101,
+      "sum_secs": 7.759091367
+    },
+    "utxo_latency": {
+      "n": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "max_ms": 0.0,
+      "sum_secs": 0.0
+    }
+  }
+]

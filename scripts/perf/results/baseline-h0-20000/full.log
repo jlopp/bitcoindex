@@ -1,0 +1,35 @@
+2026-11-01T22:03:57.430919Z  INFO header pass: scanning blk files files=149
+2026-11-01T22:04:19.539989Z  INFO header pass complete height=322983 orphans=0
+bench trial 0: 20000 blocks (heights 0..20000) mode=full threads=16 reorder_high=32 channel_depth=512 sink_batch_rows=250000
+
+=== trial 0 (full) ===
+blocks: 20000
+blocks/s: 41100.8
+user cpu: 3.2s peak rss: 146.7 MB
+missing utxos: 0
+stages:
+                     header_pass  wall  22.112s  cpu_util 4%  peak_rss       97 MB
+        parse (Σ worker CPU-ish)  wall   5.695s  cpu_util 0%  peak_rss        0 MB
+         utxo_apply (sequential)  wall   0.042s  cpu_util 0%  peak_rss        0 MB
+                    parquet_sink  wall   0.023s  cpu_util 0%  peak_rss        0 MB
+             pipeline_wall_total  wall   0.487s  cpu_util 41%  peak_rss      147 MB
+per-block parse   p50    0.00ms  p99     0.01ms  max   353.92ms  (n=20000)
+per-block apply   p50    0.00ms  p99     0.01ms  max     2.46ms  (n=20000)
+rocksdb:
+       cur_size_all_mem_tables  5244928
+           size_all_mem_tables  5244928
+     cur_size_active_mem_table  5244928
+       num_immutable_mem_table  0
+       mem_table_flush_pending  0
+           num_running_flushes  0
+            compaction_pending  0
+       num_running_compactions  0
+              is_write_stopped  0
+     actual_delayed_write_rate  0
+             estimate_num_keys  37842
+       estimate_live_data_size  0
+          total_sst_files_size  0
+          block_cache_capacity  33554432
+             block_cache_usage  87
+           num_files_at_level0  0
+                   stall_lines  Write Stall (count): cf-l0-file-count-limit-delays-with-ongoing-compaction: 0, cf-l0-file-count-limit-stops-with-ongoing-compaction: 0, l0-file-count-limit-delays: 0, l0-file-count-limit-stops: 0, memtable-limit-delays: 0, memtable-limit-stops: 0, pending-compaction-bytes-delays: 0, pending-compaction-bytes-stops: 0, total-delays: 0, total-stops: 0 | Cumulative stall: 00:00:0.000 H:M:S, 0.0 percent | Interval stall: 00:00:0.000 H:M:S, 0.0 percent | Write Stall (count): write-buffer-manager-limit-stops: 0

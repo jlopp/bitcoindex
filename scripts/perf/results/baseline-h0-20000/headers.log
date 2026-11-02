@@ -1,0 +1,10 @@
+2026-11-01T22:02:34.141844Z  INFO header pass: scanning blk files files=149
+2026-11-01T22:02:51.778635Z  INFO header pass complete height=322983 orphans=0
+
+=== trial 0 (headers) ===
+blocks: 322984
+blocks/s: 18306.8
+user cpu: 16.2s peak rss: 90.8 MB
+missing utxos: 0
+stages:
+                     header_pass  wall  17.643s  cpu_util 6%  peak_rss       91 MB

@@ -1,0 +1,13 @@
+2026-11-01T22:02:51.828654Z  INFO header pass: scanning blk files files=149
+2026-11-01T22:03:07.334084Z  INFO header pass complete height=322983 orphans=0
+bench trial 0: 20000 blocks (heights 0..20000) mode=drain threads=16 reorder_high=32 channel_depth=512 sink_batch_rows=250000
+
+=== trial 0 (drain) ===
+blocks: 0
+blocks/s: 0.0
+user cpu: 0.0s peak rss: 93.6 MB
+missing utxos: 0
+stages:
+                     header_pass  wall  15.509s  cpu_util 6%  peak_rss       93 MB
+        parse (Σ worker CPU-ish)  wall   0.000s  cpu_util 0%  peak_rss        0 MB
+             pipeline_wall_total  wall   0.000s  cpu_util 0%  peak_rss       94 MB

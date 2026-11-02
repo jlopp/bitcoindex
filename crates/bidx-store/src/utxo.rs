@@ -210,6 +210,31 @@ pub struct SpendResult {
     pub spends: Vec<SpendRow>,
     pub fees: Vec<u64>,
     pub missing: u64,
+    /// Instrumentation for the H2 question: how much of `apply_block` is a
+    /// database round trip versus an in-memory `pending` hit.
+    ///
+    /// Every output of the block is in `pending` before the input loop starts,
+    /// so a same-block spend never touches RocksDB. `db_lookups` counts the
+    /// inputs that did have to be read from the database — exactly the set a
+    /// batched prefetch would have to cover. `db_nanos` is the wall time spent
+    /// inside those `get_pinned` calls.
+    ///
+    /// Measured on testnet4: 71.6% of non-coinbase inputs are database lookups,
+    /// costing ~35% of apply wall time. A `batched_multi_get_cf` prefetch over
+    /// precisely that key set was implemented and A/B-tested and changed apply
+    /// wall time by 0.04% (noise). The cost is per-key RocksDB work, not I/O,
+    /// so batching it does not pay. See PERF.md §9. These counters are kept
+    /// because the question is worth re-asking on mainnet, where the UTXO set
+    /// is far larger and may not fit the block cache.
+    ///
+    /// `db_lookups == 0` on a block means the block never touched RocksDB for
+    /// reads, so H2 could not help it at all. If `db_nanos` is a small share of
+    /// apply wall time, the prefetch is not worth implementing.
+    pub db_lookups: u64,
+    pub db_nanos: u64,
+    /// Inputs resolved from `pending` without a database read (same-block
+    /// spends). `pending_hits + db_lookups` == non-coinbase input count.
+    pub pending_hits: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +362,11 @@ impl UtxoStore {
     fn cf_meta(&self) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(CF_META).expect("meta cf")
     }
+    fn cf_default(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .expect("default cf")
+    }
 
     /// Apply one block forward. In undo-enabled (live) mode, also writes the
     /// undo record for `height` in the same batch so the set and its undo log
@@ -377,6 +407,13 @@ impl UtxoStore {
             }
         }
 
+        // H2 instrumentation: how many inputs needed a database read at all,
+        // and how much wall time those reads cost. This is the measurement that
+        // decides whether the prefetch below is worth having.
+        let mut db_lookups = 0u64;
+        let mut db_nanos = 0u64;
+        let mut pending_hits = 0u64;
+
         for inp in inputs {
             if inp.is_coinbase {
                 continue;
@@ -394,9 +431,14 @@ impl UtxoStore {
                     // `same_block` is reconciled into `created` once, below.
                     same_block.insert(key);
                 }
+                pending_hits += 1;
                 record_spend(&mut spends, &mut fees, height, inp, v);
             } else {
-                match self.db.get_pinned(key)? {
+                db_lookups += 1;
+                let t0 = std::time::Instant::now();
+                let got = self.db.get_pinned(key);
+                db_nanos += t0.elapsed().as_nanos() as u64;
+                match got? {
                     Some(bytes) => {
                         if let Some(v) = UtxoValue::decode(bytes.as_ref()) {
                             batch.delete(key);
@@ -450,6 +492,9 @@ impl UtxoStore {
             spends,
             fees,
             missing,
+            db_lookups,
+            db_nanos,
+            pending_hits,
         })
     }
 
@@ -1047,6 +1092,86 @@ mod tests {
             BLOCK_CACHE_BYTES >= 512 << 20,
             "cache must dominate the write buffer for the read path"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The H2 counters must be internally consistent: every non-coinbase input
+    /// is either resolved from `pending` (same-block spend) or read from the
+    /// database, never both and never neither. A block with one of each is the
+    /// minimal case that proves the split is real.
+    #[test]
+    fn apply_block_reports_db_and_pending_lookup_counts() {
+        let dir = tmp_path("h2counts");
+        let db = UtxoStore::open_live(&dir).unwrap();
+
+        // Block 0 funds outpoint A:0, which lands in the database.
+        let a = [0xA1u8; 32];
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 1_000)])
+            .unwrap();
+
+        // Block 1 creates B:0 and spends it in the same block (a `pending`
+        // hit), and also spends A:0 from block 0 (a database lookup).
+        let b = [0xB1u8; 32];
+        let tx1 = [0xC1u8; 32];
+        let tx2 = [0xD1u8; 32];
+        let inputs = [
+            inp_row(1, 1, 0, tx1, a, 0, false), // DB lookup
+            inp_row(1, 2, 0, tx2, b, 0, false), // same-block spend
+        ];
+        let outputs = [out_row(1, 0, 0, b, 500)];
+        let txs = [tx_row(1, 0, b), tx_row(1, 1, tx1), tx_row(1, 2, tx2)];
+
+        let r = db.apply_block(1, &txs, &inputs, &outputs).unwrap();
+        assert_eq!(r.db_lookups, 1, "A:0 must be read from the database");
+        assert_eq!(r.pending_hits, 1, "B:0 must be resolved from pending");
+        assert_eq!(
+            r.db_lookups + r.pending_hits,
+            2,
+            "every non-coinbase input must be accounted for exactly once"
+        );
+        assert!(
+            r.db_nanos > 0,
+            "a real database read must take measurable time"
+        );
+        assert_eq!(r.missing, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block whose spends are all same-block must report zero database
+    /// lookups — the case where a batched prefetch could not help at all.
+    #[test]
+    fn apply_block_reports_no_db_lookups_when_all_spends_are_same_block() {
+        let dir = tmp_path("h2none");
+        let db = UtxoStore::open_live(&dir).unwrap();
+        let a = [0xA2u8; 32];
+        let tx1 = [0xC2u8; 32];
+        let inputs = [inp_row(0, 1, 0, tx1, a, 0, false)];
+        let outputs = [out_row(0, 0, 0, a, 700)];
+        let txs = [tx_row(0, 0, a), tx_row(0, 1, tx1)];
+
+        let r = db.apply_block(0, &txs, &inputs, &outputs).unwrap();
+        assert_eq!(r.db_lookups, 0);
+        assert_eq!(r.pending_hits, 1);
+        assert_eq!(r.db_nanos, 0, "no database read means no database time");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Coinbase inputs are neither a database lookup nor a pending hit, so a
+    /// coinbase-only block reports zero for both. This is the case that makes
+    /// the counters meaningful on testnet4, where most blocks are coinbase-only.
+    #[test]
+    fn apply_block_excludes_coinbase_from_lookup_counts() {
+        let dir = tmp_path("h2cb");
+        let db = UtxoStore::open_live(&dir).unwrap();
+        let a = [0xA3u8; 32];
+        let inputs = [inp_row(0, 0, 0, a, [0u8; 32], u32::MAX, true)];
+        let outputs = [out_row(0, 0, 0, a, 50)];
+        let r = db
+            .apply_block(0, &[tx_row(0, 0, a)], &inputs, &outputs)
+            .unwrap();
+        assert_eq!(r.db_lookups, 0);
+        assert_eq!(r.pending_hits, 0);
+        assert_eq!(r.spends.len(), 0, "coinbase produces no spend row");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

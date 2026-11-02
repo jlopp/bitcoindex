@@ -1,0 +1,51 @@
+[
+  {
+    "trial": 0,
+    "mode": "sink",
+    "blocks": 20000,
+    "blocks_per_sec": 41343.70830816475,
+    "user_cpu_secs": 3.14,
+    "peak_rss_mb": 134.125,
+    "missing_utxos": 0,
+    "stages": [
+      {
+        "name": "header_pass",
+        "wall_secs": 16.117983334,
+        "cpu_util": 0.057350537027177684,
+        "peak_rss_mb": 91.6640625
+      },
+      {
+        "name": "parse (Σ worker CPU-ish)",
+        "wall_secs": 6.201930395,
+        "cpu_util": 0.0,
+        "peak_rss_mb": 0.0
+      },
+      {
+        "name": "parquet_sink",
+        "wall_secs": 0.024943877,
+        "cpu_util": 0.0,
+        "peak_rss_mb": 0.0
+      },
+      {
+        "name": "pipeline_wall_total",
+        "wall_secs": 0.483749543,
+        "cpu_util": 0.4056851377738666,
+        "peak_rss_mb": 134.125
+      }
+    ],
+    "parse_latency": {
+      "n": 20000,
+      "p50_ms": 0.000782,
+      "p99_ms": 0.01043,
+      "max_ms": 385.544852,
+      "sum_secs": 6.201930395
+    },
+    "utxo_latency": {
+      "n": 0,
+      "p50_ms": 0.0,
+      "p99_ms": 0.0,
+      "max_ms": 0.0,
+      "sum_secs": 0.0
+    }
+  }
+]
