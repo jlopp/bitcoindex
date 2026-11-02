@@ -71,10 +71,22 @@ impl BlkFile {
             source: e,
         })?;
         let xor_key = read_xor_key(path);
-        // Trim trailing preallocated zero padding against the RAW view —
-        // after XOR decode those zeros turn into the key pattern and are
-        // indistinguishable from real data.
-        let data_end = last_raw_nonzero(&mmap);
+        // Determine where the meaningful data ends.
+        //
+        // Bitcoin Core preallocates blk files with trailing zero padding, and
+        // XOR decode turns raw zeros into the key pattern, so the padding must
+        // be trimmed against the RAW view before decoding. But a file is not
+        // always padded: when the node is still writing, or the last record
+        // happens to end at EOF, the final record can itself end in zero bytes
+        // (a transaction whose locktime is 0). Trimming on "last non-zero byte"
+        // alone then eats real data, and the last record's declared length
+        // overruns the trimmed slice — a spurious `bad record len`.
+        //
+        // So walk the records instead. That is exact for both padded and
+        // unpadded files, and it also yields a correct length for XOR files
+        // (where the "trailing zeros" heuristic cannot work at all, because
+        // every padding byte decodes to a non-zero key byte).
+        let data_end = record_walk_end(&mmap, xor_key.as_ref());
         let decoded = match &xor_key {
             Some(key) => {
                 let mut decoded = xor_decode(&mmap, key);
@@ -138,12 +150,66 @@ impl BlkFile {
     }
 }
 
-/// Find the highest offset in the RAW (pre-decode) file that isn't zero.
-/// Bitcoin Core preallocates blk files with trailing zero padding; XOR
-/// decode turns raw zeros into the key pattern, so we must trim against
-/// the raw view BEFORE decoding, then decode the trimmed region.
-fn last_raw_nonzero(raw: &[u8]) -> usize {
-    raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0)
+/// Find where the meaningful data ends by walking the record framing.
+///
+/// A blk file is a flat sequence of `magic(4) || len(4) || payload(len)`
+/// records, optionally followed by trailing preallocated zero padding. We
+/// cannot simply trim trailing zero bytes: the last record may legitimately
+/// end in zeros (a tx with `locktime == 0`), and under XOR obfuscation the
+/// padding decodes to a non-zero key pattern so the raw view is the only
+/// place the zeros are visible at all.
+///
+/// Walking is exact in both cases. It stops at the first offset that is not a
+/// well-formed record — either a non-magic word (the zero padding) or a
+/// declared length that would run past the end of the file. The returned
+/// offset is the end of the last complete record, so it is always a record
+/// boundary; a partially written trailing record is therefore excluded
+/// rather than parsed as garbage.
+///
+/// `key` is the XOR key when the file is obfuscated; lengths are read through
+/// the same XOR so the walk sees the real framing.
+fn record_walk_end(raw: &[u8], key: Option<&[u8; 8]>) -> usize {
+    /// Read a 4-byte word at `off`, XOR-decoding it when obfuscated.
+    #[inline]
+    fn word(raw: &[u8], off: usize, key: Option<&[u8; 8]>) -> u32 {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&raw[off..off + 4]);
+        if let Some(k) = key {
+            // The keystream index is the byte offset into the file.
+            for (i, byte) in b.iter_mut().enumerate() {
+                *byte ^= k[(off + i) & 7];
+            }
+        }
+        u32::from_le_bytes(b)
+    }
+
+    let mut pos = 0usize;
+    let mut end = 0usize;
+    // A record needs at least magic(4) + len(4) + header(80).
+    while pos + 8 + BLOCK_HEADER_LEN <= raw.len() {
+        if !is_known_network_magic(word(raw, pos, key)) {
+            break;
+        }
+        let len = word(raw, pos + 4, key) as usize;
+        // `len` is attacker-controlled in principle; bound it before adding.
+        if len < BLOCK_HEADER_LEN || len > raw.len() - pos - 8 {
+            break;
+        }
+        pos += 8 + len;
+        end = pos;
+    }
+
+    // If not a single record parsed, distinguish "this is pure padding (or an
+    // empty file)" from "this file is malformed". Trimming a malformed file to
+    // nothing would turn a wrong `--blocks-dir` into a silent "0 blocks"
+    // instead of the actionable "bad magic"/"bad record len" the iterator
+    // produces. Padding is zero on disk, so a non-zero first byte means the
+    // file is meant to contain records and we hand it over intact to report
+    // the real error.
+    if end == 0 && !raw.is_empty() && raw[0] != 0 {
+        return raw.len();
+    }
+    end
 }
 
 /// Read the 8-byte XOR key from `xor.dat` in the same directory as
@@ -314,14 +380,121 @@ mod tests {
         assert_eq!(back, tiny);
     }
 
+    /// Build `n` synthetic records of `payload_len` bytes each, ending in a
+    /// zero byte when `zero_tail` is set (the case that used to break the
+    /// last-non-zero trim).
+    fn synth_records(n: usize, payload_len: usize, zero_tail: bool) -> Vec<u8> {
+        let mut data = Vec::new();
+        for i in 0..n {
+            data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+            data.extend_from_slice(&(payload_len as u32).to_le_bytes());
+            let mut payload = vec![0xABu8; payload_len];
+            // Last byte zero only on the final record, when requested.
+            if zero_tail && i == n - 1 {
+                let last = payload.len() - 1;
+                payload[last] = 0;
+            }
+            data.extend_from_slice(&payload);
+        }
+        data
+    }
+
     #[test]
-    fn last_raw_nonzero_trims_trailing_zeros_only() {
-        assert_eq!(last_raw_nonzero(&[]), 0);
-        assert_eq!(last_raw_nonzero(&[0u8]), 0);
-        assert_eq!(last_raw_nonzero(&[1u8]), 1);
-        assert_eq!(last_raw_nonzero(&[1u8, 2, 0, 0, 0]), 2);
-        // Leading zeros must NOT be trimmed — only trailing.
-        assert_eq!(last_raw_nonzero(&[0u8, 0, 1]), 3);
+    fn record_walk_end_handles_zero_padding() {
+        let data = synth_records(3, 100, false);
+        // 3 records then 128 bytes of preallocated zero padding.
+        let mut padded = data.clone();
+        padded.extend_from_slice(&[0u8; 128]);
+        assert_eq!(record_walk_end(&padded, None), data.len());
+    }
+
+    /// The bug this replaced: a final record that ends in zero bytes must not
+    /// be truncated. This is the testnet4 `blk00000.dat` case — the file ended
+    /// exactly at EOF with a tx whose locktime was 0, and the old
+    /// last-non-zero trim ate four real bytes.
+    #[test]
+    fn record_walk_end_keeps_final_record_ending_in_zeros() {
+        let data = synth_records(3, 100, true);
+        assert_eq!(*data.last().unwrap(), 0, "fixture must end in a zero byte");
+        assert_eq!(record_walk_end(&data, None), data.len());
+    }
+
+    /// A partially written trailing record (declared length runs past EOF)
+    /// must be excluded, and the end must land on the previous boundary.
+    #[test]
+    fn record_walk_end_excludes_partial_trailing_record() {
+        let mut data = synth_records(2, 100, false);
+        let complete = data.len();
+        // Start a third record but cut it short.
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&500u32.to_le_bytes());
+        data.extend_from_slice(&[0xCDu8; 40]);
+        assert_eq!(record_walk_end(&data, None), complete);
+    }
+
+    /// Non-magic garbage ends the walk immediately.
+    #[test]
+    fn record_walk_end_stops_on_non_magic() {
+        let mut data = synth_records(1, 100, false);
+        let complete = data.len();
+        data.extend_from_slice(&[0xDEu8; 64]);
+        assert_eq!(record_walk_end(&data, None), complete);
+        assert_eq!(record_walk_end(&[], None), 0);
+        assert_eq!(record_walk_end(&[0u8; 16], None), 0);
+    }
+
+    /// A declared length below the header size is malformed; the walk must not
+    /// land mid-record on it, and (like the other malformed cases) hands the
+    /// file back intact so the iterator reports the real error.
+    #[test]
+    fn record_walk_end_preserves_short_length_for_diagnosis() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 200]);
+        assert_eq!(record_walk_end(&data, None), data.len());
+    }
+
+    /// A file that starts with something other than a known magic is handed
+    /// back intact rather than trimmed to nothing, so the iterator can report
+    /// the real "bad magic" instead of the run silently seeing zero blocks.
+    #[test]
+    fn record_walk_end_preserves_malformed_file_for_diagnosis() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xDEADBEEFu32.to_le_bytes()); // unknown magic
+        data.extend_from_slice(&80u32.to_le_bytes());
+        data.extend_from_slice(&[1u8; 80]);
+        assert_eq!(record_walk_end(&data, None), data.len());
+    }
+
+    /// A non-zero declared length that overruns the file is likewise kept so
+    /// the iterator reports "bad record len" rather than reporting no blocks.
+    #[test]
+    fn record_walk_end_preserves_overrun_length_for_diagnosis() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&[1u8; 80]);
+        assert_eq!(record_walk_end(&data, None), data.len());
+    }
+
+    /// Under XOR obfuscation the raw trailing padding is a non-zero key
+    /// pattern, so only the walk can find the end. Lengths and magic must be
+    /// read through the key.
+    #[test]
+    fn record_walk_end_works_under_xor_with_padding() {
+        let key = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let plain = synth_records(3, 100, true);
+        let mut padded = plain.clone();
+        padded.extend_from_slice(&[0u8; 256]); // padding; decodes to key pattern
+        let obfuscated: Vec<u8> = padded
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 8])
+            .collect();
+        // The raw tail is NOT zero, so a last-non-zero trim would keep it all.
+        assert_ne!(*obfuscated.last().unwrap(), 0);
+        assert_eq!(record_walk_end(&obfuscated, Some(&key)), plain.len());
     }
 
     #[test]

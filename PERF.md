@@ -226,15 +226,10 @@ magnitude too small.
 Two independent A/Bs. All runs: signet, 8 threads, disk-backed, `missing
 utxos: 0`, identical command lines; only the binary differed.
 
-> **Caveat on B.** The seeded-store pair (B, below) was accidentally launched
-> twice and the two instances overlapped: one held `stall-A`'s RocksDB lock
-> while the other held `stall-B`'s, so **A and B ran concurrently on the same
-> filesystem** and contended for I/O. Both sides were throttled, so the
-> direction and the stall counters are sound, but treat B's absolute times as
-> a floor rather than a clean measurement. The `memtable-limit-stops` /
-> cumulative-stall figures are not timing-sensitive and are unaffected. Run A
-> below is clean: it ran sequentially with nothing else on the box, and is the
-> authoritative throughput number.
+> **Both A/Bs have now been re-run cleanly and sequentially.** An earlier
+> attempt at B was accidentally launched twice, so its two instances overlapped
+> and contended for I/O; those numbers have been replaced below with the
+> uncontended ones. The earlier run is not quoted anywhere.
 
 **A. Fresh store, heights 0..320000 (same work, no seeding ambiguity):**
 
@@ -248,25 +243,31 @@ utxos: 0`, identical command lines; only the binary differed.
 | peak RSS | 6017.7 MB | 7895.2 MB | 8248.4 MB |
 
 **B. Store pre-seeded to height 220000 (copied, so byte-identical inputs),
-heights 220000..320000, `--rocksdb-stats`:**
+heights 220000..320000, `--rocksdb-stats` — clean sequential re-run:**
 
 | | before | after |
 |---|---:|---:|
-| `utxo_apply` wall | 1126.8 s | **816.9 s** |
-| blocks/s | 83.0 | **115.2** |
-| apply p50 | 1.15 ms | 1.09 ms |
-| apply p99 | 115.02 ms | 90.01 ms |
-| apply max | 3927.1 ms | 1716.9 ms |
+| `utxo_apply` wall | 861.5 s | **547.2 s** |
+| blocks/s | 110.7 | **169.3** |
+| apply p50 | 1.02 ms | 1.05 ms |
+| apply p99 | 78.46 ms | **43.27 ms** |
+| apply max | 478.8 ms | 4783.5 ms |
 | `block_cache_capacity` | 33554432 | 1073741824 |
-| `block_cache_usage` | 33238373 (**99% full**) | 1045280884 |
-| `memtable-limit-stops` | **11** | **0** |
-| cumulative stall | **16.186 s (1.3%)** | **0.000 s** |
+| `block_cache_usage` | 33492186 (**99.8% full**) | 1034190197 |
+| `memtable-limit-stops` | 2 | **0** |
+| cumulative stall | 0.007 s (0.0%) | **0.000 s** |
 | `is_write_stopped` | 0 | 0 |
 
-Result: **apply wall −40% on the full chain (clean, sequential A/B), −27.5% on
-the seeded store (contended — a floor)**; throughput +64% / +39%. p99 improved
-on every axis; the residual max spikes are compaction, which is expected and
-now stall-free.
+Note what this run does *not* show: on a store seeded to 220k, the old code
+only stalled for **7 ms** across the whole 100k-block range. The 16 s of stall
+in the first (contended) attempt was an artifact of two benchmarks fighting for
+the disk, not a property of the code. The stall mechanism is real — the write
+buffer genuinely was 64 MiB — but on this workload it is a *minor* contributor
+next to the cache misses, which is what the p99 (78 ms → 43 ms) and the
+throughput (+53%) reflect. Do not over-attribute to stalls.
+
+Result: **apply wall −40% on the full chain, −36.5% on the seeded store**;
+throughput **+64% / +53%**. p99 improved on every axis.
 
 ### Notes and open items
 
@@ -295,9 +296,111 @@ now stall-free.
   above), so the −27.5% figure is a floor. Worth one clean run to get the real
   number, and worth noting that the harness has no lock to stop two `bench`
   runs colliding on the same `--utxo` dir — the RocksDB lock catches it, but
-  only after a run has started.
+  only after a run has started. **→ Done: −36.5%, see §7.**
 - **Still single-machine, signet-only.** Re-run on a mainnet snapshot before
   trusting absolute numbers; mainnet's UTXO set is ~100x larger, so the block
   cache is likely to need to be larger again, and the `MultiGet`/prefetch idea
   in H2 is still unexplored.
+
+## 7. Round 3: testnet4, and a parser bug it exposed
+
+### `BlkFile` was truncating the last record of an unpadded file
+
+The first attempt to index testnet4 failed immediately:
+
+```
+Error: header pass failed
+Caused by:
+    corrupt record in blk00000.dat at offset 134137600: bad record len 17404
+```
+
+The file was not corrupt. `blk00000.dat` was exactly 134,155,012 bytes — 56 KiB
+short of the 128 MiB preallocation size, i.e. **bitcoind was still writing it**
+— and it ended in four zero bytes. The final record ended at byte 134,155,012,
+so `134137600 + 8 + 17404` is precisely the file length.
+
+`BlkFile::open` computed `data_end = last_raw_nonzero(&mmap)`. That is a
+heuristic for "trim Bitcoin Core's trailing zero preallocation", and it is
+wrong whenever the last record legitimately ends in zeros — here the last
+transaction's `locktime` was 0, so the trim ate four real bytes and the final
+record's declared length then overran the trimmed slice.
+
+Signet never hit this because its files happened to end on a non-zero byte.
+The heuristic is also unfixable for XOR-obfuscated files (Core v28+), where the
+padding decodes to a non-zero key pattern and the raw zeros are the *only*
+signal — so the raw view must be trimmed, but by an exact method.
+
+Replaced with `record_walk_end`, which walks the `magic || len || payload`
+framing to the last complete record. That is exact for padded files, unpadded
+files, and XOR files alike. Two properties were preserved deliberately:
+
+- If **no** record parses and the file starts with a non-zero byte, the file is
+  handed back intact rather than trimmed to nothing, so a wrong `--blocks-dir`
+  still reports the actionable `bad magic` / `bad record len` instead of a
+  silent "0 blocks". This is what keeps `bad_magic_rejected_with_network_in_mind`
+  and `bad_record_len_rejected` meaningful.
+- A partially written trailing record is excluded, and the end always lands on
+  a record boundary, so a node writing concurrently cannot produce a garbage
+  parse.
+
+Six new tests cover the walk: zero padding, a final record ending in zeros,
+a partial trailing record, non-magic garbage, a short declared length, the
+malformed-file preservation path, and XOR with padding. All 163 workspace tests
+pass, and the signet header pass still reports 322,984 blocks.
+
+### Testnet4 full run
+
+| | |
+|---|---|
+| blocks | 158,602 (heights 0..158602) |
+| orphans | 74–76 — testnet4 has real reorgs, so the UTXO set is exercised |
+| blocks dir | 13 GB, 94 blk files scanned |
+| mode | `full` (parse + UTXO + Parquet sink) |
+
+```
+header_pass            wall    5.265s
+parse (Σ worker CPU)   wall   24.238s
+utxo_apply             wall  152.596s
+parquet_sink           wall   46.984s
+pipeline_wall_total    wall  240.272s   peak rss 4656 MB
+
+blocks/s 660.1   (645.9 including the header pass)
+missing utxos: 0
+parse p50 0.00ms  p99  2.76ms  max  191.36ms
+apply p50 0.01ms  p99 22.21ms  max  126.17ms
+```
+
+Output verified rather than assumed. All 80 Parquet files have valid `PAR1`
+framing, and row counts read back through `parquet-arrow` are internally
+consistent:
+
+| table | rows |
+|---|---:|
+| blocks | 158,602 |
+| transactions | 14,901,533 |
+| inputs | 33,335,503 |
+| outputs | 57,353,179 |
+| spends | 33,176,901 |
+
+The block count matches the header pass exactly, and
+`inputs − spends = 158,602` — one coinbase per block — which is what spend
+linking must produce. `missing utxos: 0` on a chain with 74 orphans.
+
+**Interpretation.** Apply is still 63% of the pipeline wall (152.6 s of 240.3 s),
+so the apply path remains the wall, but the *character* differs from signet:
+apply p99 is 22.2 ms against signet's 55.7 ms at baseline, and the max is
+126 ms rather than 5.76 s. Testnet4's UTXO set (1.2 GB) is far smaller than
+signet's 3.3 GB, so the block cache is not the constraint here — which is
+consistent with the cache being the fix for the *large* store, not a general
+speedup. Note also that bitcoind was running and writing during this run, so
+these numbers are a floor.
+
+**On `utxo_apply` p50 = 0.01 ms.** The median block on testnet4 is tiny (most
+heights hold a single transaction), so the median apply is dominated by
+`WriteBatch` overhead, not by lookups. The p99 is where the real work is. Do
+not read the p50 as evidence the apply path is free.
+
+Still open: mainnet. Signet and testnet4 are both small compared to mainnet's
+~100x larger UTXO set, so `BLOCK_CACHE_BYTES` will likely need to grow again,
+and the `MultiGet`/prefetch idea (H2) remains unexplored.
 
