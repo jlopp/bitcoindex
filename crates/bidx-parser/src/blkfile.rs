@@ -14,6 +14,8 @@ pub enum BlkError {
     },
     #[error("no blk*.dat files found in {0}")]
     NoFiles(PathBuf),
+    #[error("no block records found in any blk*.dat file under {0}")]
+    NoRecords(PathBuf),
     #[error("corrupt record in blk{file_id:05}.dat at offset {offset}: {reason}")]
     Corrupt {
         file_id: u32,
@@ -342,6 +344,7 @@ mod tests {
         std::fs::write(dir.join("xor.dat"), k).unwrap();
         assert_eq!(read_xor_key(&blk), Some(k));
         let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Build a synthetic blk file in a temp dir containing a sequence of
     /// valid records (the genesis block header, then a trailing zero region).
@@ -366,6 +369,12 @@ mod tests {
             for j in 0..32 {
                 hdr[36 + j] = (i * 32 + j) as u8;
             }
+            // Ensure the record does not END in a zero byte. `BlkFile::open`
+            // trims trailing zero padding against the raw bytes, so a final
+            // record whose last byte is 0 would be truncated and then fail to
+            // parse as a "bad record len". Real block data always ends in a
+            // non-zero locktime/nonce byte, so mirror that here.
+            hdr[BLOCK_HEADER_LEN - 1] = 0x01;
             let payload_len = 80u32;
             data.extend_from_slice(&BLOCK_MAGIC.to_le_bytes());
             const BLOCK_MAGIC: u32 = bidx_core::BLOCK_MAGIC;
@@ -504,6 +513,9 @@ mod tests {
             let path = tmp.join("blk00000.dat");
             let mut hdr = [0u8; 80];
             hdr[0] = 1;
+            // Non-zero final byte so `BlkFile::open`'s trailing-zero trim
+            // cannot swallow the record (see make_blk_dir).
+            hdr[79] = 0x01;
             let mut data = Vec::new();
             data.extend_from_slice(&magic.to_le_bytes());
             data.extend_from_slice(&80u32.to_le_bytes());

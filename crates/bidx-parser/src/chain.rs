@@ -178,7 +178,10 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
         Some(w)
     }
 
-    // Tip = max cumulative work.
+    // Tip = max cumulative work. An empty chain (a blocks dir whose files
+    // hold no records, e.g. a node that has only preallocated blk files) is a
+    // caller error, not a panic: the pipeline already reports "empty chain"
+    // from `ChainIndex::tip_height()`.
     let mut tip: Option<(Hash32, f64)> = None;
     for (h, &w) in cum_work.iter() {
         match tip {
@@ -186,7 +189,9 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
             _ => tip = Some((*h, w)),
         }
     }
-    let (tip_hash, _) = tip.expect("no blocks found");
+    let Some((tip_hash, _)) = tip else {
+        return Err(BlkError::NoRecords(blocks_dir.to_path_buf()));
+    };
 
     // Walk back from tip to genesis assigning heights.
     let mut chain: Vec<Hash32> = Vec::new();

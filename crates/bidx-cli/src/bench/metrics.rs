@@ -42,6 +42,38 @@ impl ResourceSample {
     }
 }
 
+/// Process lifetime peak resident set size, in KiB.
+///
+/// `ResourceSample::now()` returns the *instantaneous* RSS, so taking the max
+/// of two samples (start and end of a stage) silently under-reports any peak
+/// that happens in between — and a reorder buffer that balloons and drains
+/// within one stage is exactly that shape. This reads the kernel's own
+/// high-water mark (`VmHWM`), which is monotonic and therefore immune to
+/// sampling luck.
+///
+/// Falls back to `getrusage(2)`'s `ru_maxrss` (also KiB on Linux) when
+/// `/proc` is unavailable, and to 0 if neither works.
+pub fn peak_rss_kb() -> u64 {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Some(v) = status.lines().find_map(|l| {
+            let rest = l.strip_prefix("VmHWM:")?;
+            rest.split_whitespace().next()?.parse::<u64>().ok()
+        }) {
+            return v;
+        }
+    }
+    // SAFETY: `getrusage` only writes into the provided struct and cannot fail
+    // for RUSAGE_SELF; we still check the return value.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    if rc == 0 {
+        // Linux reports ru_maxrss in KiB; other platforms use bytes, but this
+        // indexer is Linux-only in practice.
+        return usage.ru_maxrss as u64;
+    }
+    0
+}
+
 /// Subtract-able snapshot pair for one stage.
 #[derive(Debug, Clone, Copy)]
 pub struct StageTimer {
@@ -63,7 +95,11 @@ impl StageTimer {
         StageMeasure {
             wall,
             cpu_jiffies: end_res.cpu_jiffies() - self.start_res.cpu_jiffies(),
-            peak_rss_kb: end_res.rss_kb.max(self.start_res.rss_kb),
+            // Process-lifetime high-water mark, monotonic across stages. Using
+            // the max of the two instantaneous samples would miss a buffer that
+            // balloons and drains inside a single stage, which is precisely the
+            // failure mode this harness exists to catch.
+            peak_rss_kb: peak_rss_kb(),
         }
     }
 }
@@ -105,5 +141,49 @@ mod tests {
         assert!(b.cpu_jiffies() >= a.cpu_jiffies());
         assert!(b.rss_kb > 0);
         std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn peak_rss_kb_is_positive_and_monotonic() {
+        // A live process always has a non-zero high-water mark, and it can
+        // never decrease: it is the kernel's monotonic VmHWM.
+        let a = peak_rss_kb();
+        assert!(a > 0, "peak_rss_kb returned 0");
+        // Force some allocation so the high-water mark has a chance to move,
+        // then confirm the second reading is not below the first.
+        let ballast: Vec<u8> = vec![7u8; 8 * 1024 * 1024];
+        let b = peak_rss_kb();
+        assert!(b >= a, "peak RSS went backwards: {a} -> {b}");
+        std::hint::black_box(&ballast);
+    }
+
+    #[test]
+    fn peak_rss_kb_is_at_least_instantaneous_rss() {
+        // VmHWM is by definition >= current VmRSS, so the harness's headline
+        // number can never under-report what the process is actually using.
+        let inst = ResourceSample::now().rss_kb;
+        let peak = peak_rss_kb();
+        assert!(
+            peak >= inst,
+            "peak {peak} KiB below instantaneous {inst} KiB"
+        );
+    }
+
+    #[test]
+    fn stage_measure_reports_peak_high_water_mark() {
+        // A stage that allocates and frees within its own body must still
+        // report the transient peak: this is the regression that let a
+        // reorder buffer balloon and drain unnoticed.
+        let t = StageTimer::start();
+        {
+            let ballast: Vec<u8> = vec![3u8; 32 * 1024 * 1024];
+            std::hint::black_box(&ballast);
+        }
+        let m = t.stop();
+        assert!(
+            m.peak_rss_kb >= 32 * 1024,
+            "stage peak {} KiB did not capture the transient allocation",
+            m.peak_rss_kb
+        );
     }
 }

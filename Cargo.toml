@@ -61,6 +61,20 @@ inherits = "dev"
 lto = "no"
 debug = true
 
+# Profile for `perf record` / `perf report`. The release profile sets
+# `lto = "fat"` and drops debug info, which makes sampled stacks unresolvable
+# — every frame shows up as an inlined blob or an unknown symbol. This profile
+# keeps frame pointers (RUSTFLAGS is not enough on its own: `debug = 1` is what
+# gives `perf` line numbers) and uses thin LTO so build time stays sane.
+#
+#   cargo build --profile profiling -p bidx-cli
+#   perf record -g --call-graph dwarf ./target/profiling/bidx bench ...
+[profile.profiling]
+inherits = "release"
+lto = "thin"
+debug = 1
+strip = false
+
 [profile.dev.package."*"]
 # Third-party deps still build fast but DON'T need to be coverage-visible.
 opt-level = 1

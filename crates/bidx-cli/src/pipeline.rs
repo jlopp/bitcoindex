@@ -22,28 +22,52 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-/// Get a sensible RSS ceiling for `bidx parse` based on available RAM.
-/// We leave ~2 GiB for OS + runtime + the page cache the bench tool
-/// needs for parsing. Reads /proc/meminfo for `MemTotal`; falls
-/// back to ~16 GiB if /proc is missing.
-fn max_rss_kb() -> u64 {
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+/// Get a sensible RSS ceiling for `bidx parse` based on memory that is
+/// actually available, not merely installed.
+///
+/// Using `MemTotal` here is wrong: it ignores every other process on the box,
+/// so on a busy machine the computed ceiling can sit *above* the point where
+/// the kernel's OOM killer steps in, and the watchdog never fires. That is
+/// exactly how a 30 GiB machine ends up killing bidx at 21 GiB RSS with no
+/// diagnostic. `MemAvailable` is the kernel's own estimate of what a new
+/// allocation can obtain without swapping, which is the quantity we want.
+///
+/// We still leave a reserve for the runtime and the page cache the parse stage
+/// needs, and cap at 90% so a single runaway pipeline stage cannot consume the
+/// whole box.
+pub(crate) fn max_rss_kb() -> u64 {
     const RESERVED_FOR_RUNTIME_KB: u64 = 2 * 1024 * 1024; // 2 GiB
-    let total_kb = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse::<u64>().ok())
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
+    let field_kb = |name: &str| -> Option<u64> {
+        meminfo.as_ref()?.lines().find_map(|l| {
+            let rest = l.strip_prefix(name)?;
+            rest.split_whitespace().next()?.parse::<u64>().ok()
         })
-        .unwrap_or(16 * 1024 * 1024);
-    // Cap at 90% of total to leave headroom.
-    total_kb.saturating_sub(total_kb / 10).saturating_sub(RESERVED_FOR_RUNTIME_KB)
+    };
+    let total_kb = field_kb("MemTotal:").unwrap_or(16 * 1024 * 1024);
+    // Fall back to MemTotal when MemAvailable is missing (older kernels).
+    let available_kb = field_kb("MemAvailable:").unwrap_or(total_kb);
+    available_kb
+        .saturating_sub(available_kb / 10)
+        .saturating_sub(RESERVED_FOR_RUNTIME_KB)
+        .max(256 * 1024) // never return something absurdly small
 }
 
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Reorder-buffer watermark shared with workers. If the consumer falls
+/// more than this many blocks behind, workers spin briefly to give it
+/// time to drain — prevents pathological growth when an early height is
+/// slow and the ordered consumer can't drain the buffer. With each parsed
+/// `FullBlock` typically <10 MB, 32 blocks ≈ 320 MB worst-case headroom.
+///
+/// Public so `bidx bench` can sweep it without a rebuild.
+pub const REORDER_HIGH: usize = 32;
+/// Worker -> consumer channel depth. Bounded on purpose: an unbounded
+/// channel is a memory leak under backpressure.
+pub const CHANNEL_DEPTH: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct ParseConfig {
@@ -173,7 +197,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
 
     // Channel carries parsed blocks from workers to the ordered consumer.
     // Bound it to keep memory in check if the consumer (RocksDB) lags.
-    let (tx, rx) = bounded::<WorkItem>(512);
+    let (tx, rx) = bounded::<WorkItem>(CHANNEL_DEPTH);
 
     let progress = ProgressBar::new(total);
     progress.set_style(
@@ -190,11 +214,12 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // Reorder-buffer watermark shared with workers. If the consumer falls
     // more than REORDER_HIGH blocks behind, workers spin briefly to give it
     // time to drain — prevents pathological growth when an early height is
-    // slow and the ordered consumer can't drain the buffer. With each parsed
-    // FullBlock typically <10 MB, 32 blocks ≈ 320 MB worst-case headroom.
-    const REORDER_HIGH: usize = 32;
-    const REORDER_LOW: usize = 16;
+    // slow and the ordered consumer can't drain the buffer.
     let reorder_depth = Arc::new(AtomicUsize::new(0));
+    // Height the consumer is waiting for. Workers holding this height are
+    // exempt from the watermark, which is what makes the spin loop safe: the
+    // one worker that can unblock the consumer is never parked.
+    let next_height = Arc::new(AtomicU32::new(start));
 
     let blocks_dir = cfg.blocks_dir.clone();
     let heights: Vec<u32> = (start..end).collect();
@@ -207,11 +232,17 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     let out_dir = cfg.out.clone();
     let blocks_per_part = cfg.blocks_per_part;
     let recorder = Arc::new(DiskRecorder::new(disk_cfg.clone()));
+    // The watchdog must exist before the consumer is spawned so the consumer
+    // can poll it. `Arc` because the consumer thread needs its own handle;
+    // the original binding keeps it alive for the whole run.
+    let watchdog = Arc::new(crate::bench::OomWatchdog::start(max_rss_kb()));
     let consumer = std::thread::spawn({
         let progress = progress.clone();
         let missing_utxos = Arc::clone(&missing_utxos);
         let recorder = Arc::clone(&recorder);
         let reorder_depth = Arc::clone(&reorder_depth_w);
+        let next_height = Arc::clone(&next_height);
+        let watchdog = Arc::clone(&watchdog);
         move || -> Result<()> {
             consume_ordered(
                 rx,
@@ -224,6 +255,8 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 &missing_utxos,
                 recorder.as_ref(),
                 &reorder_depth,
+                &next_height,
+                Some(watchdog.as_ref()),
             )
         }
     });
@@ -234,18 +267,42 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         .num_threads(cfg.threads.unwrap_or(0))
         .build()?;
 
-    let _watchdog = crate::bench::OomWatchdog::start(max_rss_kb());
     let reorder_depth_w = Arc::clone(&reorder_depth);
+    let next_height_w = Arc::clone(&next_height);
     let file_cache = ThreadFileCache::new(&blocks_dir);
+    // Workers need the watchdog too: when it trips, the consumer returns and
+    // drops `rx`, so every worker's next `send` fails. Reporting that as
+    // "consumer dropped" would hide the actual cause, so the send-failure path
+    // checks the watchdog first.
+    let watchdog_w = Arc::clone(&watchdog);
 
     let parse_result: Result<()> = pool.install(|| {
         heights.par_iter().try_for_each_init(
-            || (file_cache.clone(), tx.clone(), Arc::clone(&reorder_depth_w)),
-            |(cache, tx, reorder), &height| -> Result<()> {
+            || {
+                (
+                    file_cache.clone(),
+                    tx.clone(),
+                    Arc::clone(&reorder_depth_w),
+                    Arc::clone(&next_height_w),
+                    Arc::clone(&watchdog_w),
+                )
+            },
+            |(cache, tx, reorder, next_h, watchdog), &height| -> Result<()> {
                 // Backpressure: spin/sleep until consumer drains the
                 // reorder buffer below the watermark. This caps the
                 // consumer's BTreeMap at ~REORDER_HIGH parsed blocks.
-                while reorder.load(Ordering::Relaxed) > REORDER_HIGH {
+                //
+                // Two guards make this safe. The watchdog check stops an
+                // aborted consumer (RSS over limit) from turning the spin into
+                // a hang. The `next_h` exemption stops a deadlock: the worker
+                // holding the height the consumer is waiting for must run, or
+                // no block ever arrives to let the consumer drain.
+                while reorder.load(Ordering::Relaxed) > REORDER_HIGH
+                    && next_h.load(Ordering::Relaxed) != height
+                {
+                    if watchdog.is_tripped() {
+                        return Err(watchdog.tripped_error());
+                    }
                     std::thread::sleep(std::time::Duration::from_micros(50));
                 }
                 let loc = &index_for_workers.by_height[height as usize];
@@ -258,6 +315,16 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 header_raw.copy_from_slice(&bytes[..80]);
                 let header = bidx_core::BlockHeader::parse(&header_raw);
                 let hash = bidx_core::dsha256(&header_raw);
+                // A send failure means the consumer is gone. That is either a
+                // real bug or the RSS watchdog having aborted it; report the
+                // actual cause rather than a generic "consumer dropped".
+                let send_failed = |w: &crate::bench::OomWatchdog| -> anyhow::Error {
+                    if w.is_tripped() {
+                        w.tripped_error()
+                    } else {
+                        anyhow::anyhow!("consumer dropped")
+                    }
+                };
                 // Skip orphaned (stale / side-chain) blocks. Their UTXOs were
                 // never part of the active chain; indexing them would poison
                 // the UTXO set and emit duplicate rows. We still must notify
@@ -266,13 +333,13 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                     if orphans.contains(&hash) {
                         orphans_skipped.fetch_add(1, Ordering::Relaxed);
                         tx.send(WorkItem::Skipped { height })
-                            .map_err(|_| anyhow::anyhow!("consumer dropped"))?;
+                            .map_err(|_| send_failed(watchdog))?;
                         return Ok(());
                     }
                 }
                 let block = parse_block_full(&bytes, height, hash, &header)?;
                 tx.send(WorkItem::Block { height, block })
-                    .map_err(|_| anyhow::anyhow!("consumer dropped"))?;
+                    .map_err(|_| send_failed(watchdog))?;
                 Ok(())
             },
         )
@@ -336,6 +403,20 @@ impl ThreadFileCache {
         }
     }
 
+    /// Number of `BlkFile`s currently resident in the shared LRU. Used by
+    /// `bidx bench --trace-cache` to prove the decoded-file bound actually
+    /// holds; a value above `MAX_CACHED_FILES` means eviction is broken.
+    /// Number of `BlkFile`s currently resident in the shared LRU.
+    ///
+    /// Exposed for tests: the whole point of `MAX_CACHED_FILES` is that this
+    /// never exceeds it, and an assertion on the count is the only way to
+    /// catch an eviction regression that would otherwise only show up as a
+    /// 19 GiB RSS spike on a long run.
+    #[cfg(test)]
+    pub(crate) fn resident(&self) -> usize {
+        self.inner.map.read().len()
+    }
+
     fn touch(&self, file_id: u32) {
         let mut lru = self.inner.lru.lock();
         // Move `file_id` to the back (most recently used).
@@ -392,10 +473,17 @@ fn consume_ordered(
     missing_utxos: &AtomicU64,
     recorder: &DiskRecorder,
     reorder_depth: &AtomicUsize,
+    // Height the consumer is waiting for; workers exempt themselves from
+    // backpressure when their own height matches (see `run_parse`). Without
+    // this the backpressure spin can deadlock: the worker holding `next`
+    // parks, so nothing ever arrives to unblock the consumer.
+    next_height: &AtomicU32,
+    watchdog: Option<&crate::bench::OomWatchdog>,
 ) -> Result<()> {
     let mut buffer: BTreeMap<u32, FullBlock> = BTreeMap::new();
     let mut skipped_queue: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut next = start;
+    next_height.store(next, Ordering::Relaxed);
 
     let mut part_id = start / blocks_per_part;
     let mut sink = ParquetSink::create(out_dir, part_id, SinkConfig::default())?;
@@ -419,6 +507,7 @@ fn consume_ordered(
             progress.inc(1);
             let _ = recorder.on_block_applied(next)?;
             next += 1;
+            next_height.store(next, Ordering::Relaxed);
             if next >= end {
                 sink.finish()?;
                 return Ok(());
@@ -426,6 +515,13 @@ fn consume_ordered(
         }
 
         while let Some(block) = buffer.remove(&next) {
+            // Poll the RSS watchdog once per block. It is a relaxed atomic
+            // load, so the cost is nil next to apply_block.
+            if let Some(w) = watchdog {
+                if w.is_tripped() {
+                    return Err(w.tripped_error());
+                }
+            }
             // Drained one from reorder buffer — signal workers that there
             // is space for more.
             reorder_depth.fetch_sub(1, Ordering::Relaxed);
@@ -468,6 +564,7 @@ fn consume_ordered(
             progress.inc(1);
             let _ = recorder.on_block_applied(next)?;
             next += 1;
+            next_height.store(next, Ordering::Relaxed);
             if next >= end {
                 sink.finish()?;
                 return Ok(());
@@ -557,7 +654,9 @@ mod tests {
             tx.push(1u8); // 1 output
             tx.extend_from_slice(&100u64.to_le_bytes()); // value
             tx.push(0u8); // spk len 0
-            tx.extend_from_slice(&0u32.to_le_bytes()); // locktime
+            // Non-zero locktime: `BlkFile::open` trims trailing zero padding,
+            // so a synthetic record ending in 0 would lose its final bytes.
+            tx.extend_from_slice(&0x1122_3344u32.to_le_bytes()); // locktime
 
             let payload_len = (BLOCK_HEADER_LEN + 1 + tx.len()) as u32;
             data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
@@ -625,6 +724,7 @@ mod tests {
             skip_disk_check: true, // no real disk-check against /tmp
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
         })
         .expect("run_parse");
         // Layout: out/<entity>/part-NNNNN.parquet, one entity dir per kind.
@@ -670,6 +770,7 @@ mod tests {
             skip_disk_check: true,
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("c")),
+            orphan_blocks: None,
         })
         .err()
         .expect("should error");
@@ -695,5 +796,104 @@ mod tests {
         let b2 = cache.block_bytes(&loc).expect("second read");
         assert_eq!(b1.len(), b2.len());
         let _ = std::fs::remove_dir_all(&blocks_dir);
+    }
+
+    /// Build `n` single-record blk files, each with its own id, so we can drive
+    /// the LRU past `MAX_CACHED_FILES` and prove eviction keeps the resident
+    /// set bounded. A regression here is exactly what turns a long run into a
+    /// multi-gigabyte RSS spike, so it must be asserted rather than assumed.
+    fn make_many_blk_files(n: u32) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "bidx-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        for file_id in 0..n {
+            let mut hdr = [0u8; BLOCK_HEADER_LEN];
+            hdr[0] = 1;
+            hdr[76..80].copy_from_slice(&file_id.to_le_bytes());
+            // Coinbase-only body ending in a non-zero locktime so the
+            // trailing-zero trim in `BlkFile::open` cannot swallow it.
+            let mut tx = Vec::new();
+            tx.extend_from_slice(&1i32.to_le_bytes());
+            tx.push(1u8);
+            tx.extend_from_slice(&[0u8; 32]);
+            tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+            tx.push(0u8);
+            tx.extend_from_slice(&0u32.to_le_bytes());
+            tx.push(1u8);
+            tx.extend_from_slice(&100u64.to_le_bytes());
+            tx.push(0u8);
+            tx.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+
+            let payload_len = (BLOCK_HEADER_LEN + 1 + tx.len()) as u32;
+            let mut data = Vec::new();
+            data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+            data.extend_from_slice(&payload_len.to_le_bytes());
+            data.extend_from_slice(&hdr);
+            data.push(1u8);
+            data.extend_from_slice(&tx);
+            fs::write(tmp.join(format!("blk{:05}.dat", file_id)), &data).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn thread_file_cache_evicts_beyond_capacity() {
+        // Open more distinct files than the LRU holds; the resident count must
+        // never exceed the cap, or decoded 128 MiB buffers accumulate without
+        // bound (the 19 GiB failure mode this bound exists to prevent).
+        let n = (MAX_CACHED_FILES as u32) + 8;
+        let dir = make_many_blk_files(n);
+        let cache = ThreadFileCache::new(&dir);
+        let loc = |file_id: u32| BlockLocation {
+            file_id,
+            offset: 0,
+            record_len: (BLOCK_HEADER_LEN + 1 + 47 + 8) as u32,
+        };
+        for file_id in 0..n {
+            cache
+                .block_bytes(&loc(file_id))
+                .unwrap_or_else(|e| panic!("open file {file_id}: {e}"));
+            assert!(
+                cache.resident() <= MAX_CACHED_FILES,
+                "resident {} exceeded cap {} after opening file {}",
+                cache.resident(),
+                MAX_CACHED_FILES,
+                file_id
+            );
+        }
+        // After sweeping past the cap the map must be exactly at capacity,
+        // i.e. eviction removed the overflow rather than merely not adding.
+        assert_eq!(cache.resident(), MAX_CACHED_FILES);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thread_file_cache_reuses_within_capacity() {
+        // Below the cap nothing should be evicted: re-reading a cached file
+        // must not change the resident set, which proves the LRU hit path is
+        // taken rather than a reopen.
+        let n = (MAX_CACHED_FILES as u32) - 2;
+        let dir = make_many_blk_files(n);
+        let cache = ThreadFileCache::new(&dir);
+        let loc = |file_id: u32| BlockLocation {
+            file_id,
+            offset: 0,
+            record_len: (BLOCK_HEADER_LEN + 1 + 47 + 8) as u32,
+        };
+        for file_id in 0..n {
+            cache.block_bytes(&loc(file_id)).unwrap();
+        }
+        assert_eq!(cache.resident(), n as usize);
+        // Re-read the oldest; it must still be resident.
+        cache.block_bytes(&loc(0)).unwrap();
+        assert_eq!(cache.resident(), n as usize);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

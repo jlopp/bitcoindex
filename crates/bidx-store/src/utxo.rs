@@ -200,6 +200,10 @@ pub struct UtxoStore {
     /// When false, undo records are not written (bulk initial load).
     /// Live mode enables undo so reorgs can be reversed.
     undo_enabled: bool,
+    /// True when RocksDB statistics were requested at open time. Only then do
+    /// the stall counters in `rocksdb.stats` carry meaningful values; see
+    /// `stall_report`.
+    statistics: bool,
 }
 
 pub struct SpendResult {
@@ -217,15 +221,23 @@ pub struct TipState {
 impl UtxoStore {
     /// Open in bulk-load mode (no WAL, no undo logging).
     pub fn open(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, false, false)
+        Self::open_with(path, false, false, false)
     }
 
     /// Open in live mode: WAL enabled (durable per-block) and undo logging.
     pub fn open_live(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, true, true)
+        Self::open_with(path, true, true, false)
     }
 
-    fn open_with(path: &Path, wal: bool, undo_enabled: bool) -> Result<Self, UtxoError> {
+    /// Like [`UtxoStore::open`] but with RocksDB statistics enabled, which
+    /// makes `stall_report` meaningful. Statistics collection adds a small
+    /// amount of per-operation overhead, so this is for diagnosis, not for
+    /// throughput runs.
+    pub fn open_statistics(path: &Path) -> Result<Self, UtxoError> {
+        Self::open_with(path, false, false, true)
+    }
+
+    fn open_with(path: &Path, wal: bool, undo_enabled: bool, statistics: bool) -> Result<Self, UtxoError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
@@ -239,6 +251,10 @@ impl UtxoStore {
         opts.increase_parallelism(8);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        if statistics {
+            opts.enable_statistics();
+            opts.set_stats_dump_period_sec(0);
+        }
         // WAL stays enabled; we control per-write durability via WriteOptions.
 
         let cf_defs = vec![
@@ -253,6 +269,7 @@ impl UtxoStore {
             path: path.to_path_buf(),
             pending: Mutex::new(FxHashMap::default()),
             undo_enabled,
+            statistics,
         })
     }
 
@@ -436,6 +453,88 @@ impl UtxoStore {
     /// Filesystem path of the UTXO db.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Snapshot of RocksDB internals that matter for ingest throughput.
+    ///
+    /// These properties answer the questions that decide where to optimise:
+    /// whether the write-buffer tuning in `open_with` actually took effect on
+    /// the column families (`cur_size_all_mem_tables` / `size_all_mem_tables`
+    /// against the configured 512 MiB per buffer), whether the write path is
+    /// backing up behind flushes (`num_immutable_mem_table`,
+    /// `mem_table_flush_pending`), whether compactions are queued
+    /// (`compaction_pending`, `num_running_compactions`), whether RocksDB has
+    /// started throttling us (`is_write_stopped`,
+    /// `actual_delayed_write_rate`), and how the point-lookup path that
+    /// `apply_block` depends on is cached (`block_cache_capacity/usage`).
+    ///
+    /// All of these are readable without enabling RocksDB statistics, so the
+    /// act of measuring does not perturb the run. Properties that RocksDB
+    /// declines to answer are reported as `"unavailable"` rather than
+    /// omitted, so two runs can be diffed key-for-key.
+    pub fn perf_properties(&self) -> Vec<(String, String)> {
+        const KEYS: &[(&rocksdb::properties::PropName, &str)] = &[
+            (rocksdb::properties::CUR_SIZE_ALL_MEM_TABLES, "cur_size_all_mem_tables"),
+            (rocksdb::properties::SIZE_ALL_MEM_TABLES, "size_all_mem_tables"),
+            (rocksdb::properties::CUR_SIZE_ACTIVE_MEM_TABLE, "cur_size_active_mem_table"),
+            (rocksdb::properties::NUM_IMMUTABLE_MEM_TABLE, "num_immutable_mem_table"),
+            (rocksdb::properties::MEM_TABLE_FLUSH_PENDING, "mem_table_flush_pending"),
+            (rocksdb::properties::NUM_RUNNING_FLUSHES, "num_running_flushes"),
+            (rocksdb::properties::COMPACTION_PENDING, "compaction_pending"),
+            (rocksdb::properties::NUM_RUNNING_COMPACTIONS, "num_running_compactions"),
+            (rocksdb::properties::IS_WRITE_STOPPED, "is_write_stopped"),
+            (rocksdb::properties::ACTUAL_DELAYED_WRITE_RATE, "actual_delayed_write_rate"),
+            (rocksdb::properties::ESTIMATE_NUM_KEYS, "estimate_num_keys"),
+            (rocksdb::properties::ESTIMATE_LIVE_DATA_SIZE, "estimate_live_data_size"),
+            (rocksdb::properties::TOTAL_SST_FILES_SIZE, "total_sst_files_size"),
+            (rocksdb::properties::BLOCK_CACHE_CAPACITY, "block_cache_capacity"),
+            (rocksdb::properties::BLOCK_CACHE_USAGE, "block_cache_usage"),
+        ];
+
+        let mut out: Vec<(String, String)> = Vec::with_capacity(KEYS.len() + 2);
+        for &(prop, name) in KEYS {
+            out.push((name.to_string(), self.property_or_unavailable(prop)));
+        }
+        // "num-files-at-level0" is generated, not a const.
+        out.push((
+            "num_files_at_level0".to_string(),
+            self.property_or_unavailable(rocksdb::properties::num_files_at_level(0)),
+        ));
+        out
+    }
+
+    fn property_or_unavailable(&self, prop: impl rocksdb::CStrLike) -> String {
+        self.db
+            .property_value(prop)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unavailable".to_string())
+    }
+
+    /// Lines from the `rocksdb.stats` blob that mention stalls, which is
+    /// where compaction backpressure becomes visible.
+    ///
+    /// Returns empty unless the store was opened with `open_statistics`,
+    /// because RocksDB only populates these counters when statistics are on.
+    /// An empty result therefore means "not measured", never "zero stalls".
+    pub fn stall_report(&self) -> Vec<String> {
+        self.db
+            .property_value(rocksdb::properties::STATS)
+            .ok()
+            .flatten()
+            .map(|s| {
+                s.lines()
+                    .filter(|l| l.contains("stall") || l.contains("Stall"))
+                    .map(|l| l.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// True when this store was opened with RocksDB statistics enabled, i.e.
+    /// when `stall_report` can say anything meaningful.
+    pub fn statistics_enabled(&self) -> bool {
+        self.statistics
     }
 
     /// Total bytes consumed by this UTXO db on disk, including WAL and MANIFEST.
