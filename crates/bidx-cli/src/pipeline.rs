@@ -538,10 +538,25 @@ fn consume_ordered(
             missing_utxos.fetch_add(res.missing, Ordering::Relaxed);
 
             // Enrich txs with fees and block with total fee.
+            //
+            // The coinbase flag must be read from `block.inputs` *before*
+            // borrowing `block.txs` mutably, and it is computed as a boolean
+            // per tx rather than a nested scan. The previous form re-scanned
+            // every input for every tx — O(txs x inputs), ~16M comparisons on
+            // a 4k-tx block — on the single-threaded consumer.
+            let coinbase_tx: Vec<bool> = {
+                let mut flags = vec![false; block.txs.len()];
+                for inp in &block.inputs {
+                    if let Some(f) = flags.get_mut(inp.tx_index as usize) {
+                        *f |= inp.is_coinbase;
+                    }
+                }
+                flags
+            };
             let mut total_fee = 0u64;
             for (i, tx) in block.txs.iter_mut().enumerate() {
                 tx.fee = res.fees[i];
-                if !block.inputs.iter().any(|inp| inp.tx_index == i as u32 && inp.is_coinbase) {
+                if !coinbase_tx.get(i).copied().unwrap_or(false) {
                     total_fee = total_fee.saturating_add(res.fees[i]);
                 }
             }
