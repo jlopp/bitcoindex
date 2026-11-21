@@ -185,11 +185,40 @@ enum Cmd {
         height: u32,
     },
 
+    /// Inspect and maintain the query-index catalogue.
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+
     /// Benchmark the ingest pipeline: run bidx against a blocks directory
     /// and report per-stage timing (header pass, parallel parse, sequential
     /// UTXO apply, Parquet sink) plus wall-clock throughput, CPU utilisation,
     /// and peak RSS. Use mode=headers/parse/utxo/sink to isolate stages.
     Bench(BenchConfig),
+}
+
+#[derive(Subcommand)]
+enum IndexAction {
+    /// List the query-index catalogue (name, mechanism, target table).
+    List,
+    /// Rebuild a backfilled index. Only `coinstats_by_height` and
+    /// `address_prefix` are backfills; every other index is maintained
+    /// automatically by its materialized view.
+    Rebuild {
+        /// Index name (see `bidx index list`).
+        name: String,
+        #[arg(long, default_value = "localhost")]
+        host: String,
+        #[arg(long, default_value_t = 9000)]
+        port: u16,
+        #[arg(long, default_value = "default")]
+        user: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long, default_value = "bitcoin")]
+        database: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -286,6 +315,32 @@ fn main() -> Result<()> {
         Cmd::Inspect { blocks_dir, height } => {
             pipeline::inspect_block(&blocks_dir, height)?;
         }
+
+        Cmd::Index { action } => match action {
+            IndexAction::List => {
+                for spec in bidx_loader::schema::index_catalog() {
+                    println!("{:<26} {:<20} {}", spec.name, spec.mechanism, spec.target);
+                }
+            }
+            IndexAction::Rebuild {
+                name,
+                host,
+                port,
+                user,
+                password,
+                database,
+            } => {
+                let loader = bidx_loader::ChLoader::new(bidx_loader::ChConfig {
+                    host,
+                    port,
+                    user,
+                    password,
+                    database,
+                })?;
+                loader.rebuild_index(&name)?;
+                println!("rebuilt index {name}");
+            }
+        },
 
         Cmd::Bench(cfg) => run_bench(cfg)?,
 
