@@ -120,8 +120,10 @@ mod tests {
             let e = parse_hashblock_multipart(&msg).unwrap_err();
             match e {
                 ZmqError::Malformed(s) => {
-                    assert!(s.contains(&format!("payload {} bytes", bad_len)),
-                        "missing payload-len info in {s}");
+                    assert!(
+                        s.contains(&format!("payload {} bytes", bad_len)),
+                        "missing payload-len info in {s}"
+                    );
                 }
                 other => panic!("wrong error: {:?}", other),
             }
@@ -161,10 +163,7 @@ mod tests {
             // Republish until the slow-joiner subscription is established; the
             // main thread stops us as soon as it receives one message.
             while !stop_sender.load(Ordering::Relaxed) {
-                let _ = publisher.send_multipart(
-                    [b"hashblock".to_vec(), hash.to_vec()],
-                    0,
-                );
+                let _ = publisher.send_multipart([b"hashblock".to_vec(), hash.to_vec()], 0);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         });

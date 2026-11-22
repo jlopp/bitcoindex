@@ -188,8 +188,10 @@ fn parse_tx<'a>(
         c.skip(script_len as usize)?;
         let sequence = c.read_u32()?;
 
-        let is_coinbase =
-            is_single_input && input_index == 0 && prev_txid == [0u8; 32] && prev_vout == 0xFFFF_FFFF;
+        let is_coinbase = is_single_input
+            && input_index == 0
+            && prev_txid == [0u8; 32]
+            && prev_vout == 0xFFFF_FFFF;
         inputs.push(InputRow {
             height,
             tx_index,
@@ -426,7 +428,9 @@ mod tests {
         let tx = synth_tx_body(21_000_001u64 * 100_000_000);
         let payload = block_with(&[tx]);
         let hash = dsha256(&payload[..80]);
-        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        let e = parse_block_full(&payload, 0, hash, &header_for(1))
+            .err()
+            .unwrap();
         assert!(matches!(e, TxParseError::BadValue(_)), "got {:?}", e);
     }
 
@@ -437,7 +441,9 @@ mod tests {
         payload.extend_from_slice(&2u64.to_le_bytes()[..1]); // count = 2 (varint)
         payload.extend_from_slice(&synth_tx_body(1_000));
         let hash = dsha256(&payload[..80]);
-        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        let e = parse_block_full(&payload, 0, hash, &header_for(1))
+            .err()
+            .unwrap();
         // Either an EOF in cursor machinery or the explicit TxCountMismatch.
         match e {
             TxParseError::Cursor(_) | TxParseError::TxCountMismatch { .. } => {}
@@ -509,11 +515,13 @@ mod tests {
         tx.extend_from_slice(&1i32.to_le_bytes());
         tx.push(0x00); // marker
         tx.push(0x00); // flag = 0 — invalid
-        // Whatever follows doesn't matter; the parser must reject before reading.
+                       // Whatever follows doesn't matter; the parser must reject before reading.
         tx.extend_from_slice(&[0u8; 32]);
         let payload = block_with(&[tx]);
         let hash = dsha256(&payload[..80]);
-        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        let e = parse_block_full(&payload, 0, hash, &header_for(1))
+            .err()
+            .unwrap();
         assert!(matches!(e, TxParseError::BadSegwitFlag { .. }));
     }
 
@@ -647,7 +655,10 @@ mod tests {
 
         assert_eq!(block.witnesses.len(), 2);
         let w0 = &block.witnesses[0];
-        assert_eq!((w0.height, w0.tx_index, w0.input_index, w0.item_index), (8, 0, 1, 0));
+        assert_eq!(
+            (w0.height, w0.tx_index, w0.input_index, w0.item_index),
+            (8, 0, 1, 0)
+        );
         assert_eq!(w0.item_len, 1);
         assert_eq!(w0.item_bytes, vec![0xAA]);
         let w1 = &block.witnesses[1];
@@ -695,8 +706,17 @@ mod tests {
         // is larger than the number of parseable txs but which still reaches the
         // post-loop check (count = 1 with one tx present parses; to hit the
         // guard we assert its construction and Display instead).
-        let e = TxParseError::TxCountMismatch { declared: 5, parsed: 3 };
-        assert!(matches!(e, TxParseError::TxCountMismatch { declared: 5, parsed: 3 }));
+        let e = TxParseError::TxCountMismatch {
+            declared: 5,
+            parsed: 3,
+        };
+        assert!(matches!(
+            e,
+            TxParseError::TxCountMismatch {
+                declared: 5,
+                parsed: 3
+            }
+        ));
         assert_eq!(e.to_string(), "tx count mismatch: declared 5, parsed 3");
     }
 
@@ -712,7 +732,9 @@ mod tests {
         // (no input bytes needed; the parser must reject on the count itself)
         let payload = block_with(&[tx]);
         let hash = dsha256(&payload[..80]);
-        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        let e = parse_block_full(&payload, 0, hash, &header_for(1))
+            .err()
+            .unwrap();
         match e {
             TxParseError::Cursor(ParseError::CountOverflow(n, _)) => assert_eq!(n, 5_000_000),
             other => panic!("expected CountOverflow, got {other:?}"),
@@ -724,10 +746,7 @@ mod tests {
         // The input-count match has a branch per varint size class; the 0xfe
         // (u32) and 0xff (u64, within the sanity bound) branches are exercised
         // here with a count of 1 so the rest of the tx parses normally.
-        for (label, encode) in [
-            ("0xfe", 0u8),
-            ("0xff", 1u8),
-        ] {
+        for (label, encode) in [("0xfe", 0u8), ("0xff", 1u8)] {
             let mut tx = Vec::new();
             tx.extend_from_slice(&1i32.to_le_bytes());
             match encode {

@@ -18,11 +18,7 @@ use bidx_loader::{ChConfig, ChLoader};
 use std::path::PathBuf;
 
 pub struct VerifyArgs {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: Option<String>,
-    pub database: String,
+    pub ch: ChConfig,
     /// Optional Bitcoin Core RPC URL for the node-agreement check.
     pub rpc_url: Option<String>,
     /// Optional node `.cookie` file (used if user/password are not given).
@@ -59,13 +55,25 @@ pub struct CheckResult {
 
 impl CheckResult {
     fn pass(name: &'static str, detail: String) -> Self {
-        CheckResult { name, status: CheckStatus::Pass, detail }
+        CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            detail,
+        }
     }
     fn fail(name: &'static str, detail: String) -> Self {
-        CheckResult { name, status: CheckStatus::Fail, detail }
+        CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail,
+        }
     }
     fn warn(name: &'static str, detail: String) -> Self {
-        CheckResult { name, status: CheckStatus::Warn, detail }
+        CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail,
+        }
     }
 }
 
@@ -110,7 +118,10 @@ pub fn evaluate(c: &Checks) -> Vec<CheckResult> {
     if c.spends == expected_spends {
         out.push(CheckResult::pass(
             "spend_linking",
-            format!("{} spends == {} non-coinbase inputs", c.spends, expected_spends),
+            format!(
+                "{} spends == {} non-coinbase inputs",
+                c.spends, expected_spends
+            ),
         ));
     } else {
         out.push(CheckResult::fail(
@@ -167,39 +178,31 @@ pub fn all_passed(results: &[CheckResult]) -> bool {
 
 /// Run the checks against ClickHouse (and optionally the node).
 pub fn run_verify(args: VerifyArgs) -> Result<()> {
-    let loader = ChLoader::new(ChConfig {
-        host: args.host.clone(),
-        port: args.port,
-        user: args.user.clone(),
-        password: args.password.clone(),
-        database: args.database.clone(),
-    })?;
+    let loader = ChLoader::new(args.ch.clone())?;
     run_verify_with(&loader, &args) // coverage-exempt: needs a working clickhouse-client on PATH; the delegate is covered via run_verify_with, and the no-client path via run_verify_fails_fast_without_clickhouse_client
 }
 
 /// The query + evaluation half of [`run_verify`], split out so it can be
 /// driven with an injected loader (tests use a fake `clickhouse-client`).
 pub fn run_verify_with(loader: &ChLoader, args: &VerifyArgs) -> Result<()> {
-    let db = &args.database;
+    let db = &args.ch.database;
 
-    let indexed_height = parse_scalar(
-        &loader.query_scalar(&format!("SELECT max(height) FROM {db}.blocks"))?,
-    )
-    .unwrap_or(0) as u32;
+    let indexed_height =
+        parse_scalar(&loader.query_scalar(&format!("SELECT max(height) FROM {db}.blocks"))?)
+            .unwrap_or(0) as u32;
     let blocks = parse_scalar(&loader.query_scalar(&format!("SELECT count() FROM {db}.blocks"))?)
         .unwrap_or(0);
-    let distinct_heights = parse_scalar(&loader.query_scalar(&format!(
-        "SELECT uniqExact(height) FROM {db}.blocks"
-    ))?)
-    .unwrap_or(0);
-    let inputs =
-        parse_scalar(&loader.query_scalar(&format!("SELECT count() FROM {db}.inputs"))?).unwrap_or(0);
+    let distinct_heights =
+        parse_scalar(&loader.query_scalar(&format!("SELECT uniqExact(height) FROM {db}.blocks"))?)
+            .unwrap_or(0);
+    let inputs = parse_scalar(&loader.query_scalar(&format!("SELECT count() FROM {db}.inputs"))?)
+        .unwrap_or(0);
     let coinbase_inputs = parse_scalar(&loader.query_scalar(&format!(
         "SELECT count() FROM {db}.inputs WHERE is_coinbase = 1"
     ))?)
     .unwrap_or(0);
-    let spends =
-        parse_scalar(&loader.query_scalar(&format!("SELECT count() FROM {db}.spends"))?).unwrap_or(0);
+    let spends = parse_scalar(&loader.query_scalar(&format!("SELECT count() FROM {db}.spends"))?)
+        .unwrap_or(0);
 
     let node_height = match &args.rpc_url {
         Some(url) => fetch_node_height(
@@ -236,7 +239,10 @@ pub fn run_verify_with(loader: &ChLoader, args: &VerifyArgs) -> Result<()> {
     } else {
         anyhow::bail!(
             "verify: {} check(s) failed",
-            results.iter().filter(|r| r.status == CheckStatus::Fail).count()
+            results
+                .iter()
+                .filter(|r| r.status == CheckStatus::Fail)
+                .count()
         )
     }
 }
@@ -322,7 +328,9 @@ mod tests {
         let mut c = healthy();
         c.coinbase_inputs = 99;
         let r = evaluate(&c);
-        assert!(r.iter().any(|x| x.name == "one_coinbase_per_block" && x.status == CheckStatus::Fail));
+        assert!(r
+            .iter()
+            .any(|x| x.name == "one_coinbase_per_block" && x.status == CheckStatus::Fail));
     }
 
     #[test]
@@ -340,14 +348,18 @@ mod tests {
         let mut c = healthy();
         c.node_height = None;
         let r = evaluate(&c);
-        assert!(r.iter().any(|x| x.name == "node_agreement" && x.status == CheckStatus::Warn));
+        assert!(r
+            .iter()
+            .any(|x| x.name == "node_agreement" && x.status == CheckStatus::Warn));
         // Warnings alone do not fail the run.
         assert!(all_passed(&r));
 
         let mut c = healthy();
         c.node_height = Some(50); // indexed 99 > node 50
         let r = evaluate(&c);
-        assert!(r.iter().any(|x| x.name == "node_agreement" && x.status == CheckStatus::Fail));
+        assert!(r
+            .iter()
+            .any(|x| x.name == "node_agreement" && x.status == CheckStatus::Fail));
         assert!(!all_passed(&r));
     }
 
@@ -362,7 +374,9 @@ mod tests {
         c.spends = 200;
         c.node_height = Some(600);
         let r = evaluate(&c);
-        assert!(r.iter().any(|x| x.name == "full_chain_from_genesis" && x.status == CheckStatus::Warn));
+        assert!(r
+            .iter()
+            .any(|x| x.name == "full_chain_from_genesis" && x.status == CheckStatus::Warn));
         assert!(all_passed(&r), "partial range is a warning, not a failure");
     }
 
@@ -378,7 +392,9 @@ mod tests {
             spends: 0,
         };
         let r = evaluate(&c);
-        assert!(r.iter().any(|x| x.name == "full_chain_from_genesis" && x.status == CheckStatus::Pass));
+        assert!(r
+            .iter()
+            .any(|x| x.name == "full_chain_from_genesis" && x.status == CheckStatus::Pass));
         assert!(all_passed(&r));
     }
 
@@ -395,11 +411,7 @@ mod tests {
         let _g = fork_guard();
         // No clickhouse-client in the sandbox PATH → a clear error, not a panic.
         let e = run_verify(VerifyArgs {
-            host: "localhost".into(),
-            port: 9000,
-            user: "default".into(),
-            password: None,
-            database: "bitcoin".into(),
+            ch: ChConfig::default(),
             rpc_url: None,
             rpc_cookie: None,
             rpc_user: None,
@@ -414,11 +426,10 @@ mod tests {
 
     fn args() -> VerifyArgs {
         VerifyArgs {
-            host: "localhost".into(),
-            port: 9000,
-            user: "default".into(),
-            password: None,
-            database: "db".into(),
+            ch: ChConfig {
+                database: "db".into(),
+                ..ChConfig::default()
+            },
             rpc_url: None,
             rpc_cookie: None,
             rpc_user: None,
@@ -448,10 +459,8 @@ mod tests {
         // Write privately then rename into place so the final inode is never
         // open for writing; the exec target's fd can't be inherited mid-write.
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!(
-            "bidx-verify-{tag}-{}-tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-verify-{tag}-{}-tmp", std::process::id()));
         std::fs::write(&tmp, body).unwrap();
         let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
@@ -470,7 +479,10 @@ mod tests {
 
     fn loader(client: PathBuf) -> ChLoader {
         ChLoader::with_client(
-            ChConfig { database: "db".into(), ..ChConfig::default() },
+            ChConfig {
+                database: "db".into(),
+                ..ChConfig::default()
+            },
             client,
         )
     }
@@ -594,13 +606,19 @@ mod tests {
         let no_colon = std::env::temp_dir().join(format!("bidx-cookie-nc-{}", std::process::id()));
         std::fs::write(&no_colon, "no-separator-here\n").unwrap();
         let (url, h) = spawn_rpc(r#"{"result":1}"#);
-        assert_eq!(fetch_node_height(&url, Some(&no_colon), None, None), Some(1));
+        assert_eq!(
+            fetch_node_height(&url, Some(&no_colon), None, None),
+            Some(1)
+        );
         h.join().unwrap();
         let _ = std::fs::remove_file(&no_colon);
 
         // Missing cookie file → early None.
         let missing = PathBuf::from("/definitely/not/here/.cookie");
-        assert_eq!(fetch_node_height("http://127.0.0.1:1", Some(&missing), None, None), None);
+        assert_eq!(
+            fetch_node_height("http://127.0.0.1:1", Some(&missing), None, None),
+            None
+        );
     }
 
     #[test]
@@ -616,6 +634,9 @@ mod tests {
         h.join().unwrap();
 
         // Nothing listening → send fails, returns None.
-        assert_eq!(fetch_node_height("http://127.0.0.1:1", None, None, None), None);
+        assert_eq!(
+            fetch_node_height("http://127.0.0.1:1", None, None, None),
+            None
+        );
     }
 }

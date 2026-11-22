@@ -458,8 +458,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bidx-core",
+ "crossbeam-channel",
  "hex",
+ "libc",
+ "parking_lot",
  "reqwest",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "sha2",

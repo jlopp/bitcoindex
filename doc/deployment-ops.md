@@ -5,7 +5,8 @@ ClickHouse store, and the day-two operations (readiness, metrics, disk-space
 guard, reorgs, backup, upgrades, troubleshooting).
 
 For the commands themselves see [cli.md](cli.md); for the serving surface see
-[serving-api.md](serving-api.md).
+[serving-api.md](serving-api.md). For Kubernetes, managed ClickHouse, and
+scaling a query fleet, see [cloud-deployment.md](cloud-deployment.md).
 
 ## Contents
 
@@ -113,6 +114,12 @@ Key operational settings:
 | `clickhouse.http_port` | `8123` | HTTP — the **serve** layer. Don't set this to 9000. |
 | `clickhouse.database` | `bitcoin` | Must be non-empty. |
 | `clickhouse.timeout_secs` | `30` | Must be > 0. |
+| `clickhouse.host` | `localhost` | `serve` accepts a comma-separated replica list with failover. |
+| `clickhouse.scheme` | `http` | `https` for TLS to ClickHouse's HTTP interface (managed services). |
+| `server.workers` / `server.queue` | `256` / `1024` | Worker pool and accept queue; beyond the queue, connections get `503`. |
+| `server.drain_delay_secs` / `server.shutdown_timeout_secs` | `5` / `25` | SIGTERM drain sequence; keep their sum under your orchestrator's grace period. |
+| `cache.enabled` | `true` | In-process response cache plus `Cache-Control` headers. |
+| `auth.required` | `false` | Require an API key on the API surface. |
 | `node.rpc_url` | *(none)* | Optional; enables the readiness lag metric and `verify`'s node check. |
 
 `api_addr` and `metrics_addr` must differ, and the service refuses to start
@@ -127,9 +134,9 @@ the secret is not on disk.
 | `GET /readyz` | `200` when ready, else `503`, with a per-check JSON body. |
 | `GET /metrics` | Prometheus text exposition. |
 
-`/readyz` requires **both** a verified ClickHouse connection **and** a non-zero
-indexed tip: a freshly `init-db`'d but unloaded database is *not* ready to
-serve. Wire it into your orchestrator's readiness probe (not liveness) so
+`/readyz` requires a verified ClickHouse connection **and** a non-zero indexed
+tip: a freshly `init-db`'d but unloaded database is *not* ready to serve. It
+also returns 503 from SIGTERM onward while the process drains. Wire it into your orchestrator's readiness probe (not liveness) so
 traffic does not reach an empty index.
 
 Key metrics for dashboards and alerts:
@@ -142,6 +149,13 @@ Key metrics for dashboards and alerts:
   addresses; a spike can indicate an indexing gap).
 - `bidx_requests_by_surface_total{surface}` and
   `bidx_responses_by_status_total{status}` — traffic and status mix.
+- `bidx_request_duration_seconds` — latency histogram (p50/p99 via
+  `histogram_quantile`).
+- `bidx_inflight_requests`, `bidx_shed_total` — saturation; any shedding
+  means scale out.
+- `bidx_cache_hits_total` / `bidx_cache_misses_total` — cache effectiveness.
+- `bidx_rate_limited_total`, `bidx_unauthorized_total`, and the per-tenant
+  `bidx_tenant_*` families — API-key usage.
 
 The serving loop refreshes health/metrics once at startup and every 10 seconds
 thereafter; `/metrics` renders on scrape.

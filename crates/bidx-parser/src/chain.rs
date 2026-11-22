@@ -145,7 +145,10 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
             // `genesis_candidates`, which is built from `headers` keys, so the
             // lookup cannot miss. Guarded rather than indexed to keep the pass
             // total against a future change to how the stack is seeded.
-            let Some(entry) = headers.get(&h) else { continue };
+            // coverage-exempt: 150 — the `continue` below, unreachable as explained above.
+            let Some(entry) = headers.get(&h) else {
+                continue;
+            };
             // coverage-exempt: unreachable — `cum_work` starts empty and this
             // DFS only ever pushes `(genesis_candidate, true)` (it does not
             // descend to children), so the first pop of a given hash always
@@ -418,7 +421,10 @@ mod tests {
 
         let (idx, stats) = build_chain_index(&dir).unwrap();
         assert_eq!(stats.total_records, 4);
-        assert_eq!(stats.unique_blocks, 2, "duplicate hash must not be counted twice");
+        assert_eq!(
+            stats.unique_blocks, 2,
+            "duplicate hash must not be counted twice"
+        );
         assert_eq!(stats.orphans, 0);
         // The retained location is from file 0 (first seen).
         assert_eq!(idx.by_height[0].file_id, 0);
@@ -463,8 +469,16 @@ mod tests {
         let b = header(ah, 0x1d00ffff, 42);
         let bh = dsha256(&b);
 
-        let loc = BlockLocation { file_id: 0, offset: 0, record_len: 88 };
-        let entry = |prev| HeaderEntry { prev, location: loc, work: unit };
+        let loc = BlockLocation {
+            file_id: 0,
+            offset: 0,
+            record_len: 88,
+        };
+        let entry = |prev| HeaderEntry {
+            prev,
+            location: loc,
+            work: unit,
+        };
         let mut headers = FxHashMap::default();
         headers.insert(g, entry(Hash32::ZERO));
         headers.insert(ah, entry(g));

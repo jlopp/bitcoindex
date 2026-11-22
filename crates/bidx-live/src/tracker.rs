@@ -121,7 +121,12 @@ impl LiveTracker {
                     hash: h,
                 };
                 self.utxo.set_tip(&tip)?;
-                on_event(TrackerEvent::CaughtUp { height: node_tip_height }, None);
+                on_event(
+                    TrackerEvent::CaughtUp {
+                        height: node_tip_height,
+                    },
+                    None,
+                );
                 return Ok(());
             }
         };
@@ -149,10 +154,7 @@ impl LiveTracker {
                 return Err(TrackerError::ReorgTooDeep(disconnects));
             }
             if disconnects == 0 {
-                on_event(
-                    TrackerEvent::ReorgStart { depth: 0 },
-                    None,
-                );
+                on_event(TrackerEvent::ReorgStart { depth: 0 }, None);
             }
             // Single-line so coverage attribution for the structured fields is
             // unambiguous (multi-line macros split across lines the probe may
@@ -203,9 +205,9 @@ impl LiveTracker {
                 },
             )?;
 
-            let res = self
-                .utxo
-                .apply_block(next_height, &block.txs, &block.inputs, &block.outputs)?;
+            let res =
+                self.utxo
+                    .apply_block(next_height, &block.txs, &block.inputs, &block.outputs)?;
             // Fill fees + block total_fee so downstream sinks see final data.
             let mut total_fee = 0u64;
             for (i, tx) in block.txs.iter_mut().enumerate() {
@@ -223,7 +225,14 @@ impl LiveTracker {
             self.utxo.set_tip(&new_tip)?;
             local = new_tip;
             if res.missing > 0 {
-                warn!(height = next_height, missing = res.missing, "missing prevouts");
+                // coverage-exempt: 232-234 — `warn!` field expressions are only
+                // evaluated when a subscriber is installed; tests run without
+                // one. The branch itself is reached by the missing-prevout tests.
+                warn!(
+                    height = next_height,
+                    missing = res.missing,
+                    "missing prevouts"
+                );
             }
             on_event(
                 TrackerEvent::Applied {
@@ -235,7 +244,12 @@ impl LiveTracker {
             );
         }
 
-        on_event(TrackerEvent::CaughtUp { height: local.height }, None);
+        on_event(
+            TrackerEvent::CaughtUp {
+                height: local.height,
+            },
+            None,
+        );
         Ok(())
     }
 
@@ -313,7 +327,9 @@ mod tests {
         hdr[0] = 1; // version
         hdr[4..36].copy_from_slice(prev_hash.as_bytes());
         // Deterministic "merkle" pattern for the hash diversity:
-        for j in 0..32 { hdr[36 + j] = ((height >> 3) as u8).wrapping_add(j as u8); }
+        for j in 0..32 {
+            hdr[36 + j] = ((height >> 3) as u8).wrapping_add(j as u8);
+        }
         hdr[68..72].copy_from_slice(&1231006505u32.to_le_bytes());
         hdr[72..76].copy_from_slice(&0x1d00ffffu32.to_le_bytes());
         hdr[76..80].copy_from_slice(&height.to_le_bytes()); // nonce carries height
@@ -348,7 +364,9 @@ mod tests {
 
     impl FakeNode {
         fn new() -> Self {
-            FakeNode { chain: StdMutex::new(StdMap::new()) }
+            FakeNode {
+                chain: StdMutex::new(StdMap::new()),
+            }
         }
         fn add(&self, height: u32, raw: Vec<u8>, hash: Hash32) {
             self.chain.lock().unwrap().insert(height, (raw, hash));
@@ -356,7 +374,10 @@ mod tests {
     }
 
     impl RpcTransport for FakeNode {
-        fn roundtrip(&self, body: &serde_json::Value) -> Result<serde_json::Value, crate::node::RpcError> {
+        fn roundtrip(
+            &self,
+            body: &serde_json::Value,
+        ) -> Result<serde_json::Value, crate::node::RpcError> {
             let method = body["method"].as_str().unwrap_or_default();
             let chain = self.chain.lock().unwrap();
             match method {
@@ -457,25 +478,34 @@ mod tests {
         // Prime the UTXO store with an artificial tip at height 0 matching h_g.
         let utxo_dir = tmp_utxo("fwd");
         let utxo = Arc::new(UtxoStore::open_live(&utxo_dir).unwrap());
-        utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 0,
+            hash: h_g,
+        })
+        .unwrap();
 
         let client = NodeClient::with_transport(Box::new(node));
         let tracker = LiveTracker::new(client, None, utxo.clone(), TrackerConfig::default());
         let mut heights: Vec<u32> = Vec::new();
         let mut events: Vec<TrackerEvent> = Vec::new();
-        tracker.catch_up(&mut |e, _| {
-            if let TrackerEvent::Applied { height, .. } = &e {
-                heights.push(*height);
-            }
-            events.push(e);
-        }).unwrap();
+        tracker
+            .catch_up(&mut |e, _| {
+                if let TrackerEvent::Applied { height, .. } = &e {
+                    heights.push(*height);
+                }
+                events.push(e);
+            })
+            .unwrap();
 
         // 1, 2 applied in order; tip ends at 2.
         assert_eq!(heights, vec![1, 2]);
         assert_eq!(utxo.tip().unwrap().unwrap().height, 2);
         assert_eq!(utxo.tip().unwrap().unwrap().hash, h_2);
         // One CaughtUp at the end.
-        assert!(matches!(events.last().unwrap(), TrackerEvent::CaughtUp { height: 2 }));
+        assert!(matches!(
+            events.last().unwrap(),
+            TrackerEvent::CaughtUp { height: 2 }
+        ));
         let _ = std::fs::remove_dir_all(&utxo_dir);
     }
 
@@ -532,7 +562,11 @@ mod tests {
 
             let utxo_dir = tmp_utxo(if capture { "wit-on" } else { "wit-off" });
             let utxo = Arc::new(UtxoStore::open_live(&utxo_dir).unwrap());
-            utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+            utxo.set_tip(&TipState {
+                height: 0,
+                hash: h_g,
+            })
+            .unwrap();
 
             let client = NodeClient::with_transport(Box::new(node));
             let tracker = LiveTracker::new(
@@ -588,7 +622,11 @@ mod tests {
         }));
         let tracker = LiveTracker::new(client, None, utxo.clone(), TrackerConfig::default());
         // Seed tip at 0 to simulate a previous sync.
-        utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 0,
+            hash: h_g,
+        })
+        .unwrap();
         let mut silent = |_e: TrackerEvent, _b: Option<&bidx_parser::FullBlock>| {};
         tracker.catch_up(&mut silent).unwrap();
         assert_eq!(utxo.tip().unwrap().unwrap().hash, h_1a);
@@ -604,13 +642,21 @@ mod tests {
 
         // Expect a ReorgStart, a Disconnected(h_1a), a fresh Applied(h_1b),
         // then CaughtUp(1).
-        let kinds: Vec<&'static str> = seen.iter().map(|e| match e {
-            TrackerEvent::Applied { .. } => "applied",
-            TrackerEvent::Disconnected { .. } => "disconnected",
-            TrackerEvent::ReorgStart { .. } => "reorgstart",
-            TrackerEvent::CaughtUp { .. } => "caughtup",
-        }).collect();
-        assert_eq!(kinds, vec!["reorgstart", "disconnected", "applied", "caughtup"], "got {:?}", kinds);
+        let kinds: Vec<&'static str> = seen
+            .iter()
+            .map(|e| match e {
+                TrackerEvent::Applied { .. } => "applied",
+                TrackerEvent::Disconnected { .. } => "disconnected",
+                TrackerEvent::ReorgStart { .. } => "reorgstart",
+                TrackerEvent::CaughtUp { .. } => "caughtup",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["reorgstart", "disconnected", "applied", "caughtup"],
+            "got {:?}",
+            kinds
+        );
         assert_eq!(utxo.tip().unwrap().unwrap().hash, h_1b);
         let _ = std::fs::remove_dir_all(&utxo_dir);
     }
@@ -630,16 +676,26 @@ mod tests {
         let utxo_dir = tmp_utxo("deep");
         let utxo = Arc::new(UtxoStore::open_live(&utxo_dir).unwrap());
         // Build state: pretend 2 blocks were applied.
-        utxo.set_tip(&TipState { height: 2, hash: h_2a }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 2,
+            hash: h_2a,
+        })
+        .unwrap();
         // We have to actually apply two blocks for disconnect_block to find
         // an undo record. Easier: lower max_reorg_depth to 0 so we hit
         // ReorgTooDeep on the first disconnect check.
-        let cfg = TrackerConfig { max_reorg_depth: 0, ..Default::default() };
+        let cfg = TrackerConfig {
+            max_reorg_depth: 0,
+            ..Default::default()
+        };
         let node = FakeNode::new();
         node.add(0, raw_g.clone(), h_g);
         let client = NodeClient::with_transport(Box::new(node));
         let tracker = LiveTracker::new(client, None, utxo.clone(), cfg);
-        let e = tracker.catch_up(&mut |_e, _b| {}).err().expect("expected error");
+        let e = tracker
+            .catch_up(&mut |_e, _b| {})
+            .err()
+            .expect("expected error");
         assert!(matches!(e, TrackerError::ReorgTooDeep(_)), "got {:?}", e);
         let _ = std::fs::remove_dir_all(&utxo_dir);
     }
@@ -665,13 +721,19 @@ mod tests {
         let utxo_dir = tmp_utxo("genesis-stop");
         let utxo = Arc::new(UtxoStore::open_live(&utxo_dir).unwrap());
         // A non-matching genesis hash forces the mismatch path.
-        utxo.set_tip(&TipState { height: 0, hash: Hash32::from_bytes([0xEE; 32]) })
-            .unwrap();
+        utxo.set_tip(&TipState {
+            height: 0,
+            hash: Hash32::from_bytes([0xEE; 32]),
+        })
+        .unwrap();
         let tracker = LiveTracker::new(client, None, utxo.clone(), TrackerConfig::default());
         let mut events = Vec::new();
         tracker.catch_up(&mut |e, _| events.push(e)).unwrap();
         // Nothing applied; ends CaughtUp at 0.
-        assert!(matches!(events.last().unwrap(), TrackerEvent::CaughtUp { height: 0 }));
+        assert!(matches!(
+            events.last().unwrap(),
+            TrackerEvent::CaughtUp { height: 0 }
+        ));
         let _ = std::fs::remove_dir_all(&utxo_dir);
     }
 
@@ -729,16 +791,26 @@ mod tests {
             }),
         }));
         let seeder = LiveTracker::new(seed, None, utxo.clone(), TrackerConfig::default());
-        utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 0,
+            hash: h_g,
+        })
+        .unwrap();
         seeder.catch_up(&mut |_e, _b| {}).unwrap();
         assert_eq!(utxo.tip().unwrap().unwrap().height, 1);
 
         let tracker = LiveTracker::new(client, None, utxo.clone(), TrackerConfig::default());
         let mut kinds = Vec::new();
-        tracker.catch_up(&mut |e, _| kinds.push(format!("{e:?}"))).unwrap();
+        tracker
+            .catch_up(&mut |e, _| kinds.push(format!("{e:?}")))
+            .unwrap();
         // First event is a ReorgStart, and the tip stepped back to 0.
         assert!(kinds[0].contains("ReorgStart"), "got {:?}", kinds);
-        assert!(kinds.iter().any(|k| k.contains("Disconnected")), "got {:?}", kinds);
+        assert!(
+            kinds.iter().any(|k| k.contains("Disconnected")),
+            "got {:?}",
+            kinds
+        );
         assert_eq!(utxo.tip().unwrap().unwrap().height, 0);
         let _ = std::fs::remove_dir_all(&utxo_dir);
     }
@@ -792,7 +864,11 @@ mod tests {
             }),
         }));
         let seeder = LiveTracker::new(seed, None, utxo.clone(), TrackerConfig::default());
-        utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 0,
+            hash: h_g,
+        })
+        .unwrap();
         seeder.catch_up(&mut |_e, _b| {}).unwrap();
         assert_eq!(utxo.tip().unwrap().unwrap().height, 1);
 
@@ -819,12 +895,19 @@ mod tests {
         // set max_reorg_depth=0 so the polled catch_up returns ReorgTooDeep.
         let mut fake = [0u8; 32];
         fake[0] = 0xAB;
-        utxo.set_tip(&TipState { height: 3, hash: Hash32::from_bytes(fake) }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 3,
+            hash: Hash32::from_bytes(fake),
+        })
+        .unwrap();
         let tracker = LiveTracker::new(
             client,
             None,
             utxo.clone(),
-            TrackerConfig { max_reorg_depth: 0, ..Default::default() },
+            TrackerConfig {
+                max_reorg_depth: 0,
+                ..Default::default()
+            },
         );
         // The initial catch_up returns ReorgTooDeep immediately (no undo record
         // needed because the budget check fires before disconnect_block).
@@ -876,7 +959,11 @@ mod tests {
             }),
         }));
         let seeder = LiveTracker::new(seed, None, utxo.clone(), TrackerConfig::default());
-        utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 0,
+            hash: h_g,
+        })
+        .unwrap();
         seeder.catch_up(&mut |_e, _b| {}).unwrap();
 
         let tracker = LiveTracker::new(client, None, utxo.clone(), TrackerConfig::default());
@@ -932,14 +1019,21 @@ mod tests {
         let client = NodeClient::with_transport(Box::new(node));
         let utxo_dir = tmp_utxo("missing");
         let utxo = Arc::new(UtxoStore::open_live(&utxo_dir).unwrap());
-        utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+        utxo.set_tip(&TipState {
+            height: 0,
+            hash: h_g,
+        })
+        .unwrap();
         let tracker = LiveTracker::new(client, None, utxo.clone(), TrackerConfig::default());
         let mut saw_block = false;
         tracker
             .catch_up(&mut |e, b| {
                 if let TrackerEvent::Applied { height: 1, .. } = e {
                     let blk = b.expect("block payload");
-                    assert_eq!(blk.block_row.total_fee, 0, "spend of a missing prevout has no fee");
+                    assert_eq!(
+                        blk.block_row.total_fee, 0,
+                        "spend of a missing prevout has no fee"
+                    );
                     saw_block = true;
                 }
             })

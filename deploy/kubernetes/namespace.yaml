@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bitcoindex
+  labels:
+    # Enforce the restricted Pod Security Standard; every pod here complies.
+    pod-security.kubernetes.io/enforce: restricted

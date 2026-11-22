@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: bidx-serve
+  labels:
+    app.kubernetes.io/name: bidx-serve
+spec:
+  selector:
+    app.kubernetes.io/name: bidx-serve
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: metrics
+      port: 9101
+      targetPort: metrics

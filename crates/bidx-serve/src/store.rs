@@ -10,6 +10,8 @@
 
 use serde::Deserialize;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -27,9 +29,28 @@ pub trait Transport: Send + Sync {
     fn query(&self, sql: &str) -> Result<String, StoreError>;
 }
 
-/// Production transport: ClickHouse HTTP interface with `FORMAT JSON`.
-pub struct ChHttpTransport {
+/// How long an endpoint that failed at the connection level is skipped
+/// before it is retried.
+const ENDPOINT_COOLDOWN_MS: u64 = 5_000;
+
+struct Endpoint {
     url: String,
+    /// Milliseconds since `ChHttpTransport::epoch` until which this endpoint
+    /// is skipped; 0 = healthy.
+    down_until_ms: AtomicU64,
+}
+
+/// Production transport: ClickHouse HTTP interface with `FORMAT JSON`.
+///
+/// Holds one or more endpoints (replicas, or the per-AZ hosts of a managed
+/// service). Queries rotate round-robin; an endpoint that fails at the
+/// connection level is put in a short cooldown and the query is retried on
+/// the next one. HTTP error statuses are *not* retried — ClickHouse returns
+/// those for query errors, which would fail identically everywhere.
+pub struct ChHttpTransport {
+    endpoints: Vec<Endpoint>,
+    next: AtomicUsize,
+    epoch: Instant,
     user: String,
     password: Option<String>,
     database: String,
@@ -38,6 +59,73 @@ pub struct ChHttpTransport {
 }
 
 impl ChHttpTransport {
+    /// Build a transport over `hosts` (each `host` or `host:port`; a bare
+    /// host uses `port`). `scheme` is `http` or `https`.
+    pub fn with_endpoints(
+        scheme: &str,
+        hosts: &[&str],
+        port: u16,
+        user: &str,
+        password: Option<String>,
+        database: &str,
+        timeout_secs: u64,
+    ) -> Result<Self, StoreError> {
+        if hosts.is_empty() {
+            return Err(StoreError::Transport(
+                "no ClickHouse hosts configured".into(),
+            ));
+        }
+        if scheme != "http" && scheme != "https" {
+            return Err(StoreError::Transport(format!(
+                "unsupported scheme '{scheme}'"
+            )));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| StoreError::Transport(e.to_string()))?;
+        let endpoints = hosts
+            .iter()
+            .map(|h| Endpoint {
+                url: endpoint_url(scheme, h, port),
+                down_until_ms: AtomicU64::new(0),
+            })
+            .collect();
+        Ok(ChHttpTransport {
+            endpoints,
+            next: AtomicUsize::new(0),
+            epoch: Instant::now(),
+            user: user.to_string(),
+            password,
+            database: database.to_string(),
+            timeout_secs,
+            client,
+        })
+    }
+
+    /// The resolved endpoint URLs, in rotation order.
+    pub fn endpoint_urls(&self) -> Vec<&str> {
+        self.endpoints.iter().map(|e| e.url.as_str()).collect()
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    fn send_to(&self, url: &str, sql: &str) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        let mut req = self
+            .client
+            .post(url)
+            .header("X-ClickHouse-User", &self.user)
+            .query(&[("database", self.database.as_str())])
+            .body(format!("{sql} FORMAT JSON"));
+        if let Some(pw) = &self.password {
+            req = req.header("X-ClickHouse-Key", pw);
+        }
+        req.send()
+    }
+
     pub fn new(
         host: &str,
         port: u16,
@@ -60,35 +148,68 @@ impl ChHttpTransport {
         database: &str,
         timeout_secs: u64,
     ) -> Result<Self, StoreError> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| StoreError::Transport(e.to_string()))?;
-        Ok(ChHttpTransport {
-            url: format!("http://{host}:{port}/"),
-            user: user.to_string(),
+        Self::with_endpoints(
+            "http",
+            &[host],
+            port,
+            user,
             password,
-            database: database.to_string(),
+            database,
             timeout_secs,
-            client,
-        })
+        )
+    }
+}
+
+fn endpoint_url(scheme: &str, host: &str, default_port: u16) -> String {
+    // `host:port` overrides the default; a bracketed IPv6 literal without a
+    // port (`[::1]`) or a bare host gets the default.
+    let has_port = match host.rfind(':') {
+        Some(i) => {
+            let tail = &host[i + 1..];
+            !tail.is_empty() && !tail.contains(']') && tail.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    };
+    if has_port {
+        format!("{scheme}://{host}/")
+    } else {
+        format!("{scheme}://{host}:{default_port}/")
     }
 }
 
 impl Transport for ChHttpTransport {
     fn query(&self, sql: &str) -> Result<String, StoreError> {
-        let mut req = self
-            .client
-            .post(&self.url)
-            .header("X-ClickHouse-User", &self.user)
-            .query(&[("database", self.database.as_str())])
-            .body(format!("{sql} FORMAT JSON"));
-        if let Some(pw) = &self.password {
-            req = req.header("X-ClickHouse-Key", pw);
+        let n = self.endpoints.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        let now = self.now_ms();
+        // Healthy endpoints first (in rotation order), then cooled-down ones
+        // as a last resort so a full outage still retries everything.
+        let order = (0..n)
+            .map(|i| (start + i) % n)
+            .filter(|&i| self.endpoints[i].down_until_ms.load(Ordering::Relaxed) <= now)
+            .chain(
+                (0..n)
+                    .map(|i| (start + i) % n)
+                    .filter(|&i| self.endpoints[i].down_until_ms.load(Ordering::Relaxed) > now),
+            );
+        let mut last_err = String::new();
+        let mut resp = None;
+        for i in order {
+            let ep = &self.endpoints[i];
+            match self.send_to(&ep.url, sql) {
+                Ok(r) => {
+                    ep.down_until_ms.store(0, Ordering::Relaxed);
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    ep.down_until_ms
+                        .store(self.now_ms() + ENDPOINT_COOLDOWN_MS, Ordering::Relaxed);
+                    last_err = format!("{}: {e} (timeout {}s)", ep.url, self.timeout_secs);
+                }
+            }
         }
-        let resp = req
-            .send()
-            .map_err(|e| StoreError::Transport(format!("{e} (timeout {}s)", self.timeout_secs)))?;
+        let resp = resp.ok_or(StoreError::Transport(last_err))?;
         let status = resp.status();
         let body = resp
             .text()
@@ -386,7 +507,10 @@ impl Store {
     }
 
     /// Per-address aggregate stats. Returns `None` when the address is absent.
-    pub fn address_stats(&self, address_hash: &[u8; 32]) -> Result<Option<AddressStatsRow>, StoreError> {
+    pub fn address_stats(
+        &self,
+        address_hash: &[u8; 32],
+    ) -> Result<Option<AddressStatsRow>, StoreError> {
         let sql = format!(
             "SELECT sum(funded_count) AS funded_count, sum(funded_sum) AS funded_sum, \
              sum(spent_count) AS spent_count, sum(spent_sum) AS spent_sum, \
@@ -399,7 +523,11 @@ impl Store {
     }
 
     /// Unspent outputs for an address, newest first.
-    pub fn address_utxos(&self, address_hash: &[u8; 32], limit: u32) -> Result<Vec<UtxoRow>, StoreError> {
+    pub fn address_utxos(
+        &self,
+        address_hash: &[u8; 32],
+        limit: u32,
+    ) -> Result<Vec<UtxoRow>, StoreError> {
         let sql = format!(
             "SELECT hex(txid) AS txid, output_index, value_sat, height \
              FROM {}.utxos_by_address FINAL \
@@ -413,7 +541,11 @@ impl Store {
     }
 
     /// Full funding + spending history for an address, oldest first.
-    pub fn address_history(&self, address_hash: &[u8; 32], limit: u32) -> Result<Vec<HistoryRow>, StoreError> {
+    pub fn address_history(
+        &self,
+        address_hash: &[u8; 32],
+        limit: u32,
+    ) -> Result<Vec<HistoryRow>, StoreError> {
         let sql = format!(
             "SELECT hex(txid) AS txid, height, value_sat, kind \
              FROM {}.address_history \
@@ -561,7 +693,10 @@ impl Store {
 /// Parse a 64-char hex string into 32 bytes.
 pub fn parse_hex32(s: &str) -> Result<[u8; 32], StoreError> {
     if s.len() != 64 {
-        return Err(StoreError::Parse(format!("expected 64 hex chars, got {}", s.len())));
+        return Err(StoreError::Parse(format!(
+            "expected 64 hex chars, got {}",
+            s.len()
+        )));
     }
     let mut out = [0u8; 32];
     for i in 0..32 {
@@ -665,7 +800,9 @@ mod tests {
         assert_eq!(row.spent_count, 1);
         assert_eq!(row.spent_sum, 2000);
         assert_eq!(row.history_count, 4);
-        assert!(t.sql().contains(&format!("address_hash = unhex('{}')", "11".repeat(32))));
+        assert!(t
+            .sql()
+            .contains(&format!("address_hash = unhex('{}')", "11".repeat(32))));
         assert!(t.sql().contains("FROM bitcoin.address_stats"));
     }
 
@@ -690,12 +827,15 @@ mod tests {
 
     #[test]
     fn outspends_tx_and_blocks_parse() {
-        let (s, _) = store_with(r#"{"data":[{"spent_vout":0,"spending_txid":"ff","height":9}],"rows":1}"#);
+        let (s, _) =
+            store_with(r#"{"data":[{"spent_vout":0,"spending_txid":"ff","height":9}],"rows":1}"#);
         let r = s.tx_outspends(&[0u8; 32]).unwrap();
         assert_eq!(r[0].spent_vout, 0);
         assert_eq!(r[0].spending_txid, "ff");
 
-        let (s, _) = store_with(r#"{"data":[{"txid":"aa","height":1,"tx_index":2,"fee":"150","output_count":2}],"rows":1}"#);
+        let (s, _) = store_with(
+            r#"{"data":[{"txid":"aa","height":1,"tx_index":2,"fee":"150","output_count":2}],"rows":1}"#,
+        );
         let tx = s.tx(&[0u8; 32]).unwrap().unwrap();
         assert_eq!(tx.tx_index, 2);
         assert_eq!(tx.fee, 150);
@@ -759,7 +899,9 @@ mod tests {
     #[test]
     fn numeric_deserializer_accepts_numbers_and_strings() {
         // Numbers (not strings) must also parse.
-        let (s, _) = store_with(r#"{"data":[{"funded_count":3,"funded_sum":5000,"spent_count":1,"spent_sum":2000,"history_count":4}],"rows":1}"#);
+        let (s, _) = store_with(
+            r#"{"data":[{"funded_count":3,"funded_sum":5000,"spent_count":1,"spent_sum":2000,"history_count":4}],"rows":1}"#,
+        );
         let row = s.address_stats(&[0u8; 32]).unwrap().unwrap();
         assert_eq!(row.funded_sum, 5000);
     }
@@ -849,7 +991,10 @@ mod tests {
     #[test]
     fn error_display_impls() {
         assert_eq!(StoreError::NotFound.to_string(), "address not found");
-        assert_eq!(StoreError::Transport("x".into()).to_string(), "transport error: x");
+        assert_eq!(
+            StoreError::Transport("x".into()).to_string(),
+            "transport error: x"
+        );
         assert!(StoreError::Parse("y".into()).to_string().contains("parse"));
     }
 
@@ -948,6 +1093,102 @@ mod tests {
         let lower = req.to_ascii_lowercase();
         assert!(lower.contains("x-clickhouse-key: pw"), "request was: {req}");
         assert!(req.contains("FORMAT JSON"), "request was: {req}");
+    }
+
+    /// Answers `n` connections with `200 {"data":[]}`, counting them.
+    fn counting_http_server(n: usize) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let mut served = 0;
+            for _ in 0..n {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let body = "{\"data\":[]}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+                served += 1;
+            }
+            served
+        });
+        (port, h)
+    }
+
+    #[test]
+    fn endpoint_url_applies_default_port_only_when_missing() {
+        assert_eq!(endpoint_url("http", "ch", 8123), "http://ch:8123/");
+        assert_eq!(endpoint_url("https", "ch:8443", 8123), "https://ch:8443/");
+        assert_eq!(endpoint_url("http", "[::1]", 8123), "http://[::1]:8123/");
+        assert_eq!(endpoint_url("http", "[::1]:9", 8123), "http://[::1]:9/");
+    }
+
+    #[test]
+    fn with_endpoints_rejects_empty_host_list_and_unknown_scheme() {
+        assert!(matches!(
+            ChHttpTransport::with_endpoints("http", &[], 8123, "u", None, "db", 1),
+            Err(StoreError::Transport(m)) if m.contains("no ClickHouse hosts")
+        ));
+        assert!(matches!(
+            ChHttpTransport::with_endpoints("ftp", &["h"], 8123, "u", None, "db", 1),
+            Err(StoreError::Transport(m)) if m.contains("ftp")
+        ));
+        let t = ChHttpTransport::with_endpoints("https", &["a", "b:9"], 8443, "u", None, "db", 1)
+            .unwrap();
+        assert_eq!(t.endpoint_urls(), vec!["https://a:8443/", "https://b:9/"]);
+    }
+
+    #[test]
+    fn transport_fails_over_to_the_next_host_and_cools_down_the_dead_one() {
+        let (port, h) = counting_http_server(3);
+        let live = format!("127.0.0.1:{port}");
+        let t = ChHttpTransport::with_endpoints(
+            "http",
+            &["127.0.0.1:1", live.as_str()],
+            8123,
+            "u",
+            None,
+            "db",
+            2,
+        )
+        .unwrap();
+        // Rotation starts at the dead host; the query still succeeds.
+        assert_eq!(t.query("SELECT 1").unwrap(), "{\"data\":[]}");
+        assert!(t.endpoints[0].down_until_ms.load(Ordering::Relaxed) > 0);
+        assert_eq!(t.endpoints[1].down_until_ms.load(Ordering::Relaxed), 0);
+        // Next two queries: one starts at the live host, one at the dead
+        // host — which is cooling down, so it's skipped without a connect.
+        assert!(t.query("SELECT 1").is_ok());
+        assert!(t.query("SELECT 1").is_ok());
+        assert_eq!(h.join().unwrap(), 3);
+    }
+
+    #[test]
+    fn transport_retries_cooled_hosts_when_everything_is_down() {
+        let t = ChHttpTransport::with_endpoints(
+            "http",
+            &["127.0.0.1:1", "127.0.0.1:2"],
+            8123,
+            "u",
+            None,
+            "db",
+            1,
+        )
+        .unwrap();
+        let e = t.query("SELECT 1").unwrap_err().to_string();
+        assert!(e.contains("127.0.0.1:"), "{e}");
+        assert!(t
+            .endpoints
+            .iter()
+            .all(|ep| ep.down_until_ms.load(Ordering::Relaxed) > 0));
+        // Both cooling down: the last-resort pass still tries them.
+        let e = t.query("SELECT 1").unwrap_err().to_string();
+        assert!(e.contains("127.0.0.1:"), "{e}");
     }
 
     #[test]

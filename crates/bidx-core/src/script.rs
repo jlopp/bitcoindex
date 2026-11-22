@@ -133,10 +133,7 @@ pub fn classify_script(spk: &[u8]) -> (ScriptType, AddressHash) {
 
     // Bare multisig: OP_m <pubkeys...> OP_n OP_CHECKMULTISIG
     if is_bare_multisig(spk) {
-        return (
-            ScriptType::BareMultisig,
-            pad20(crate::hash::hash160(spk)),
-        );
+        return (ScriptType::BareMultisig, pad20(crate::hash::hash160(spk)));
     }
 
     (ScriptType::Unknown, [0u8; 32])
@@ -218,7 +215,10 @@ mod tests {
 
     #[test]
     fn classifies_op_return_and_multisig() {
-        assert_eq!(classify_script(&[0x6a, 0x04, 1, 2, 3, 4]).0, ScriptType::OpReturn);
+        assert_eq!(
+            classify_script(&[0x6a, 0x04, 1, 2, 3, 4]).0,
+            ScriptType::OpReturn
+        );
 
         // 1-of-2 bare multisig with two compressed keys
         let mut ms = vec![0x51, 0x21];
@@ -238,7 +238,10 @@ mod tests {
         let (t, h) = classify_script(&spk);
         assert_eq!(t, ScriptType::P2PK);
         // hash160 of the genesis pubkey
-        assert_eq!(&h[..20], &hex::decode("62e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap()[..]);
+        assert_eq!(
+            &h[..20],
+            &hex::decode("62e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap()[..]
+        );
     }
 
     #[test]

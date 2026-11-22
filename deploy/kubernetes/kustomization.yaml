@@ -1,0 +1,37 @@
+# bitcoindex on Kubernetes — base.
+#
+#   kubectl apply -f deploy/kubernetes/secret.example.yaml   # edit first!
+#   kubectl apply -k deploy/kubernetes
+#
+# Layout:
+#   serve   — stateless query API (Deployment + Service + PDB + HPA). Scale
+#             horizontally; every replica reads the same ClickHouse.
+#   ingest  — the single writer (StatefulSet, replicas: 1) running
+#             `bidx live --ch-live` against your Bitcoin Core node.
+#   jobs/   — one-off bootstrap (init-db + load --upload), applied by hand.
+#   optional/ — Ingress, ServiceMonitor, custom-metric HPA.
+#
+# Override the image tag / replica counts / config with an overlay:
+#   images: [{ name: ghcr.io/jameson/bitcoindex, newTag: "1.2.3" }]
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: bitcoindex
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: bitcoindex
+    includeSelectors: false
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - serve-deployment.yaml
+  - serve-service.yaml
+  - serve-pdb.yaml
+  - serve-hpa.yaml
+  - ingest-statefulset.yaml
+
+images:
+  - name: ghcr.io/jameson/bitcoindex
+    newTag: edge

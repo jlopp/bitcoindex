@@ -168,7 +168,10 @@ mod tests {
             (&[0xfd, 0xfd, 0x00], 253),
             (&[0xfd, 0xff, 0xff], 65535),
             (&[0xfe, 0x00, 0x00, 0x01, 0x00], 65536),
-            (&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], u64::MAX),
+            (
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                u64::MAX,
+            ),
         ];
         for (bytes, want) in cases {
             let mut c = Cursor::new(bytes);
@@ -248,7 +251,11 @@ mod tests {
         let mut c = Cursor::new(&[0u8; 1]);
         let e = c.read_u64().unwrap_err();
         match e {
-            ParseError::Eof { offset, needed, remaining } => {
+            ParseError::Eof {
+                offset,
+                needed,
+                remaining,
+            } => {
                 assert_eq!(offset, 0);
                 assert_eq!(needed, 8);
                 assert_eq!(remaining, 1);

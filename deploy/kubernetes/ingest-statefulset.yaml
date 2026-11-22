@@ -1,0 +1,102 @@
+# The single writer. Exactly one replica: the UTXO RocksDB store is locked by
+# one process, and two writers would double-insert into ClickHouse. A
+# StatefulSet (not a Deployment) guarantees the old pod is gone before its
+# replacement starts, so a rollout never runs two writers at once.
+#
+# Prerequisite: the `data` PVC's utxo/ dir must hold the UTXO store produced
+# by the initial
+# `bidx parse` (see doc/cloud-deployment.md, "Bootstrap").
+apiVersion: v1
+kind: Service
+metadata:
+  name: bidx-ingest
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: bidx-ingest
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bidx-ingest
+  labels:
+    app.kubernetes.io/name: bidx-ingest
+    app.kubernetes.io/component: ingest
+spec:
+  replicas: 1
+  serviceName: bidx-ingest
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bidx-ingest
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bidx-ingest
+        app.kubernetes.io/component: ingest
+    spec:
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: live
+          image: ghcr.io/jameson/bitcoindex
+          # Flags fall back to BIDX_* env (see configmap.yaml / the Secret).
+          args: ["live", "--ch-live"]
+          envFrom:
+            - configMapRef:
+                name: bidx-ingest-env
+          env:
+            - name: BIDX_CLICKHOUSE__USER
+              valueFrom:
+                secretKeyRef: { name: bidx-secrets, key: INGEST_CLICKHOUSE_USER }
+            - name: BIDX_CLICKHOUSE__PASSWORD
+              valueFrom:
+                secretKeyRef: { name: bidx-secrets, key: INGEST_CLICKHOUSE_PASSWORD }
+            - name: BIDX_NODE__USER
+              valueFrom:
+                secretKeyRef: { name: bidx-secrets, key: BIDX_NODE__USER, optional: true }
+            - name: BIDX_NODE__PASSWORD
+              valueFrom:
+                secretKeyRef: { name: bidx-secrets, key: BIDX_NODE__PASSWORD, optional: true }
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            # clickhouse-client may write its config/history under $HOME.
+            - name: home
+              mountPath: /home/bidx
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # Use an SSD class; RocksDB is random-read heavy during reorgs.
+        resources:
+          requests:
+            storage: 100Gi

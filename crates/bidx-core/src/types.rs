@@ -227,10 +227,9 @@ mod tests {
         raw[0] = 1;
         raw[4..36].copy_from_slice(&[0u8; 32]);
         // Genesis merkle root, wire order (little-endian on disk).
-        let merkle = hex::decode(
-            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
-        )
-        .unwrap();
+        let merkle =
+            hex::decode("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
+                .unwrap();
         let mut wire = [0u8; 32];
         for i in 0..32 {
             wire[31 - i] = merkle[i];
@@ -272,7 +271,11 @@ mod tests {
 
     #[test]
     fn block_location_data_offset() {
-        let l = BlockLocation { file_id: 3, offset: 42, record_len: 100 };
+        let l = BlockLocation {
+            file_id: 3,
+            offset: 42,
+            record_len: 100,
+        };
         assert_eq!(l.data_offset(), 50);
     }
 }

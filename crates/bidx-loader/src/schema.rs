@@ -74,25 +74,101 @@ pub struct IndexSpec {
 /// The 19 indexes the serving layer maintains, in catalogue order.
 pub fn index_catalog() -> Vec<IndexSpec> {
     vec![
-        IndexSpec { name: "blocks_by_hash", mechanism: "projection", target: "blocks" },
-        IndexSpec { name: "transactions_by_txid", mechanism: "table+mv", target: "transactions" },
-        IndexSpec { name: "spends_by_spent_outpoint", mechanism: "table+mv", target: "spends" },
-        IndexSpec { name: "outputs_by_address", mechanism: "table+mv", target: "outputs" },
-        IndexSpec { name: "spends_by_address", mechanism: "table+mv", target: "spends" },
-        IndexSpec { name: "address_history", mechanism: "table+mv", target: "outputs+spends" },
-        IndexSpec { name: "utxos_by_address", mechanism: "collapsing+mv", target: "outputs+spends" },
-        IndexSpec { name: "outputs_by_script_type", mechanism: "projection", target: "outputs" },
-        IndexSpec { name: "idx_blocks_time", mechanism: "skip-index", target: "blocks" },
-        IndexSpec { name: "idx_outputs_value", mechanism: "skip-index", target: "outputs" },
-        IndexSpec { name: "idx_txs_fee", mechanism: "skip-index", target: "transactions" },
-        IndexSpec { name: "blocks_by_time", mechanism: "projection", target: "blocks" },
-        IndexSpec { name: "fee_rate", mechanism: "materialized-column", target: "transactions" },
-        IndexSpec { name: "spends_by_spent_height", mechanism: "projection", target: "spends" },
-        IndexSpec { name: "address_stats", mechanism: "summing+mv", target: "outputs+spends" },
-        IndexSpec { name: "coinstats_by_height", mechanism: "backfill", target: "outputs+spends" },
-        IndexSpec { name: "blocks_by_miner", mechanism: "table+mv", target: "outputs" },
-        IndexSpec { name: "address_prefix", mechanism: "backfill", target: "outputs" },
-        IndexSpec { name: "scripthash_map", mechanism: "table+mv", target: "outputs" },
+        IndexSpec {
+            name: "blocks_by_hash",
+            mechanism: "projection",
+            target: "blocks",
+        },
+        IndexSpec {
+            name: "transactions_by_txid",
+            mechanism: "table+mv",
+            target: "transactions",
+        },
+        IndexSpec {
+            name: "spends_by_spent_outpoint",
+            mechanism: "table+mv",
+            target: "spends",
+        },
+        IndexSpec {
+            name: "outputs_by_address",
+            mechanism: "table+mv",
+            target: "outputs",
+        },
+        IndexSpec {
+            name: "spends_by_address",
+            mechanism: "table+mv",
+            target: "spends",
+        },
+        IndexSpec {
+            name: "address_history",
+            mechanism: "table+mv",
+            target: "outputs+spends",
+        },
+        IndexSpec {
+            name: "utxos_by_address",
+            mechanism: "collapsing+mv",
+            target: "outputs+spends",
+        },
+        IndexSpec {
+            name: "outputs_by_script_type",
+            mechanism: "projection",
+            target: "outputs",
+        },
+        IndexSpec {
+            name: "idx_blocks_time",
+            mechanism: "skip-index",
+            target: "blocks",
+        },
+        IndexSpec {
+            name: "idx_outputs_value",
+            mechanism: "skip-index",
+            target: "outputs",
+        },
+        IndexSpec {
+            name: "idx_txs_fee",
+            mechanism: "skip-index",
+            target: "transactions",
+        },
+        IndexSpec {
+            name: "blocks_by_time",
+            mechanism: "projection",
+            target: "blocks",
+        },
+        IndexSpec {
+            name: "fee_rate",
+            mechanism: "materialized-column",
+            target: "transactions",
+        },
+        IndexSpec {
+            name: "spends_by_spent_height",
+            mechanism: "projection",
+            target: "spends",
+        },
+        IndexSpec {
+            name: "address_stats",
+            mechanism: "summing+mv",
+            target: "outputs+spends",
+        },
+        IndexSpec {
+            name: "coinstats_by_height",
+            mechanism: "backfill",
+            target: "outputs+spends",
+        },
+        IndexSpec {
+            name: "blocks_by_miner",
+            mechanism: "table+mv",
+            target: "outputs",
+        },
+        IndexSpec {
+            name: "address_prefix",
+            mechanism: "backfill",
+            target: "outputs",
+        },
+        IndexSpec {
+            name: "scripthash_map",
+            mechanism: "table+mv",
+            target: "outputs",
+        },
     ]
 }
 
@@ -110,41 +186,41 @@ pub fn all_ddl(db: &str) -> Vec<String> {
         witnesses(db),
         // --- indexes added in place on base tables (projections, skip
         //     indexes, materialized column) ---
-        proj_blocks_by_hash(db),             // 1
-        proj_outputs_by_script_type(db),     // 8
-        skip_blocks_time(db),                // 9
-        skip_outputs_value(db),              // 10
-        skip_txs_fee(db),                    // 11
-        proj_blocks_by_time(db),             // 12
-        col_fee_rate(db),                    // 13
-        proj_spends_by_spent_height(db),     // 14
+        proj_blocks_by_hash(db),         // 1
+        proj_outputs_by_script_type(db), // 8
+        skip_blocks_time(db),            // 9
+        skip_outputs_value(db),          // 10
+        skip_txs_fee(db),                // 11
+        proj_blocks_by_time(db),         // 12
+        col_fee_rate(db),                // 13
+        proj_spends_by_spent_height(db), // 14
         // --- standalone index tables (populated by the MVs below) ---
-        transactions_by_txid(db),            // 2
+        transactions_by_txid(db), // 2
         inputs_by_prev_output(db),
-        outputs_by_address(db),              // 4
-        spends_by_spent_outpoint(db),        // 3
-        spends_by_address(db),               // 5
-        address_history(db),                 // 6
-        utxos_by_address(db),                // 7
-        address_stats(db),                   // 15
-        coinstats_by_height(db),             // 16
-        blocks_by_miner(db),                 // 17
-        address_prefix(db),                  // 18
-        scripthash_map(db),                  // 19
+        outputs_by_address(db),       // 4
+        spends_by_spent_outpoint(db), // 3
+        spends_by_address(db),        // 5
+        address_history(db),          // 6
+        utxos_by_address(db),         // 7
+        address_stats(db),            // 15
+        coinstats_by_height(db),      // 16
+        blocks_by_miner(db),          // 17
+        address_prefix(db),           // 18
+        scripthash_map(db),           // 19
         // --- materialized views (source + target both exist by now) ---
-        mv_transactions_by_txid(db),         // 2
+        mv_transactions_by_txid(db), // 2
         mv_inputs_by_prev_output(db),
-        mv_outputs_by_address(db),           // 4
-        mv_spends_by_spent_outpoint(db),     // 3
-        mv_spends_by_address(db),            // 5
-        mv_address_history_fund(db),         // 6
-        mv_address_history_spend(db),        // 6
-        mv_utxos_fund(db),                   // 7
-        mv_utxos_spend(db),                  // 7
-        mv_address_stats_fund(db),           // 15
-        mv_address_stats_spend(db),          // 15
-        mv_blocks_by_miner(db),              // 17
-        mv_scripthash_map(db),               // 19
+        mv_outputs_by_address(db),       // 4
+        mv_spends_by_spent_outpoint(db), // 3
+        mv_spends_by_address(db),        // 5
+        mv_address_history_fund(db),     // 6
+        mv_address_history_spend(db),    // 6
+        mv_utxos_fund(db),               // 7
+        mv_utxos_spend(db),              // 7
+        mv_address_stats_fund(db),       // 15
+        mv_address_stats_spend(db),      // 15
+        mv_blocks_by_miner(db),          // 17
+        mv_scripthash_map(db),           // 19
     ]
 }
 
@@ -262,10 +338,7 @@ pub fn materialize_migrations(db: &str) -> Vec<(u32, Vec<String>)> {
         .map(|(v, stmts)| {
             (
                 v,
-                stmts
-                    .into_iter()
-                    .map(|s| s.replace("__DB__", db))
-                    .collect(),
+                stmts.into_iter().map(|s| s.replace("__DB__", db)).collect(),
             )
         })
         .collect()
@@ -293,9 +366,7 @@ pub fn read_schema_version(db: &str) -> String {
 /// Query returning `1` when `table` exists in the database, else `0`. Used to
 /// probe for the optional `witnesses` table before touching it.
 pub fn table_exists(db: &str, table: &str) -> String {
-    format!(
-        "SELECT count() > 0 FROM system.tables WHERE database = '{db}' AND name = '{table}'"
-    )
+    format!("SELECT count() > 0 FROM system.tables WHERE database = '{db}' AND name = '{table}'")
 }
 
 // ---------------------------------------------------------------------------
@@ -780,9 +851,7 @@ pub fn address_prefix_source(db: &str) -> String {
 pub fn insert_address_prefix(db: &str, rows: &[(String, u8, String)]) -> String {
     let values: Vec<String> = rows
         .iter()
-        .map(|(addr, ty, hash_hex)| {
-            format!("({}, {}, unhex('{}'))", SqlLit(addr), ty, hash_hex)
-        })
+        .map(|(addr, ty, hash_hex)| format!("({}, {}, unhex('{}'))", SqlLit(addr), ty, hash_hex))
         .collect();
     format!(
         "INSERT INTO {db}.address_prefix (address, script_type, address_hash) VALUES {}",
@@ -902,7 +971,10 @@ mod tests {
             );
         }
         for entity in ENTITIES {
-            assert!(body.contains(&format!("testdb.{entity} ")), "missing base table {entity}");
+            assert!(
+                body.contains(&format!("testdb.{entity} ")),
+                "missing base table {entity}"
+            );
         }
     }
 
@@ -910,8 +982,14 @@ mod tests {
     fn hashes_are_fixed_size_binary_only() {
         let body = all_ddl("db").join("\n");
         assert!(body.contains("FixedString(32)"));
-        assert!(!body.contains(" String "), "must not use variable-length String for hashes");
-        assert!(!body.contains("(String"), "no bare String columns except address_prefix");
+        assert!(
+            !body.contains(" String "),
+            "must not use variable-length String for hashes"
+        );
+        assert!(
+            !body.contains("(String"),
+            "no bare String columns except address_prefix"
+        );
     }
 
     #[test]
@@ -951,22 +1029,42 @@ mod tests {
             ("scripthash_map", "scripthash_map_mv"),
         ] {
             assert!(body.contains(mv), "missing MV {mv}");
-            let table_at = body.find(&format!("db.{table} ")).or_else(|| body.find(&format!("db.{table}\n")));
+            let table_at = body
+                .find(&format!("db.{table} "))
+                .or_else(|| body.find(&format!("db.{table}\n")));
             let mv_at = body.find(mv).expect("mv present");
             let table_at = table_at.expect("table present");
-            assert!(table_at < mv_at, "MV {mv} must be defined after table {table}");
+            assert!(
+                table_at < mv_at,
+                "MV {mv} must be defined after table {table}"
+            );
         }
     }
 
     #[test]
-    fn projections_and_skip_indexes_are_present() {        let body = all_ddl("db").join("\n");
-        for proj in ["blocks_by_hash", "outputs_by_script_type", "blocks_by_time", "spends_by_spent_height"] {
-            assert!(body.contains(&format!("ADD PROJECTION IF NOT EXISTS {proj}")), "missing projection {proj}");
+    fn projections_and_skip_indexes_are_present() {
+        let body = all_ddl("db").join("\n");
+        for proj in [
+            "blocks_by_hash",
+            "outputs_by_script_type",
+            "blocks_by_time",
+            "spends_by_spent_height",
+        ] {
+            assert!(
+                body.contains(&format!("ADD PROJECTION IF NOT EXISTS {proj}")),
+                "missing projection {proj}"
+            );
         }
         for idx in ["idx_blocks_time", "idx_outputs_value", "idx_txs_fee"] {
-            assert!(body.contains(&format!("ADD INDEX IF NOT EXISTS {idx}")), "missing skip index {idx}");
+            assert!(
+                body.contains(&format!("ADD INDEX IF NOT EXISTS {idx}")),
+                "missing skip index {idx}"
+            );
         }
-        assert!(body.contains("ADD COLUMN IF NOT EXISTS fee_rate"), "missing fee_rate column");
+        assert!(
+            body.contains("ADD COLUMN IF NOT EXISTS fee_rate"),
+            "missing fee_rate column"
+        );
     }
 
     #[test]
@@ -992,14 +1090,23 @@ mod tests {
         // SummingMergeTree sums the plain counter columns correctly across
         // merges; AggregatingMergeTree over plain columns keeps only one row per
         // key and silently drops rows for repeatedly-funded addresses.
-        assert!(sql.contains("SummingMergeTree"), "must be SummingMergeTree: {sql}");
+        assert!(
+            sql.contains("SummingMergeTree"),
+            "must be SummingMergeTree: {sql}"
+        );
         assert!(
             !sql.contains("AggregatingMergeTree"),
             "AggregatingMergeTree over plain columns drops rows: {sql}"
         );
         // Both MVs must carry all five counter columns with matching names.
         for mv in [mv_address_stats_fund("db"), mv_address_stats_spend("db")] {
-            for col in ["funded_count", "funded_sum", "spent_count", "spent_sum", "history_count"] {
+            for col in [
+                "funded_count",
+                "funded_sum",
+                "spent_count",
+                "spent_sum",
+                "history_count",
+            ] {
                 assert!(mv.contains(col), "MV missing counter {col}: {mv}");
             }
         }
@@ -1011,7 +1118,11 @@ mod tests {
     #[test]
     fn address_stats_migration_rebuilds_and_swaps_tables() {
         let stmts = migrate_address_stats_to_summing("db");
-        assert_eq!(stmts.len(), 6, "drop-new + create + 2 backfills + drop-old + rename");
+        assert_eq!(
+            stmts.len(),
+            6,
+            "drop-new + create + 2 backfills + drop-old + rename"
+        );
         // 1. clear any half-built table so a retry does not double-count.
         assert_eq!(stmts[0], "DROP TABLE IF EXISTS db.address_stats_new");
         // 2. new table, correct engine.
@@ -1029,7 +1140,10 @@ mod tests {
         // 4. swap: drop the old table (IF EXISTS, so a retry is tolerated), then
         //    rename (last, so a failure before it leaves the old table in place).
         assert_eq!(stmts[4], "DROP TABLE IF EXISTS db.address_stats");
-        assert_eq!(stmts[5], "RENAME TABLE db.address_stats_new TO db.address_stats");
+        assert_eq!(
+            stmts[5],
+            "RENAME TABLE db.address_stats_new TO db.address_stats"
+        );
     }
 
     /// The migration is applied as one batch and the version is recorded only
@@ -1046,7 +1160,9 @@ mod tests {
                 "migration must begin by clearing its scratch table: {first}"
             );
             assert!(
-                stmts.iter().any(|s| s.starts_with("DROP TABLE IF EXISTS") && !s.contains("_new")),
+                stmts
+                    .iter()
+                    .any(|s| s.starts_with("DROP TABLE IF EXISTS") && !s.contains("_new")),
                 "the old-table drop must be IF EXISTS so a post-swap retry is a no-op"
             );
             // The rename is the commit point and must come last.
@@ -1078,8 +1194,14 @@ mod tests {
             "placeholder left after materialization: {:?}",
             mat[0].1
         );
-        assert!(mat[0].1.iter().any(|s| s.contains("bitcoin.address_stats_new")));
-        assert!(mat[0].1.iter().any(|s| s == "RENAME TABLE bitcoin.address_stats_new TO bitcoin.address_stats"));
+        assert!(mat[0]
+            .1
+            .iter()
+            .any(|s| s.contains("bitcoin.address_stats_new")));
+        assert!(mat[0]
+            .1
+            .iter()
+            .any(|s| s == "RENAME TABLE bitcoin.address_stats_new TO bitcoin.address_stats"));
     }
 
     #[test]
@@ -1135,7 +1257,10 @@ mod tests {
             ("script_type = 6", "5120"),   // P2TR
         ] {
             assert!(ddl.contains(ty), "missing arm for {ty}");
-            assert!(ddl.contains(&format!("unhex('{prefix}')")), "missing prefix {prefix}");
+            assert!(
+                ddl.contains(&format!("unhex('{prefix}')")),
+                "missing prefix {prefix}"
+            );
         }
         // Only the reconstructable types are inserted.
         assert!(ddl.contains("WHERE script_type IN (2, 3, 4, 5, 6)"));
@@ -1176,17 +1301,34 @@ mod tests {
     #[test]
     fn insert_address_prefix_binds_hash_and_escapes_address() {
         let rows = vec![
-            ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(), 2u8, "ab".repeat(32)),
-            ("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(), 4, "cd".repeat(32)),
+            (
+                "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string(),
+                2u8,
+                "ab".repeat(32),
+            ),
+            (
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string(),
+                4,
+                "cd".repeat(32),
+            ),
         ];
         let sql = insert_address_prefix("db", &rows);
-        assert!(sql.starts_with("INSERT INTO db.address_prefix (address, script_type, address_hash) VALUES "));
+        assert!(sql.starts_with(
+            "INSERT INTO db.address_prefix (address, script_type, address_hash) VALUES "
+        ));
         assert!(sql.contains("('1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa', 2, unhex('"));
         assert!(sql.contains("('bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4', 4, unhex('"));
         // A hostile address cannot break out of the literal.
-        let evil = vec![("x'); DROP TABLE db.outputs; --".to_string(), 2u8, "00".repeat(32))];
+        let evil = vec![(
+            "x'); DROP TABLE db.outputs; --".to_string(),
+            2u8,
+            "00".repeat(32),
+        )];
         let sql = insert_address_prefix("db", &evil);
-        assert!(sql.contains(r"'x\'); DROP TABLE db.outputs; --'"), "got: {sql}");
+        assert!(
+            sql.contains(r"'x\'); DROP TABLE db.outputs; --'"),
+            "got: {sql}"
+        );
     }
 
     /// Validation harness: writes the exact generated DDL to a temp file (one
@@ -1225,7 +1367,9 @@ mod tests {
         assert_eq!(xml.matches("<type>executable</type>").count(), 2);
         assert_eq!(xml.matches("<format>TabSeparated</format>").count(), 2);
         // The command carries the binary and the network.
-        assert!(xml.contains("<command>/usr/local/bin/bidx-udf address --network testnet3</command>"));
+        assert!(
+            xml.contains("<command>/usr/local/bin/bidx-udf address --network testnet3</command>")
+        );
         assert!(xml.contains("<command>/usr/local/bin/bidx-udf parse --network testnet3</command>"));
         // Argument types: UInt8+String for render, String for parse.
         assert!(xml.contains("<type>UInt8</type>"));

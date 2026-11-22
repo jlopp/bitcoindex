@@ -285,19 +285,25 @@ fn read_varint(b: &mut &[u8]) -> Option<u64> {
     match first {
         0x00..=0xfc => Some(first as u64),
         0xfd => {
-            if b.len() < 2 { return None; }
+            if b.len() < 2 {
+                return None;
+            }
             let v = u16::from_le_bytes([b[0], b[1]]) as u64;
             *b = &b[2..];
             Some(v)
         }
         0xfe => {
-            if b.len() < 4 { return None; }
+            if b.len() < 4 {
+                return None;
+            }
             let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
             *b = &b[4..];
             Some(v)
         }
         0xff => {
-            if b.len() < 8 { return None; }
+            if b.len() < 8 {
+                return None;
+            }
             let v = u64::from_le_bytes(b[..8].try_into().ok()?);
             *b = &b[8..];
             Some(v)
@@ -811,20 +817,56 @@ impl UtxoStore {
     /// omitted, so two runs can be diffed key-for-key.
     pub fn perf_properties(&self) -> Vec<(String, String)> {
         const KEYS: &[(&rocksdb::properties::PropName, &str)] = &[
-            (rocksdb::properties::CUR_SIZE_ALL_MEM_TABLES, "cur_size_all_mem_tables"),
-            (rocksdb::properties::SIZE_ALL_MEM_TABLES, "size_all_mem_tables"),
-            (rocksdb::properties::CUR_SIZE_ACTIVE_MEM_TABLE, "cur_size_active_mem_table"),
-            (rocksdb::properties::NUM_IMMUTABLE_MEM_TABLE, "num_immutable_mem_table"),
-            (rocksdb::properties::MEM_TABLE_FLUSH_PENDING, "mem_table_flush_pending"),
-            (rocksdb::properties::NUM_RUNNING_FLUSHES, "num_running_flushes"),
-            (rocksdb::properties::COMPACTION_PENDING, "compaction_pending"),
-            (rocksdb::properties::NUM_RUNNING_COMPACTIONS, "num_running_compactions"),
+            (
+                rocksdb::properties::CUR_SIZE_ALL_MEM_TABLES,
+                "cur_size_all_mem_tables",
+            ),
+            (
+                rocksdb::properties::SIZE_ALL_MEM_TABLES,
+                "size_all_mem_tables",
+            ),
+            (
+                rocksdb::properties::CUR_SIZE_ACTIVE_MEM_TABLE,
+                "cur_size_active_mem_table",
+            ),
+            (
+                rocksdb::properties::NUM_IMMUTABLE_MEM_TABLE,
+                "num_immutable_mem_table",
+            ),
+            (
+                rocksdb::properties::MEM_TABLE_FLUSH_PENDING,
+                "mem_table_flush_pending",
+            ),
+            (
+                rocksdb::properties::NUM_RUNNING_FLUSHES,
+                "num_running_flushes",
+            ),
+            (
+                rocksdb::properties::COMPACTION_PENDING,
+                "compaction_pending",
+            ),
+            (
+                rocksdb::properties::NUM_RUNNING_COMPACTIONS,
+                "num_running_compactions",
+            ),
             (rocksdb::properties::IS_WRITE_STOPPED, "is_write_stopped"),
-            (rocksdb::properties::ACTUAL_DELAYED_WRITE_RATE, "actual_delayed_write_rate"),
+            (
+                rocksdb::properties::ACTUAL_DELAYED_WRITE_RATE,
+                "actual_delayed_write_rate",
+            ),
             (rocksdb::properties::ESTIMATE_NUM_KEYS, "estimate_num_keys"),
-            (rocksdb::properties::ESTIMATE_LIVE_DATA_SIZE, "estimate_live_data_size"),
-            (rocksdb::properties::TOTAL_SST_FILES_SIZE, "total_sst_files_size"),
-            (rocksdb::properties::BLOCK_CACHE_CAPACITY, "block_cache_capacity"),
+            (
+                rocksdb::properties::ESTIMATE_LIVE_DATA_SIZE,
+                "estimate_live_data_size",
+            ),
+            (
+                rocksdb::properties::TOTAL_SST_FILES_SIZE,
+                "total_sst_files_size",
+            ),
+            (
+                rocksdb::properties::BLOCK_CACHE_CAPACITY,
+                "block_cache_capacity",
+            ),
             (rocksdb::properties::BLOCK_CACHE_USAGE, "block_cache_usage"),
         ];
 
@@ -983,12 +1025,15 @@ mod tests {
     #[test]
     fn block_undo_rejects_truncated() {
         let mut u = BlockUndo::default();
-        u.spent.push(([1u8; 36], UtxoValue {
-            value_sat: 1,
-            script_type: 0,
-            height: 0,
-            address_hash: [0u8; 32],
-        }));
+        u.spent.push((
+            [1u8; 36],
+            UtxoValue {
+                value_sat: 1,
+                script_type: 0,
+                height: 0,
+                address_hash: [0u8; 32],
+            },
+        ));
         let enc = u.encode();
         // Truncate mid-record.
         assert!(BlockUndo::decode(&enc[..20]).is_none());
@@ -1001,7 +1046,10 @@ mod tests {
             (&[0xfc][..], Some(252u64)),
             (&[0xfd, 0xfd, 0x00][..], Some(253u64)),
             (&[0xfe, 0x00, 0x00, 0x01, 0x00][..], Some(65_536u64)),
-            (&[0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00][..], Some(1u64)),
+            (
+                &[0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00][..],
+                Some(1u64),
+            ),
             // Truncations of each multi-byte form.
             (&[0xfd][..], None),
             (&[0xfd, 0xaa][..], None),
@@ -1016,7 +1064,15 @@ mod tests {
             assert_eq!(read_varint(&mut s), want, "case {:?}", bytes);
         }
         // put_varint ↔ read_varint roundtrips for big values.
-        for n in [0u64, 252, 253, 65_535, 65_536, u32::MAX as u64, u64::MAX - 1] {
+        for n in [
+            0u64,
+            252,
+            253,
+            65_535,
+            65_536,
+            u32::MAX as u64,
+            u64::MAX - 1,
+        ] {
             let mut buf = Vec::new();
             put_varint(&mut buf, n);
             let mut s: &[u8] = &buf;
@@ -1128,7 +1184,9 @@ mod tests {
         let fund_txid = [0x11u8; 32];
         let fund = out_row(0, 0, 0, fund_txid, 50_000);
         let b0_outputs = vec![fund.clone()];
-        let r = db.apply_block(0, &[tx_row(0, 0, fund_txid)], &[], &b0_outputs).unwrap();
+        let r = db
+            .apply_block(0, &[tx_row(0, 0, fund_txid)], &[], &b0_outputs)
+            .unwrap();
         assert!(r.spends.is_empty());
         assert_eq!(r.missing, 0);
 
@@ -1139,7 +1197,12 @@ mod tests {
         let b1_inputs = vec![spend_cb.clone(), spend_in.clone()];
         let b1_outputs = vec![out_row(1, 1, 0, spend_txid, 45_000)];
         let r = db
-            .apply_block(1, &[tx_row(1, 0, [0u8; 32]), tx_row(1, 1, spend_txid)], &b1_inputs, &b1_outputs)
+            .apply_block(
+                1,
+                &[tx_row(1, 0, [0u8; 32]), tx_row(1, 1, spend_txid)],
+                &b1_inputs,
+                &b1_outputs,
+            )
             .unwrap();
         assert_eq!(r.spends.len(), 1, "coinbase inputs record no spend");
         let s = &r.spends[0];
@@ -1153,14 +1216,23 @@ mod tests {
         assert_eq!(r.fees[1], 5_000);
 
         // tip roundtrip
-        db.set_tip(&TipState { height: 1, hash: Hash32::from_bytes([0xEE; 32]) }).unwrap();
+        db.set_tip(&TipState {
+            height: 1,
+            hash: Hash32::from_bytes([0xEE; 32]),
+        })
+        .unwrap();
         let t = db.tip().unwrap().unwrap();
         assert_eq!(t.height, 1);
         assert_eq!(t.hash.0, [0xEE; 32]);
 
         // Disconnect block 1 and verify the funded output comes back.
         db.disconnect_block(1).unwrap();
-        let (v, _) = db.db.get_pinned(make_key(&fund_txid, 0)).unwrap().map(|b| (b.len(), 0i8)).unwrap();
+        let (v, _) = db
+            .db
+            .get_pinned(make_key(&fund_txid, 0))
+            .unwrap()
+            .map(|b| (b.len(), 0i8))
+            .unwrap();
         assert_eq!(v, 45);
         // Created outpoint in block 1 should be gone.
         let gone = db.db.get_pinned(make_key(&spend_txid, 0)).unwrap();
@@ -1186,9 +1258,7 @@ mod tests {
     fn missing_utxo_counted_not_fatal() {
         let dir = tmp_path("miss");
         let db = UtxoStore::open(&dir).unwrap();
-        let inputs = vec![inp_row(
-            0, 0, 0, [0x33u8; 32], [0x44u8; 32], 0, false,
-        )];
+        let inputs = vec![inp_row(0, 0, 0, [0x33u8; 32], [0x44u8; 32], 0, false)];
         let r = db
             .apply_block(0, &[tx_row(0, 0, [0x33u8; 32])], &inputs, &[])
             .unwrap();
@@ -1204,10 +1274,22 @@ mod tests {
         let dir = tmp_path("bulk");
         let db = UtxoStore::open(&dir).unwrap();
         let out_txid = [0xAAu8; 32];
-        db.apply_block(0, &[tx_row(0, 0, out_txid)], &[], &[out_row(0, 0, 0, out_txid, 100)])
-            .unwrap();
+        db.apply_block(
+            0,
+            &[tx_row(0, 0, out_txid)],
+            &[],
+            &[out_row(0, 0, 0, out_txid, 100)],
+        )
+        .unwrap();
         let inp = inp_row(1, 0, 0, [0xBBu8; 32], out_txid, 0, false);
-        let r = db.apply_block(1, &[tx_row(1, 0, [0xBBu8; 32])], std::slice::from_ref(&inp), &[]).unwrap();
+        let r = db
+            .apply_block(
+                1,
+                &[tx_row(1, 0, [0xBBu8; 32])],
+                std::slice::from_ref(&inp),
+                &[],
+            )
+            .unwrap();
         assert_eq!(r.spends.len(), 1);
         assert_eq!(r.fees[0], 100);
         // No undo logged; disconnect must fail.
@@ -1228,7 +1310,12 @@ mod tests {
         let tx0 = tx_row(0, 0, txid);
         let tx1 = tx_row(0, 1, [0x88u8; 32]);
         let r = db
-            .apply_block(0, &[tx0, tx1], std::slice::from_ref(&inp), std::slice::from_ref(&out))
+            .apply_block(
+                0,
+                &[tx0, tx1],
+                std::slice::from_ref(&inp),
+                std::slice::from_ref(&out),
+            )
             .unwrap();
         assert_eq!(r.spends.len(), 1);
         // Now disconnect: the undo should handle the same-block spend cleanly.
@@ -1252,13 +1339,8 @@ mod tests {
         let inp = inp_row(0, 1, 0, txid, txid, 0, false);
         let tx0 = tx_row(0, 0, txid);
         let tx1 = tx_row(0, 1, [0x66u8; 32]);
-        db.apply_block(
-            0,
-            &[tx0, tx1],
-            std::slice::from_ref(&inp),
-            &[out0, out1],
-        )
-        .unwrap();
+        db.apply_block(0, &[tx0, tx1], std::slice::from_ref(&inp), &[out0, out1])
+            .unwrap();
 
         // Inspect the stored undo record directly.
         let raw = db
@@ -1267,7 +1349,11 @@ mod tests {
             .unwrap()
             .expect("undo record");
         let undo = BlockUndo::decode(&raw).expect("decodable undo");
-        assert_eq!(undo.spent.len(), 0, "same-block spend must not be an undo.spent");
+        assert_eq!(
+            undo.spent.len(),
+            0,
+            "same-block spend must not be an undo.spent"
+        );
         assert_eq!(
             undo.created.len(),
             1,
@@ -1425,7 +1511,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(r.cache_hits, 1, "spend of a recent output must hit the cache");
+        assert_eq!(
+            r.cache_hits, 1,
+            "spend of a recent output must hit the cache"
+        );
         assert_eq!(r.db_lookups, 0, "no database read should have been needed");
         assert_eq!(r.missing, 0);
         // Fidelity: the same fields a DB read would have produced.
@@ -1569,11 +1658,21 @@ mod tests {
         db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 1)])
             .unwrap();
         let t1 = [0xF2u8; 32];
-        db.apply_block(1, &[tx_row(1, 0, t1)], &[inp_row(1, 0, 0, t1, a, 0, false)], &[])
-            .unwrap();
+        db.apply_block(
+            1,
+            &[tx_row(1, 0, t1)],
+            &[inp_row(1, 0, 0, t1, a, 0, false)],
+            &[],
+        )
+        .unwrap();
         let t2 = [0xF3u8; 32];
-        db.apply_block(2, &[tx_row(2, 0, t2)], &[inp_row(2, 0, 0, t2, a, 0, false)], &[])
-            .unwrap();
+        db.apply_block(
+            2,
+            &[tx_row(2, 0, t2)],
+            &[inp_row(2, 0, 0, t2, a, 0, false)],
+            &[],
+        )
+        .unwrap();
 
         let stats = db.cache_stats().expect("cache enabled");
         assert_eq!(stats.hits, 1, "first spend hit");
@@ -1635,8 +1734,14 @@ mod tests {
         let dir = tmp_path("tip");
         let db = UtxoStore::open_live(&dir).unwrap();
         assert!(db.tip().unwrap().is_none());
-        let a = TipState { height: 10, hash: Hash32::from_bytes([1; 32]) };
-        let b = TipState { height: 11, hash: Hash32::from_bytes([2; 32]) };
+        let a = TipState {
+            height: 10,
+            hash: Hash32::from_bytes([1; 32]),
+        };
+        let b = TipState {
+            height: 11,
+            hash: Hash32::from_bytes([2; 32]),
+        };
         db.set_tip(&a).unwrap();
         assert_eq!(db.tip().unwrap().unwrap(), a);
         db.set_tip(&b).unwrap();
@@ -1651,8 +1756,18 @@ mod tests {
         // Assert both the refresh and the single queue entry.
         let mut c = RecentUtxoCache::new(10 * CACHE_ENTRY_COST);
         let k = [0x11u8; 36];
-        let v1 = UtxoValue { value_sat: 1, script_type: 1, height: 1, address_hash: [0; 32] };
-        let v2 = UtxoValue { value_sat: 2, script_type: 2, height: 2, address_hash: [0; 32] };
+        let v1 = UtxoValue {
+            value_sat: 1,
+            script_type: 1,
+            height: 1,
+            address_hash: [0; 32],
+        };
+        let v2 = UtxoValue {
+            value_sat: 2,
+            script_type: 2,
+            height: 2,
+            address_hash: [0; 32],
+        };
         c.insert(k, v1);
         assert_eq!(c.order.len(), 1);
         c.insert(k, v2); // same key: refresh, no requeue
@@ -1671,7 +1786,15 @@ mod tests {
         c.evict_to_budget();
         assert_eq!(c.len(), 0);
         // With an entry present but a zero budget, eviction empties it and stops.
-        c.insert([0x22u8; 36], UtxoValue { value_sat: 1, script_type: 0, height: 0, address_hash: [0; 32] });
+        c.insert(
+            [0x22u8; 36],
+            UtxoValue {
+                value_sat: 1,
+                script_type: 0,
+                height: 0,
+                address_hash: [0; 32],
+            },
+        );
         assert_eq!(c.len(), 0);
     }
 

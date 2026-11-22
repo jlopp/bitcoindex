@@ -117,13 +117,8 @@ pub struct ParseConfig {
 /// marker for a height whose block hash is in the orphan set (we skip its
 /// data but must still advance the ordered consumer past that height).
 pub(crate) enum WorkItem {
-    Block {
-        height: u32,
-        block: FullBlock,
-    },
-    Skipped {
-        height: u32,
-    },
+    Block { height: u32, block: FullBlock },
+    Skipped { height: u32 },
 }
 
 pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
@@ -179,10 +174,11 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 .context("init RPC client for disk pre-flight")?,
             };
             let node_tip = node.get_block_count().context("getblockcount")?;
-            let local_tip = bidx_core::read_checkpoints(&disk_cfg.checkpoint_file, disk_cfg.network)
-                .last()
-                .map(|c| c.height)
-                .unwrap_or(0);
+            let local_tip =
+                bidx_core::read_checkpoints(&disk_cfg.checkpoint_file, disk_cfg.network)
+                    .last()
+                    .map(|c| c.height)
+                    .unwrap_or(0);
             if local_tip == 0 && start == 0 {
                 tracing::info!(
                     network = network.name(),
@@ -197,7 +193,10 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
             // filtering (we log a warning).
             match node.orphan_block_hashes() {
                 Ok(set) if !set.is_empty() => {
-                    warn!(count = set.len(), "fetched orphan block hashes; they will be skipped");
+                    warn!(
+                        count = set.len(),
+                        "fetched orphan block hashes; they will be skipped"
+                    );
                     cfg.orphan_blocks = Some(Arc::new(set));
                 }
                 Ok(_) => tracing::info!("no orphaned blocks reported by node"),
@@ -324,11 +323,11 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // holding the height the consumer is waiting for must run, or
                 // no block ever arrives to let the consumer drain.
                 //
-                // coverage-exempt: 333, 335-336, 338 — the spin body only runs
+                // coverage-exempt: 332, 334-335, 337 — the spin body only runs
                 // when the consumer is >REORDER_HIGH blocks behind *and* the
                 // worker's height is not the one being awaited, i.e. under real
                 // memory pressure the unit fixtures never create. The first
-                // clause of the condition (line 332) is exercised.
+                // clause of the condition (line 331) is exercised.
                 while reorder.load(Ordering::Relaxed) > REORDER_HIGH
                     && next_h.load(Ordering::Relaxed) != height
                 {
@@ -350,7 +349,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // A send failure means the consumer is gone. That is either a
                 // real bug or the RSS watchdog having aborted it; report the
                 // actual cause rather than a generic "consumer dropped".
-                // coverage-exempt: 358-359, 361 — only runs when a send to the
+                // coverage-exempt: 357-358, 360 — only runs when a send to the
                 // consumer fails, which needs the consumer thread to have
                 // aborted mid-run (RSS watchdog); not reachable in the unit
                 // fixtures. The closure's construction is covered.
@@ -433,7 +432,9 @@ impl ThreadFileCache {
         ThreadFileCache {
             blocks_dir: blocks_dir.to_path_buf(),
             inner: Arc::new(CacheInner {
-                lru: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(MAX_CACHED_FILES)),
+                lru: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                    MAX_CACHED_FILES,
+                )),
                 map: parking_lot::RwLock::new(FxHashMap::default()),
             }),
         }
@@ -470,7 +471,10 @@ impl ThreadFileCache {
         }
     }
 
-    pub(crate) fn block_bytes(&self, loc: &bidx_core::BlockLocation) -> Result<std::sync::Arc<[u8]>> {
+    pub(crate) fn block_bytes(
+        &self,
+        loc: &bidx_core::BlockLocation,
+    ) -> Result<std::sync::Arc<[u8]>> {
         let f = {
             let files = self.inner.map.read();
             files.get(&loc.file_id).cloned()
@@ -481,9 +485,7 @@ impl ThreadFileCache {
                 bf
             }
             None => {
-                let path = self
-                    .blocks_dir
-                    .join(format!("blk{:05}.dat", loc.file_id));
+                let path = self.blocks_dir.join(format!("blk{:05}.dat", loc.file_id));
                 let bf = Arc::new(BlkFile::open(&path, loc.file_id)?);
                 self.inner.map.write().insert(loc.file_id, Arc::clone(&bf));
                 self.touch(loc.file_id);
@@ -570,7 +572,7 @@ fn consume_ordered(
         while let Some(block) = buffer.remove(&next) {
             // Poll the RSS watchdog once per block. It is a relaxed atomic
             // load, so the cost is nil next to apply_block.
-            // coverage-exempt: 579 — returns only when the watchdog has already
+            // coverage-exempt: 581 — returns only when the watchdog has already
             // tripped (process RSS over the computed ceiling), which the unit
             // fixtures do not reach; the `Some(w)`/`is_tripped` checks are
             // exercised on the non-tripped path.
@@ -615,10 +617,16 @@ fn consume_ordered(
             // Hand the fully-enriched block to the sink thread. A send error
             // means the sink already failed; surface its error, not a generic
             // "channel closed".
-            // coverage-exempt: 622-625 — only runs when the sink thread has
+            // coverage-exempt: 630-633 — only runs when the sink thread has
             // already died (a Parquet write error mid-run), which the fixtures
             // do not provoke; the normal send is covered.
-            if sink_tx.send(SinkMsg::Block { block, spends: res.spends }).is_err() {
+            if sink_tx
+                .send(SinkMsg::Block {
+                    block,
+                    spends: res.spends,
+                })
+                .is_err()
+            {
                 let e = sink_handle
                     .join()
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
@@ -646,7 +654,7 @@ fn consume_ordered(
 
     if next < end {
         // Channel closed before we saw every height: that's an error.
-        // coverage-exempt: 655-656 — reached only when the producer's channel
+        // coverage-exempt: 663-664 — reached only when the producer's channel
         // closes before every height was delivered (a parse/worker abort). The
         // fixtures always complete the range and return via the `break
         // 'consume` exit, so this defensive tail is not exercised; it exists so
@@ -731,11 +739,21 @@ pub fn inspect_block(blocks_dir: &Path, height: u32) -> Result<()> {
     let block = parse_block_full(bytes, height, hash, &header)?;
 
     println!("block {} hash {}", height, hash);
-    println!("  txs={} size={} weight={}", block.block_row.tx_count, block.block_row.size, block.block_row.weight);
-    println!("  inputs={} outputs={}", block.inputs.len(), block.outputs.len());
+    println!(
+        "  txs={} size={} weight={}",
+        block.block_row.tx_count, block.block_row.size, block.block_row.weight
+    );
+    println!(
+        "  inputs={} outputs={}",
+        block.inputs.len(),
+        block.outputs.len()
+    );
     for tx in block.txs.iter().take(3) {
         let txid = bidx_core::Hash32::from_bytes(tx.txid);
-        println!("  tx[{}] {} in={} out={} witness={}", tx.tx_index, txid, tx.input_count, tx.output_count, tx.has_witness);
+        println!(
+            "  tx[{}] {} in={} out={} witness={}",
+            tx.tx_index, txid, tx.input_count, tx.output_count, tx.has_witness
+        );
     }
     Ok(())
 }
@@ -788,8 +806,8 @@ mod tests {
             tx.push(1u8); // 1 output
             tx.extend_from_slice(&100u64.to_le_bytes()); // value
             tx.push(0u8); // spk len 0
-            // Non-zero locktime: `BlkFile::open` trims trailing zero padding,
-            // so a synthetic record ending in 0 would lose its final bytes.
+                          // Non-zero locktime: `BlkFile::open` trims trailing zero padding,
+                          // so a synthetic record ending in 0 would lose its final bytes.
             tx.extend_from_slice(&0x1122_3344u32.to_le_bytes()); // locktime
 
             let payload_len = (BLOCK_HEADER_LEN + 1 + tx.len()) as u32;
@@ -856,7 +874,7 @@ mod tests {
         tx.push(1u8); // 1 output
         tx.extend_from_slice(&value.to_le_bytes());
         tx.push(0u8); // spk len 0
-        // witness for the single input: 1 item, 2 bytes.
+                      // witness for the single input: 1 item, 2 bytes.
         tx.push(1u8);
         tx.push(2u8);
         tx.push(0xAA);
@@ -1021,11 +1039,25 @@ mod tests {
                 }
             }
         }
-        let has_part0 = walk.iter().filter(|n| n.contains("part-00000.parquet")).count();
-        let has_part1 = walk.iter().filter(|n| n.contains("part-00001.parquet")).count();
-        assert_eq!(has_part0, 5, "expected all 5 entites to have part-00000: {:?}", walk);
+        let has_part0 = walk
+            .iter()
+            .filter(|n| n.contains("part-00000.parquet"))
+            .count();
+        let has_part1 = walk
+            .iter()
+            .filter(|n| n.contains("part-00001.parquet"))
+            .count();
+        assert_eq!(
+            has_part0, 5,
+            "expected all 5 entites to have part-00000: {:?}",
+            walk
+        );
         // With blocks_per_part=2 the 3rd block (h=2) lands in part 1.
-        assert_eq!(has_part1, 5, "expected all 5 entities to have part-00001: {:?}", walk);
+        assert_eq!(
+            has_part1, 5,
+            "expected all 5 entities to have part-00001: {:?}",
+            walk
+        );
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&utxo);
@@ -1076,7 +1108,10 @@ mod tests {
         assert!(part.exists(), "witnesses part must exist: {:?}", part);
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let f = std::fs::File::open(&part).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut rows = 0usize;
         for batch in reader {
             let batch = batch.unwrap();
@@ -1503,7 +1538,10 @@ mod tests {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let part = out.join("blocks/part-00000.parquet");
         let f = std::fs::File::open(&part).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut heights = Vec::new();
         for b in reader {
             let b = b.unwrap();
@@ -1589,10 +1627,7 @@ mod tests {
         })
         .err()
         .expect("missing credentials must fail");
-        assert!(
-            format!("{:#}", e).contains("init RPC client"),
-            "got: {e:#}"
-        );
+        assert!(format!("{:#}", e).contains("init RPC client"), "got: {e:#}");
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&utxo);
@@ -1610,8 +1645,12 @@ mod tests {
             body: &serde_json::Value,
         ) -> Result<serde_json::Value, bidx_live::RpcError> {
             match body["method"].as_str().unwrap_or("") {
-                "getblockcount" => Ok(serde_json::json!({ "result": self.node_tip, "error": null })),
-                _ => Err(bidx_live::RpcError::BadResponse("getchaintips exploded".into())),
+                "getblockcount" => {
+                    Ok(serde_json::json!({ "result": self.node_tip, "error": null }))
+                }
+                _ => Err(bidx_live::RpcError::BadResponse(
+                    "getchaintips exploded".into(),
+                )),
             }
         }
     }
@@ -1690,7 +1729,10 @@ mod tests {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let part = out.join("blocks/part-00000.parquet");
         let f = std::fs::File::open(&part).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut heights = Vec::new();
         for b in reader {
             let b = b.unwrap();
@@ -1768,7 +1810,10 @@ mod tests {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let part = out.join("blocks/part-00000.parquet");
         let f = std::fs::File::open(&part).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut heights = Vec::new();
         for b in reader {
             let b = b.unwrap();
@@ -1783,7 +1828,11 @@ mod tests {
             }
         }
         heights.sort_unstable();
-        assert_eq!(heights, vec![0, 1, 2], "all heights indexed when no orphans");
+        assert_eq!(
+            heights,
+            vec![0, 1, 2],
+            "all heights indexed when no orphans"
+        );
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&utxo);
@@ -1823,20 +1872,35 @@ mod tests {
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let part = out.join("blocks/part-00000.parquet");
         let f = std::fs::File::open(&part).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut fees = std::collections::HashMap::new();
         for b in reader {
             let b = b.unwrap();
-            let heights = b.column_by_name("height").unwrap().as_any()
-                .downcast_ref::<arrow::array::UInt32Array>().unwrap();
-            let tf = b.column_by_name("total_fee").unwrap().as_any()
-                .downcast_ref::<arrow::array::UInt64Array>().unwrap();
+            let heights = b
+                .column_by_name("height")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .unwrap();
+            let tf = b
+                .column_by_name("total_fee")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
             for i in 0..heights.len() {
                 fees.insert(heights.value(i), tf.value(i));
             }
         }
         assert_eq!(fees.get(&0), Some(&0), "coinbase-only block has zero fee");
-        assert_eq!(fees.get(&1), Some(&40), "block 1 fee = 100 spent - 60 out; got {fees:?}");
+        assert_eq!(
+            fees.get(&1),
+            Some(&40),
+            "block 1 fee = 100 spent - 60 out; got {fees:?}"
+        );
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&utxo);

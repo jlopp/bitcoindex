@@ -234,7 +234,9 @@ impl LiveOutput {
             LiveOutput::Parquet(s) => s.retract_from(height),
             // ClickHouse rows are inserted as they are applied, so a
             // disconnected height must be removed explicitly.
-            LiveOutput::ClickHouse { loader, .. } => loader.retract_from(height).map_err(Into::into),
+            LiveOutput::ClickHouse { loader, .. } => {
+                loader.retract_from(height).map_err(Into::into)
+            }
         }
     }
 
@@ -340,13 +342,22 @@ mod tests {
         assert_eq!(sink.part, 0);
         // Still part-0 while height < LIVE_BLOCKS_PER_PART.
         sink.write_block(&synthetic_block(500), &[]).unwrap();
-        assert_eq!(sink.part, 0, "h=500 still part 0 (< {})", LIVE_BLOCKS_PER_PART);
+        assert_eq!(
+            sink.part, 0,
+            "h=500 still part 0 (< {})",
+            LIVE_BLOCKS_PER_PART
+        );
         // h = LIVE_BLOCKS_PER_PART rolls to part 1, flushing part 0 first.
-        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART), &[]).unwrap();
+        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART), &[])
+            .unwrap();
         assert_eq!(sink.part, 1);
-        assert!(dir.join("blocks/part-00000.parquet").exists(), "part 0 flushed on rotate");
+        assert!(
+            dir.join("blocks/part-00000.parquet").exists(),
+            "part 0 flushed on rotate"
+        );
         // h = 2 × LIVE_BLOCKS_PER_PART rolls to part 2.
-        sink.write_block(&synthetic_block(2 * LIVE_BLOCKS_PER_PART), &[]).unwrap();
+        sink.write_block(&synthetic_block(2 * LIVE_BLOCKS_PER_PART), &[])
+            .unwrap();
         assert_eq!(sink.part, 2);
         sink.finish().unwrap();
         // Walk entity dirs and count part files across them (files are named
@@ -359,7 +370,11 @@ mod tests {
         }
         assert_eq!(
             parts.iter().cloned().collect::<Vec<_>>(),
-            vec!["part-00000.parquet", "part-00001.parquet", "part-00002.parquet"]
+            vec![
+                "part-00000.parquet",
+                "part-00001.parquet",
+                "part-00002.parquet"
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -460,7 +475,10 @@ mod tests {
         // Read the payload back and confirm the bytes survived the roundtrip.
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let f = std::fs::File::open(&p).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut rows = 0usize;
         for batch in reader {
             let batch = batch.unwrap();
@@ -490,7 +508,10 @@ mod tests {
 
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let f = std::fs::File::open(dir.join("blocks/part-00000.parquet")).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut heights = Vec::new();
         for batch in reader {
             let batch = batch.unwrap();
@@ -515,7 +536,8 @@ mod tests {
         let dir = tmp("retract-closed");
         let mut sink = LiveSink::create(&dir, 0).unwrap();
         // Roll to part 1 (h=1000), so h < 1000 now lives in a closed part.
-        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART), &[]).unwrap();
+        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART), &[])
+            .unwrap();
         assert_eq!(sink.part, 1);
         sink.retract_from(42).unwrap();
         sink.finish().unwrap();
@@ -564,7 +586,8 @@ mod tests {
                     esac\nexit 0\n"
             .to_string();
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!("bidx-live-ch-{tag}-{}-tmp", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-live-ch-{tag}-{}-tmp", std::process::id()));
         std::fs::write(&tmp, body).unwrap();
         let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
@@ -742,7 +765,8 @@ pub fn run_live(cfg: LiveConfig) -> Result<()> {
 
     // Optional output: rolling Parquet parts and/or direct ClickHouse inserts.
     let mut output: Option<LiveOutput> = if cfg.ch_live {
-        let loader = ChLoader::new(cfg.ch.clone()).context("init ClickHouse client for live inserts")?;
+        let loader =
+            ChLoader::new(cfg.ch.clone()).context("init ClickHouse client for live inserts")?;
         let writer = LiveChWriter::open(&cfg.ch, loader.client_path(), cfg.capture_witness)
             .context("open ClickHouse live insert pipes")?;
         Some(LiveOutput::ClickHouse { writer, loader })
@@ -778,10 +802,7 @@ pub fn run_live(cfg: LiveConfig) -> Result<()> {
                         warn!(error = %e, "failed to write applied block");
                     }
                 }
-                if let Err(e) = recorder
-                    .on_block_applied(*height)
-                    .map(|_| ())
-                {
+                if let Err(e) = recorder.on_block_applied(*height).map(|_| ()) {
                     warn!(error = %e, "failed to record disk checkpoint");
                 }
             }

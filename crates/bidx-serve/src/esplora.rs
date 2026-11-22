@@ -59,12 +59,20 @@ pub struct Esplora<'a> {
 
 impl<'a> Esplora<'a> {
     pub fn new(store: &'a Store, cfg: &'a Config) -> Self {
-        Esplora { store, cfg, metrics: None }
+        Esplora {
+            store,
+            cfg,
+            metrics: None,
+        }
     }
 
     /// Like [`new`](Self::new) but records address-not-found events.
     pub fn with_metrics(store: &'a Store, cfg: &'a Config, metrics: &'a Metrics) -> Self {
-        Esplora { store, cfg, metrics: Some(metrics) }
+        Esplora {
+            store,
+            cfg,
+            metrics: Some(metrics),
+        }
     }
 
     fn note_address_not_found(&self) {
@@ -399,10 +407,7 @@ mod tests {
     #[test]
     fn tip_endpoints() {
         let (s, _) = store(
-            &[(
-                "max(height)",
-                r#"{"data":[{"height":840000}],"rows":1}"#,
-            )],
+            &[("max(height)", r#"{"data":[{"height":840000}],"rows":1}"#)],
             r#"{"data":[],"rows":0}"#,
         );
         let e = Esplora::new(&s, &cfg());
@@ -486,7 +491,10 @@ mod tests {
             wire(&hex64(0)),
             wire(&hex64(0))
         );
-        let (s, _) = store(&[("FROM bitcoin.blocks", &block)], r#"{"data":[],"rows":0}"#);
+        let (s, _) = store(
+            &[("FROM bitcoin.blocks", &block)],
+            r#"{"data":[],"rows":0}"#,
+        );
         let e = Esplora::new(&s, &cfg());
         assert_eq!(e.block_hash_at_height(7).body, json!(disp));
         // Missing.
@@ -770,7 +778,10 @@ mod tests {
     #[test]
     fn missing_block_and_tip_map_to_404() {
         // Tip present but the tip block row is missing.
-        let (s, _) = store(&[("max(height)", r#"{"data":[{"height":5}],"rows":1}"#)], r#"{"data":[],"rows":0}"#);
+        let (s, _) = store(
+            &[("max(height)", r#"{"data":[{"height":5}],"rows":1}"#)],
+            r#"{"data":[],"rows":0}"#,
+        );
         let e = Esplora::new(&s, cfg());
         assert_eq!(e.tip_hash().status, 404);
         // Empty index → tip_hash 404 too.
@@ -783,7 +794,10 @@ mod tests {
     fn malformed_hashes_from_store_map_to_500() {
         // A block row whose hash is not valid hex makes reverse_hex fail.
         let bad_block = r#"{"data":[{"height":1,"hash":"zz","prev_hash":"zz","merkle_root":"zz","time":1,"version":1,"bits":1,"nonce":1,"tx_count":0,"size":1,"weight":1}],"rows":1}"#;
-        let (s, _) = store(&[("FROM bitcoin.blocks", bad_block)], r#"{"data":[],"rows":0}"#);
+        let (s, _) = store(
+            &[("FROM bitcoin.blocks", bad_block)],
+            r#"{"data":[],"rows":0}"#,
+        );
         let e = Esplora::new(&s, cfg());
         assert_eq!(e.block(Some(1), None).status, 500);
         assert_eq!(e.block_hash_at_height(1).status, 500);
@@ -830,10 +844,16 @@ mod tests {
         // An address with no stats row bumps the counter...
         let r = e.address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa");
         assert_eq!(r.status, 200);
-        assert!(m.registry.render().contains("bidx_address_not_found_total 1\n"));
+        assert!(m
+            .registry
+            .render()
+            .contains("bidx_address_not_found_total 1\n"));
         // ...but an invalid address (400) does not.
         assert_eq!(e.address("not-an-address").status, 400);
-        assert!(m.registry.render().contains("bidx_address_not_found_total 1\n"));
+        assert!(m
+            .registry
+            .render()
+            .contains("bidx_address_not_found_total 1\n"));
     }
 
     #[test]

@@ -6,8 +6,8 @@
 //! size. Hashes are written as FixedSizeBinary(32) in wire order.
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Int32Builder, UInt8Builder,
-    UInt32Builder, UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Int32Builder, UInt32Builder,
+    UInt64Builder, UInt8Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -268,7 +268,12 @@ pub struct ParquetSink {
     witnesses: EntityTable,
 }
 
-fn create_writer(dir: &Path, entity: &str, part: u32, schema: SchemaRef) -> Result<ArrowWriter<File>, SinkError> {
+fn create_writer(
+    dir: &Path,
+    entity: &str,
+    part: u32,
+    schema: SchemaRef,
+) -> Result<ArrowWriter<File>, SinkError> {
     let pdir = dir.join(entity);
     std::fs::create_dir_all(&pdir)?;
     let file = File::create(pdir.join(format!("part-{part:05}.parquet")))?;
@@ -574,7 +579,15 @@ mod tests {
         // "buffered >= batch_size" flush path for every entity, including the
         // spend path. The remaining `finish()` branches see an empty buffer.
         let dir = tmp_dir("flush");
-        let mut sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 2, ..Default::default() }).unwrap();
+        let mut sink = ParquetSink::create(
+            &dir,
+            0,
+            SinkConfig {
+                batch_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         for h in 0..2u32 {
             sink.push_block(&block_row(h)).unwrap();
             sink.push_tx(&tx_row(h, 0)).unwrap();
@@ -632,7 +645,15 @@ mod tests {
         // batch_size larger than the row counts, so no push triggers a flush and
         // `finish()` must flush all five partial buffers.
         let dir = tmp_dir("partial");
-        let mut sink = ParquetSink::create(&dir, 7, SinkConfig { batch_size: 100, ..Default::default() }).unwrap();
+        let mut sink = ParquetSink::create(
+            &dir,
+            7,
+            SinkConfig {
+                batch_size: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         sink.push_block(&block_row(3)).unwrap();
         sink.push_tx(&tx_row(3, 0)).unwrap();
         sink.push_input(&input_row(3, 0)).unwrap();
@@ -654,7 +675,15 @@ mod tests {
         // with zero row groups (an empty file has no record batch to read, but
         // its metadata must be present).
         let dir = tmp_dir("empty");
-        let sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 100, ..Default::default() }).unwrap();
+        let sink = ParquetSink::create(
+            &dir,
+            0,
+            SinkConfig {
+                batch_size: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         sink.finish().unwrap();
         let path = dir.join("blocks/part-00000.parquet");
         assert!(path.exists(), "empty sink must still create the file");
@@ -673,7 +702,10 @@ mod tests {
         let res = std::panic::catch_unwind(move || {
             let _ = EntityTable::new(schema);
         });
-        assert!(res.is_err(), "expected a panic for an unsupported column type");
+        assert!(
+            res.is_err(),
+            "expected a panic for an unsupported column type"
+        );
     }
 
     #[test]
@@ -709,7 +741,10 @@ mod tests {
             assert!(!schema.fields().is_empty(), "{name} schema is empty");
             // Every hash column must be FixedSizeBinary(32), never a string.
             for f in schema.fields() {
-                if f.name().contains("hash") || f.name().contains("txid") || f.name() == "merkle_root" {
+                if f.name().contains("hash")
+                    || f.name().contains("txid")
+                    || f.name() == "merkle_root"
+                {
                     assert_eq!(
                         *f.data_type(),
                         DataType::FixedSizeBinary(32),
@@ -727,12 +762,22 @@ mod tests {
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
-            vec!["height", "tx_index", "input_index", "item_index", "item_len", "item_bytes"]
+            vec![
+                "height",
+                "tx_index",
+                "input_index",
+                "item_index",
+                "item_len",
+                "item_bytes"
+            ]
         );
         let item = s.field_with_name("item_bytes").unwrap();
         // The payload is raw stack bytes, not a fixed-size hash.
         assert_eq!(*item.data_type(), DataType::Binary);
-        assert_eq!(*s.field_with_name("item_len").unwrap().data_type(), DataType::UInt32);
+        assert_eq!(
+            *s.field_with_name("item_len").unwrap().data_type(),
+            DataType::UInt32
+        );
     }
 
     #[test]
@@ -765,7 +810,10 @@ mod tests {
         let mut sink = ParquetSink::create(
             &dir,
             3,
-            SinkConfig { batch_size: 1, capture_witness: true },
+            SinkConfig {
+                batch_size: 1,
+                capture_witness: true,
+            },
         )
         .unwrap();
         sink.push_witness(&WitnessRow {
@@ -824,7 +872,10 @@ mod tests {
         let sink = ParquetSink::create(
             &dir,
             0,
-            SinkConfig { batch_size: 10, capture_witness: true },
+            SinkConfig {
+                batch_size: 10,
+                capture_witness: true,
+            },
         )
         .unwrap();
         sink.finish().unwrap();

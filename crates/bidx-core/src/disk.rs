@@ -27,7 +27,10 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{BLOCK_MAGIC, BLOCK_MAGIC_REGTEST, BLOCK_MAGIC_SIGNET, BLOCK_MAGIC_TESTNET3, BLOCK_MAGIC_TESTNET4};
+use crate::{
+    BLOCK_MAGIC, BLOCK_MAGIC_REGTEST, BLOCK_MAGIC_SIGNET, BLOCK_MAGIC_TESTNET3,
+    BLOCK_MAGIC_TESTNET4,
+};
 
 /// Height bucket for checkpoint recording — every 100,000 blocks.
 pub const CHECKPOINT_HEIGHT_STEP: u32 = 100_000;
@@ -162,7 +165,9 @@ pub struct DiskCheckpoint {
 /// The file may contain checkpoints for multiple networks — only the section
 /// under `network <name>` matching `net` is returned.
 pub fn read_checkpoints(path: &Path, net: Network) -> Vec<DiskCheckpoint> {
-    let Ok(f) = fs::File::open(path) else { return Vec::new() };
+    let Ok(f) = fs::File::open(path) else {
+        return Vec::new();
+    };
     let r = std::io::BufReader::new(f);
     let mut out = Vec::new();
     let mut cur_net: Option<String> = None;
@@ -179,7 +184,10 @@ pub fn read_checkpoints(path: &Path, net: Network) -> Vec<DiskCheckpoint> {
         if parts.len() == 2 {
             if cur_net.as_deref() == Some(net.name()) {
                 if let (Ok(h), Ok(b)) = (parts[0].parse::<u32>(), parts[1].parse::<u64>()) {
-                    out.push(DiskCheckpoint { height: h, total_bytes: b });
+                    out.push(DiskCheckpoint {
+                        height: h,
+                        total_bytes: b,
+                    });
                 }
             }
         }
@@ -200,19 +208,24 @@ pub fn append_checkpoint(path: &Path, net: Network, cp: DiskCheckpoint) -> std::
     if existing.iter().any(|c| c.height == cp.height) {
         return Ok(());
     }
-    let has_section = existing.iter().next().is_some()
-        || fs::read_to_string(path)
-            .map(|s| s.lines().any(|l| l.trim() == format!("network {}", net.name())))
-            .unwrap_or(false);
+    let section = format!("network {}", net.name());
+    let has_section = !existing.is_empty()
+        || fs::read_to_string(path).is_ok_and(|s| s.lines().any(|l| l.trim() == section));
 
     let need_header = !path.exists();
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     if need_header {
         writeln!(f, "# bidx disk checkpoints v1")?;
-        writeln!(f, "# one 'network <name>' section per chain; lines are '<height> <total_bytes>'")?;
+        writeln!(
+            f,
+            "# one 'network <name>' section per chain; lines are '<height> <total_bytes>'"
+        )?;
     }
     if !has_section {
-        writeln!(f, "network {}", net.name())?;
+        writeln!(f, "{section}")?;
     }
     writeln!(f, "{} {}", cp.height, cp.total_bytes)?;
     Ok(())
@@ -287,17 +300,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("blk00000.dat"), &v).unwrap();
-        assert_eq!(Network::detect_from_blocks_dir(&tmp), Some(Network::Mainnet));
+        assert_eq!(
+            Network::detect_from_blocks_dir(&tmp),
+            Some(Network::Mainnet)
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn from_magic_covers_all_known_networks() {
         assert_eq!(Network::from_magic(BLOCK_MAGIC), Some(Network::Mainnet));
-        assert_eq!(Network::from_magic(BLOCK_MAGIC_TESTNET3), Some(Network::Testnet3));
-        assert_eq!(Network::from_magic(BLOCK_MAGIC_SIGNET), Some(Network::Signet));
-        assert_eq!(Network::from_magic(BLOCK_MAGIC_TESTNET4), Some(Network::Testnet4));
-        assert_eq!(Network::from_magic(BLOCK_MAGIC_REGTEST), Some(Network::Regtest));
+        assert_eq!(
+            Network::from_magic(BLOCK_MAGIC_TESTNET3),
+            Some(Network::Testnet3)
+        );
+        assert_eq!(
+            Network::from_magic(BLOCK_MAGIC_SIGNET),
+            Some(Network::Signet)
+        );
+        assert_eq!(
+            Network::from_magic(BLOCK_MAGIC_TESTNET4),
+            Some(Network::Testnet4)
+        );
+        assert_eq!(
+            Network::from_magic(BLOCK_MAGIC_REGTEST),
+            Some(Network::Regtest)
+        );
         assert_eq!(Network::from_magic(0xDEAD_BEEF), None);
     }
 
@@ -318,14 +346,60 @@ mod tests {
     fn checkpoints_roundtrip_and_growth() {
         let tmp = std::env::temp_dir().join(format!("bidx-disk-ckpt-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        append_checkpoint(&tmp, Network::Mainnet, DiskCheckpoint { height: 100_000, total_bytes: 1_000 }).unwrap();
-        append_checkpoint(&tmp, Network::Mainnet, DiskCheckpoint { height: 200_000, total_bytes: 2_000 }).unwrap();
-        append_checkpoint(&tmp, Network::Mainnet, DiskCheckpoint { height: 100_000, total_bytes: 1_000 }).unwrap();
+        append_checkpoint(
+            &tmp,
+            Network::Mainnet,
+            DiskCheckpoint {
+                height: 100_000,
+                total_bytes: 1_000,
+            },
+        )
+        .unwrap();
+        append_checkpoint(
+            &tmp,
+            Network::Mainnet,
+            DiskCheckpoint {
+                height: 200_000,
+                total_bytes: 2_000,
+            },
+        )
+        .unwrap();
+        append_checkpoint(
+            &tmp,
+            Network::Mainnet,
+            DiskCheckpoint {
+                height: 100_000,
+                total_bytes: 1_000,
+            },
+        )
+        .unwrap();
         let v = read_checkpoints(&tmp, Network::Mainnet);
         assert_eq!(v.len(), 2, "duplicate height not re-recorded");
         // Slope between the two points: 1000 bytes / 100_000 blocks = 0.01 B/blk.
         let proj = projected_total_bytes(&v, 300_000);
         assert_eq!(proj, 3_000);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn append_reuses_an_empty_section_and_adds_one_for_a_new_network() {
+        let tmp = std::env::temp_dir().join(format!("bidx-disk-sect-{}", std::process::id()));
+        std::fs::write(&tmp, "# header\nnetwork testnet4\n").unwrap();
+        let cp = |height| DiskCheckpoint {
+            height,
+            total_bytes: 7,
+        };
+        // Section exists but holds no checkpoints: must not be written twice.
+        append_checkpoint(&tmp, Network::Testnet4, cp(10)).unwrap();
+        // File exists without a signet section: one is appended.
+        append_checkpoint(&tmp, Network::Signet, cp(20)).unwrap();
+        let body = std::fs::read_to_string(&tmp).unwrap();
+        assert_eq!(
+            body,
+            "# header\nnetwork testnet4\n10 7\nnetwork signet\n20 7\n"
+        );
+        assert_eq!(read_checkpoints(&tmp, Network::Testnet4), vec![cp(10)]);
+        assert_eq!(read_checkpoints(&tmp, Network::Signet), vec![cp(20)]);
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -342,13 +416,16 @@ mod tests {
         ] {
             assert_eq!(net.name(), want);
             // And the name maps back to the same magic-derived network.
-            assert_eq!(Network::from_magic(match net {
-                Network::Mainnet => BLOCK_MAGIC,
-                Network::Testnet3 => BLOCK_MAGIC_TESTNET3,
-                Network::Testnet4 => BLOCK_MAGIC_TESTNET4,
-                Network::Signet => BLOCK_MAGIC_SIGNET,
-                Network::Regtest => BLOCK_MAGIC_REGTEST,
-            }), Some(net));
+            assert_eq!(
+                Network::from_magic(match net {
+                    Network::Mainnet => BLOCK_MAGIC,
+                    Network::Testnet3 => BLOCK_MAGIC_TESTNET3,
+                    Network::Testnet4 => BLOCK_MAGIC_TESTNET4,
+                    Network::Signet => BLOCK_MAGIC_SIGNET,
+                    Network::Regtest => BLOCK_MAGIC_REGTEST,
+                }),
+                Some(net)
+            );
         }
     }
 
@@ -366,7 +443,10 @@ mod tests {
         assert_eq!(Network::detect_from_blocks_dir(&tmp), None);
         // Adding a real blk file makes detection succeed despite the decoy.
         std::fs::write(tmp.join("blk00000.dat"), &v).unwrap();
-        assert_eq!(Network::detect_from_blocks_dir(&tmp), Some(Network::Mainnet));
+        assert_eq!(
+            Network::detect_from_blocks_dir(&tmp),
+            Some(Network::Mainnet)
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -416,17 +496,29 @@ mod tests {
         // so the projection at a target height scales linearly from zero.
         // Regression guard: the slope must be bytes/height, NOT the raw byte
         // count, or the disk guard refuses to start on any disk.
-        let one = [DiskCheckpoint { height: 100_000, total_bytes: 4_242 }];
+        let one = [DiskCheckpoint {
+            height: 100_000,
+            total_bytes: 4_242,
+        }];
         assert_eq!(projected_total_bytes(&one, 200_000), 8_484);
         assert_eq!(projected_total_bytes(&one, 0), 0);
         // A single checkpoint at height 0 has no derivable slope: project flat.
-        let at_zero = [DiskCheckpoint { height: 0, total_bytes: 4_242 }];
+        let at_zero = [DiskCheckpoint {
+            height: 0,
+            total_bytes: 4_242,
+        }];
         assert_eq!(projected_total_bytes(&at_zero, 999_999), 4_242);
         // Two points at the same height make the regression denominator zero;
         // it must fall back to the mean instead of dividing by zero.
         let flat = [
-            DiskCheckpoint { height: 50_000, total_bytes: 100 },
-            DiskCheckpoint { height: 50_000, total_bytes: 300 },
+            DiskCheckpoint {
+                height: 50_000,
+                total_bytes: 100,
+            },
+            DiskCheckpoint {
+                height: 50_000,
+                total_bytes: 300,
+            },
         ];
         assert_eq!(projected_total_bytes(&flat, 50_000), 200);
     }

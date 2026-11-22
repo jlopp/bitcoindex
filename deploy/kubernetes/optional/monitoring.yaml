@@ -1,0 +1,60 @@
+# Prometheus Operator wiring: scrape every serve pod and alert on the
+# signals that matter for a query fleet.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bidx-serve
+  namespace: bitcoindex
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bidx-serve
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bidx-serve
+  namespace: bitcoindex
+spec:
+  groups:
+    - name: bitcoindex
+      rules:
+        - alert: BidxIndexLagging
+          # Requires [node] rpc_url in the serve config.
+          expr: max(bidx_indexer_lag_blocks) > 3
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: Index is {{ $value }} blocks behind the node tip
+        - alert: BidxHighErrorRate
+          expr: |
+            sum(rate(bidx_responses_by_status_total{status="5xx"}[5m]))
+              / sum(rate(bidx_queries_total[5m])) > 0.01
+          for: 10m
+          labels: { severity: critical }
+          annotations:
+            summary: More than 1% of bitcoindex requests are failing
+        - alert: BidxLatencyP99High
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(bidx_request_duration_seconds_bucket[5m]))) > 0.5
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: bitcoindex p99 latency is {{ $value }}s
+        - alert: BidxShedding
+          expr: sum(rate(bidx_shed_total[5m])) > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: Serve pods are refusing connections (worker queue full) — scale out or raise [server] workers
+        - alert: BidxNoReadyReplicas
+          expr: kube_deployment_status_replicas_available{namespace="bitcoindex",deployment="bidx-serve"} == 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: No bidx-serve replica is ready

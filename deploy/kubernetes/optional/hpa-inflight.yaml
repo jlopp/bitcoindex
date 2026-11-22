@@ -1,0 +1,38 @@
+# Scale on concurrency as well as CPU. When ClickHouse is the bottleneck,
+# requests pile up waiting on queries (high bidx_inflight_requests) while
+# CPU stays low, so a CPU-only HPA would not react.
+#
+# Requires prometheus-adapter exposing the per-pod metric, e.g.:
+#
+#   rules:
+#     - seriesQuery: 'bidx_inflight_requests{namespace!="",pod!=""}'
+#       resources: { overrides: { namespace: {resource: namespace}, pod: {resource: pod} } }
+#       name: { as: bidx_inflight_requests }
+#       metricsQuery: 'avg_over_time(<<.Series>>{<<.LabelMatchers>>}[1m])'
+#
+# Apply instead of serve-hpa.yaml (a Deployment should have one HPA).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: bidx-serve
+  namespace: bitcoindex
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: bidx-serve
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 65 }
+    - type: Pods
+      pods:
+        metric: { name: bidx_inflight_requests }
+        # Well under [server] workers (256), so we scale before shedding.
+        target: { type: AverageValue, averageValue: "64" }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300

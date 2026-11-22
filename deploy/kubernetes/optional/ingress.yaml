@@ -1,0 +1,36 @@
+# Example public entrypoint (ingress-nginx + cert-manager). Only the API port
+# is exposed; /metrics stays cluster-internal on the `metrics` port.
+#
+# Put a CDN in front of this for read-heavy public traffic: responses carry
+# `Cache-Control: public, max-age=...` (immutable for blocks/txs buried
+# `cache.confirmations` deep, ~1s for tip routes). When `auth.required` is on
+# they become `private`, so a CDN never serves one tenant's response to an
+# anonymous caller.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bidx-serve
+  namespace: bitcoindex
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    nginx.ingress.kubernetes.io/proxy-body-size: 1m
+    # Keep upstream connections alive (bidx serve supports HTTP/1.1 keep-alive).
+    nginx.ingress.kubernetes.io/upstream-keepalive-connections: "64"
+    # The serving API rate-limits per client IP and per API key itself; set
+    # [server] trust_forwarded_for = true so it sees the real client IP.
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.example.com]
+      secretName: bidx-api-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: bidx-serve
+                port:
+                  name: http

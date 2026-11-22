@@ -389,7 +389,11 @@ mod tests {
         assert!(xor_decode(&[], &key).is_empty());
         // Length not divisible by 8 exercises the remainder path.
         let tiny = vec![0xAAu8; 5];
-        let xored: Vec<u8> = tiny.iter().enumerate().map(|(i, b)| b ^ key[i % 8]).collect();
+        let xored: Vec<u8> = tiny
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 8])
+            .collect();
         let back = xor_decode(&xored, &key);
         assert_eq!(back, tiny);
     }
@@ -537,11 +541,8 @@ mod tests {
     /// valid records (the genesis block header, then a trailing zero region).
     /// Returns the tmp path + blk id so callers can clean up.
     fn make_blk_dir(records: usize, file_id: u32) -> (PathBuf, PathBuf) {
-        let tmp = std::env::temp_dir().join(format!(
-            "bidx-blk-test-{}-{}",
-            std::process::id(),
-            file_id
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-blk-test-{}-{}", std::process::id(), file_id));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let path = tmp.join(format!("blk{:05}.dat", file_id));
@@ -591,17 +592,27 @@ mod tests {
             .records()
             .map(|r| {
                 let r = r.unwrap();
-                RecCheck { loc: r.location, header: r.header, hash: r.hash }
+                RecCheck {
+                    loc: r.location,
+                    header: r.header,
+                    hash: r.hash,
+                }
             })
             .collect();
-        assert_eq!(records.len(), 3, "iterator should yield 3 blocks then stop at padding");
+        assert_eq!(
+            records.len(),
+            3,
+            "iterator should yield 3 blocks then stop at padding"
+        );
         for (i, r) in records.iter().enumerate() {
             assert_eq!(r.loc.file_id, 0);
             assert_eq!(r.loc.offset, (i * 88) as u64);
             assert_eq!(r.loc.record_len, 88);
             assert_eq!(r.header.version, 1);
             let mut want = [0u8; 32];
-            for j in 0..32 { want[j] = (i * 32 + j) as u8; }
+            for j in 0..32 {
+                want[j] = (i * 32 + j) as u8;
+            }
             assert_eq!(r.header.merkle_root.0, want);
             // Hash = dsha256(header_raw); just assert non-zero and reproducible.
             assert_ne!(r.hash, bidx_core::Hash32::ZERO);
@@ -618,7 +629,7 @@ mod tests {
         let bytes = bf.block_bytes(&blk1.location).unwrap();
         assert_eq!(bytes.len(), 80);
         assert_eq!(&bytes[..4], &[1, 0, 0, 0]); // version
-        // Downrranging
+                                                // Downrranging
         let mut bad = blk1.location;
         bad.record_len = u32::MAX;
         let e = bf.block_bytes(&bad);
@@ -677,7 +688,10 @@ mod tests {
         assert_eq!(ids, vec![0, 7, 10]);
         let empty = std::env::temp_dir().join(format!("bidx-blk-empty-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(matches!(discover_blk_files(&empty), Err(BlkError::NoFiles(_))));
+        assert!(matches!(
+            discover_blk_files(&empty),
+            Err(BlkError::NoFiles(_))
+        ));
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_dir_all(&empty);
     }
@@ -693,8 +707,11 @@ mod tests {
             C::BLOCK_MAGIC_SIGNET,
             C::BLOCK_MAGIC_REGTEST,
         ] {
-            let tmp = std::env::temp_dir()
-                .join(format!("bidx-blk-magic-{}-{:08x}", std::process::id(), magic));
+            let tmp = std::env::temp_dir().join(format!(
+                "bidx-blk-magic-{}-{:08x}",
+                std::process::id(),
+                magic
+            ));
             let _ = fs::remove_dir_all(&tmp);
             std::fs::create_dir_all(&tmp).unwrap();
             let path = tmp.join("blk00000.dat");

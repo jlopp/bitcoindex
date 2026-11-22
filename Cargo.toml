@@ -30,7 +30,7 @@ memmap2 = "0.9"
 rocksdb = "0.22"
 arrow = { version = "53", features = ["prettyprint"] }
 parquet = { version = "53", features = ["arrow", "zstd"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }

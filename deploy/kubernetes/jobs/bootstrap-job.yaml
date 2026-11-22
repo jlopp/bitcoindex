@@ -1,0 +1,71 @@
+# One-off bootstrap: create the schema and upload the Parquet produced by the
+# initial `bidx parse` into ClickHouse. Applied by hand, not by kustomize:
+#
+#   kubectl -n bitcoindex apply -f deploy/kubernetes/jobs/bootstrap-job.yaml
+#   kubectl -n bitcoindex logs -f job/bidx-bootstrap
+#
+# `--upload` streams each Parquet file over the client connection, so it works
+# against any ClickHouse — including managed services that cannot read the
+# loader's filesystem. The `parquet` PVC must contain the `bidx parse --out`
+# tree (blocks/, transactions/, outputs/, ...). One way to get it there: run
+# `bidx parse` on a machine with the node's blocks dir, then copy the tree to
+# object storage and into this PVC (or mount a CSI object-store volume here).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bidx-bootstrap
+  namespace: bitcoindex
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: init-db
+          image: ghcr.io/jameson/bitcoindex:edge
+          args: ["init-db"]
+          envFrom:
+            - configMapRef: { name: bidx-ingest-env }
+          env: &creds
+            - name: BIDX_CLICKHOUSE__USER
+              valueFrom:
+                secretKeyRef: { name: bidx-secrets, key: INGEST_CLICKHOUSE_USER }
+            - name: BIDX_CLICKHOUSE__PASSWORD
+              valueFrom:
+                secretKeyRef: { name: bidx-secrets, key: INGEST_CLICKHOUSE_PASSWORD }
+            # Managed ClickHouse: native TLS on 9440.
+            # - { name: BIDX_CLICKHOUSE__SECURE, value: "true" }
+            # - { name: BIDX_CLICKHOUSE__PORT, value: "9440" }
+          securityContext: &sc
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts: &mounts
+            - { name: home, mountPath: /home/bidx }
+      containers:
+        - name: load
+          image: ghcr.io/jameson/bitcoindex:edge
+          args: ["load", "--upload", "--input", "/data/out"]
+          envFrom:
+            - configMapRef: { name: bidx-ingest-env }
+          env: *creds
+          securityContext: *sc
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+          volumeMounts:
+            - { name: home, mountPath: /home/bidx }
+            - { name: parquet, mountPath: /data/out, readOnly: true }
+      volumes:
+        - name: home
+          emptyDir: {}
+        - name: parquet
+          persistentVolumeClaim:
+            claimName: bidx-parquet

@@ -14,6 +14,7 @@ pub struct Health {
     has_tip: AtomicBool,
     indexed_height: AtomicU32,
     node_height: AtomicU32,
+    draining: AtomicBool,
 }
 
 impl Health {
@@ -50,9 +51,22 @@ impl Health {
         true
     }
 
-    /// Readiness: ClickHouse reachable *and* the index has a tip.
+    /// Mark the process as shutting down: readiness flips to false so load
+    /// balancers stop routing new traffic while in-flight work finishes.
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::Relaxed);
+    }
+
+    pub fn draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
+    /// Readiness: ClickHouse reachable, the index has a tip, and we are not
+    /// draining.
     pub fn ready(&self) -> bool {
-        self.ch_ok.load(Ordering::Relaxed) && self.has_tip.load(Ordering::Relaxed)
+        self.ch_ok.load(Ordering::Relaxed)
+            && self.has_tip.load(Ordering::Relaxed)
+            && !self.draining()
     }
 
     pub fn indexed_height(&self) -> u32 {
@@ -75,12 +89,13 @@ impl Health {
     pub fn ready_json(&self) -> String {
         let ready = self.ready();
         format!(
-            "{{\"ready\":{ready},\"checks\":{{\"clickhouse\":{},\"index_has_tip\":{},\"indexed_height\":{},\"node_height\":{},\"lag_blocks\":{}}}}}",
+            "{{\"ready\":{ready},\"checks\":{{\"clickhouse\":{},\"index_has_tip\":{},\"indexed_height\":{},\"node_height\":{},\"lag_blocks\":{},\"draining\":{}}}}}",
             self.ch_ok.load(Ordering::Relaxed),
             self.has_tip.load(Ordering::Relaxed),
             self.indexed_height(),
             self.node_height(),
             self.lag(),
+            self.draining(),
         )
     }
 }
@@ -128,6 +143,21 @@ mod tests {
         // Indexed ahead of node (or node unknown) → 0, never underflow.
         h.set_node_height(50);
         assert_eq!(h.lag(), 0);
+    }
+
+    #[test]
+    fn draining_overrides_readiness_and_is_reported() {
+        let h = Health::new();
+        h.set_clickhouse_ok(true);
+        h.set_indexed_height(Some(1));
+        assert!(h.ready() && !h.draining());
+        h.set_draining(true);
+        assert!(!h.ready() && h.draining());
+        let v: serde_json::Value = serde_json::from_str(&h.ready_json()).unwrap();
+        assert_eq!(v["ready"], false);
+        assert_eq!(v["checks"]["draining"], true);
+        h.set_draining(false);
+        assert!(h.ready());
     }
 
     #[test]

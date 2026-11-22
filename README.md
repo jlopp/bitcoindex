@@ -90,6 +90,7 @@ Full documentation lives in [`doc/`](doc/). Start with
 | [doc/cli.md](doc/cli.md) | Every `bidx` subcommand and flag, with typical workflows. |
 | [doc/architecture.md](doc/architecture.md) | How the pipeline works end to end, stage by stage. |
 | [doc/serving-api.md](doc/serving-api.md) | The Esplora REST, Electrum JSON-RPC, and ops surfaces. |
+| [doc/cloud-deployment.md](doc/cloud-deployment.md) | Kubernetes quickstart, signed images, scaling the query tier, API keys, caching, load testing. |
 | [doc/deployment-ops.md](doc/deployment-ops.md) | Building, deploying, and operating the stack. |
 | [doc/data-model-rationale.md](doc/data-model-rationale.md) | Why the schema is shaped the way it is. |
 | [doc/contributing.md](doc/contributing.md) | Dev setup, tests, coverage, and the PR flow. |

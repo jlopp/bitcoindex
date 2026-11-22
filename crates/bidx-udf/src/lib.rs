@@ -149,7 +149,10 @@ mod tests {
     /// hash160 of the genesis coinbase output, as 64-char hex (right-padded to
     /// 32 bytes, matching the stored `address_hash` layout).
     fn genesis_hash_hex() -> String {
-        format!("{}", "62e907b15cbf27d5425399ebf6f0fb50ebb88f18".to_string() + &"0".repeat(24))
+        format!(
+            "{}",
+            "62e907b15cbf27d5425399ebf6f0fb50ebb88f18".to_string() + &"0".repeat(24)
+        )
     }
 
     fn run_str(mode: Mode, network: Network, input: &str) -> String {
@@ -185,7 +188,12 @@ mod tests {
         // OP_RETURN (7) has no address form; a short hash is unrenderable; a
         // non-numeric type is unrenderable. All three produce an empty line,
         // and a blank input line is skipped entirely.
-        let input = format!("7\t{}\nabcd\nxx\t{}\n\n2\t{}\n", genesis_hash_hex(), genesis_hash_hex(), genesis_hash_hex());
+        let input = format!(
+            "7\t{}\nabcd\nxx\t{}\n\n2\t{}\n",
+            genesis_hash_hex(),
+            genesis_hash_hex(),
+            genesis_hash_hex()
+        );
         let out = run_str(Mode::Address, Network::Mainnet, &input);
         assert_eq!(
             out,
@@ -203,14 +211,25 @@ mod tests {
 
     #[test]
     fn parse_mode_roundtrips_a_base58_address() {
-        let out = run_str(Mode::Parse, Network::Mainnet, "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa\n");
+        let out = run_str(
+            Mode::Parse,
+            Network::Mainnet,
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa\n",
+        );
         assert_eq!(out, format!("2\t{}\n", genesis_hash_hex()));
     }
 
     #[test]
     fn parse_mode_roundtrips_a_bech32_address() {
-        let out = run_str(Mode::Parse, Network::Mainnet, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\n");
-        let want = format!("4\t{}\n", "751e76e8199196d454941c45d1b3a323f1433bd6".to_string() + &"0".repeat(24));
+        let out = run_str(
+            Mode::Parse,
+            Network::Mainnet,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\n",
+        );
+        let want = format!(
+            "4\t{}\n",
+            "751e76e8199196d454941c45d1b3a323f1433bd6".to_string() + &"0".repeat(24)
+        );
         assert_eq!(out, want);
     }
 
@@ -227,11 +246,26 @@ mod tests {
     fn render_and_parse_roundtrip_through_the_udf() {
         // address -> parse -> address must be stable for every renderable type.
         for (ty, hash) in [
-            (2u8, "62e907b15cbf27d5425399ebf6f0fb50ebb88f18".to_string() + &"0".repeat(24)),
-            (3u8, "4a5e1e4baab89f3a32518a88c31bc87f618f7667".to_string() + &"0".repeat(24)),
-            (4u8, "751e76e8199196d454941c45d1b3a323f1433bd6".to_string() + &"0".repeat(24)),
-            (5u8, "1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262".to_string()),
-            (6u8, "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string()),
+            (
+                2u8,
+                "62e907b15cbf27d5425399ebf6f0fb50ebb88f18".to_string() + &"0".repeat(24),
+            ),
+            (
+                3u8,
+                "4a5e1e4baab89f3a32518a88c31bc87f618f7667".to_string() + &"0".repeat(24),
+            ),
+            (
+                4u8,
+                "751e76e8199196d454941c45d1b3a323f1433bd6".to_string() + &"0".repeat(24),
+            ),
+            (
+                5u8,
+                "1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262".to_string(),
+            ),
+            (
+                6u8,
+                "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
+            ),
         ] {
             let addr = render_pair(Network::Mainnet, ty, &hash).expect("renderable");
             let (back_ty, back_hash) = parse_addr(Network::Mainnet, &addr).expect("parses back");

@@ -21,7 +21,13 @@ electrum_enabled = true
 log = "info"
 
 [clickhouse]
+# One host, or a comma-separated replica list for `bidx serve`, which rotates
+# across them and fails over on connection errors ("ch-0:8123, ch-1:8123").
+# The writer commands (init-db/load/live) use only a single host.
 host = "clickhouse"
+# "https" for managed ClickHouse (ClickHouse Cloud etc.; typically
+# http_port = 8443). The native-protocol commands take --secure / port 9440.
+scheme = "http"
 # Native protocol port — used by `bidx init-db` / `bidx load`.
 port = 9000
 # HTTP interface port — used by `bidx serve`. ClickHouse serves HTTP on a
@@ -31,6 +37,55 @@ user = "default"
 # password = "..."           # prefer BIDX_CLICKHOUSE__PASSWORD in prod
 database = "bitcoin"
 timeout_secs = 30
+
+[server]
+# Fixed worker threads; each handles one connection at a time.
+workers = 256
+# Accepted connections waiting for a worker. Beyond this, new connections get
+# an immediate 503 + Retry-After (counted in bidx_shed_total).
+queue = 1024
+# HTTP/1.1 keep-alive idle timeout; 0 disables keep-alive.
+keep_alive_secs = 5
+# Close a connection after this many requests so L4 load balancers rebalance.
+max_requests_per_conn = 1000
+# On SIGTERM: report not-ready for this long (LB deregistration), then stop
+# accepting and wait up to shutdown_timeout_secs for in-flight requests.
+drain_delay_secs = 5
+shutdown_timeout_secs = 25
+# Behind a proxy/LB that sets X-Forwarded-For, use it as the client IP for
+# per-IP rate limiting. Leave false when clients connect directly.
+trust_forwarded_for = false
+
+[cache]
+# In-process response cache in front of ClickHouse (keyed by path+query).
+enabled = true
+max_entries = 100000
+# Tip routes (/blocks/tip/*) and anything not yet buried `confirmations` deep.
+tip_ttl_ms = 1000
+# Address / scripthash / outspend routes.
+address_ttl_ms = 2000
+# Blocks and txs at least `confirmations` deep: also sent to clients/CDNs as
+# Cache-Control: public, max-age=<immutable_ttl_secs>.
+immutable_ttl_secs = 300
+confirmations = 6
+
+[auth]
+# When true, every API request (not /metrics, /healthz, /readyz) needs a key:
+# `Authorization: Bearer <token>` or `X-API-Key: <token>`. When false, keys
+# are still honored for per-tenant quotas and metrics.
+required = false
+# Prefer BIDX_AUTH__KEYS="name:token:rps:burst,..." from a secret store, or
+# token_sha256 (hex SHA-256 of the token) so no plaintext lives here.
+# [[auth.keys]]
+# name = "acme"
+# token_sha256 = "<64 hex chars>"
+# rate_per_sec = 200.0     # 0 = unlimited
+# burst = 400.0
+
+[rate_limit]
+# Per-client-IP token bucket for anonymous traffic; 0 disables.
+per_ip_rps = 0.0
+per_ip_burst = 0.0
 
 # Optional: Bitcoin Core RPC. Used for the readiness lag metric and by
 # `bidx verify`'s node-agreement check. Omit if the node is not reachable from

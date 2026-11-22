@@ -35,14 +35,7 @@ impl Pipe {
         table: &'static str,
         cols: &str,
     ) -> Result<Self, LoadError> {
-        let mut args = vec![
-            format!("--host={}", cfg.host),
-            format!("--port={}", cfg.port),
-            format!("--user={}", cfg.user),
-        ];
-        if let Some(p) = &cfg.password {
-            args.push(format!("--password={p}"));
-        }
+        let mut args = cfg.client_args();
         args.push(format!(
             "--query=INSERT INTO {db}.{table} ({cols}) FORMAT RowBinary",
             db = cfg.database,
@@ -54,7 +47,7 @@ impl Pipe {
             .stderr(Stdio::piped())
             .spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| {
-            // coverage-exempt: 61 — unreachable: the child is spawned with
+            // coverage-exempt: 54 — unreachable: the child is spawned with
             // `Stdio::piped()` for stdin, so `take()` always yields `Some`.
             // Kept as a defensive `ok_or_else` rather than `.unwrap()` (no
             // panics in production paths).
@@ -74,9 +67,9 @@ impl Pipe {
         if self.buf.is_empty() {
             return Ok(());
         }
-        self.stdin.write_all(&self.buf).map_err(|e| {
-            LoadError::Client(format!("write to {} failed: {e}", self.table))
-        })?;
+        self.stdin
+            .write_all(&self.buf)
+            .map_err(|e| LoadError::Client(format!("write to {} failed: {e}", self.table)))?;
         self.buf.clear();
         Ok(())
     }
@@ -212,10 +205,8 @@ mod tests {
                 .to_string()
         };
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!(
-            "bidx-live-ch-{tag}-{}-tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-live-ch-{tag}-{}-tmp", std::process::id()));
         std::fs::write(&tmp, body).unwrap();
         let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
@@ -331,15 +322,34 @@ mod tests {
 
         // Each table received exactly one encoded row.
         assert_eq!(read_out(&client, "blocks").len(), 144);
-        assert_eq!(read_out(&client, "transactions").len(), 4 + 4 + 32 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + 1);
-        assert_eq!(read_out(&client, "inputs").len(), 4 + 4 + 4 + 32 + 32 + 4 + 4 + 4 + 4 + 4 + 1);
-        assert_eq!(read_out(&client, "outputs").len(), 4 + 4 + 4 + 32 + 8 + 4 + 1 + 32);
-        assert_eq!(read_out(&client, "spends").len(), 4 + 4 + 4 + 32 + 32 + 4 + 8 + 1 + 32 + 4);
+        assert_eq!(
+            read_out(&client, "transactions").len(),
+            4 + 4 + 32 + 4 + 4 + 4 + 4 + 8 + 4 + 4 + 1
+        );
+        assert_eq!(
+            read_out(&client, "inputs").len(),
+            4 + 4 + 4 + 32 + 32 + 4 + 4 + 4 + 4 + 4 + 1
+        );
+        assert_eq!(
+            read_out(&client, "outputs").len(),
+            4 + 4 + 4 + 32 + 8 + 4 + 1 + 32
+        );
+        assert_eq!(
+            read_out(&client, "spends").len(),
+            4 + 4 + 4 + 32 + 32 + 4 + 8 + 1 + 32 + 4
+        );
         // No witnesses file was produced.
         let wit = PathBuf::from(format!("{}.witnesses.out", client.display()));
         assert!(!wit.exists());
 
-        for t in ["blocks", "transactions", "inputs", "outputs", "spends", "witnesses"] {
+        for t in [
+            "blocks",
+            "transactions",
+            "inputs",
+            "outputs",
+            "spends",
+            "witnesses",
+        ] {
             let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
         }
         let _ = std::fs::remove_file(&client);
@@ -361,9 +371,20 @@ mod tests {
         w.flush().unwrap();
         w.finish().unwrap();
         let bytes = read_out(&client, "witnesses");
-        assert_eq!(bytes.len(), 20 + 1 + 2, "five u32s + a 1-byte length + payload");
+        assert_eq!(
+            bytes.len(),
+            20 + 1 + 2,
+            "five u32s + a 1-byte length + payload"
+        );
         assert_eq!(&bytes[20..23], &[0x02, 0xDE, 0xAD]);
-        for t in ["blocks", "transactions", "inputs", "outputs", "spends", "witnesses"] {
+        for t in [
+            "blocks",
+            "transactions",
+            "inputs",
+            "outputs",
+            "spends",
+            "witnesses",
+        ] {
             let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
         }
         let _ = std::fs::remove_file(&client);
@@ -379,7 +400,14 @@ mod tests {
         // Empty buffers mean no bytes written; the fake client still creates
         // the (empty) output files on EOF.
         assert!(read_out(&client, "blocks").is_empty());
-        for t in ["blocks", "transactions", "inputs", "outputs", "spends", "witnesses"] {
+        for t in [
+            "blocks",
+            "transactions",
+            "inputs",
+            "outputs",
+            "spends",
+            "witnesses",
+        ] {
             let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
         }
         let _ = std::fs::remove_file(&client);
@@ -404,15 +432,14 @@ mod tests {
     /// to `<script>.args`, so a test can assert the connection flags the writer
     /// passes. It also drains stdin so the parent's writes never block.
     fn fake_client_recording_args(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("bidx-live-chargs-{tag}-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("bidx-live-chargs-{tag}-{}", std::process::id()));
         let body = "#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done >> \"$0.args\"\n\
                     cat >/dev/null\nexit 0\n"
             .to_string();
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!(
-            "bidx-live-chargs-{tag}-{}-tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-live-chargs-{tag}-{}-tmp", std::process::id()));
         std::fs::write(&tmp, body).unwrap();
         let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
@@ -432,6 +459,7 @@ mod tests {
             user: "reader".into(),
             password: Some("s3cr3t".into()),
             database: "btc".into(),
+            secure: true,
         };
         let w = LiveChWriter::open(&cfg, client.clone(), false).unwrap();
         // Close the pipes so every child has recorded its argv.
@@ -442,6 +470,8 @@ mod tests {
         assert!(args.contains("--user=reader"), "got {args}");
         // The password branch only pushes the flag when `password` is `Some`.
         assert!(args.contains("--password=s3cr3t"), "got {args}");
+        // Live pipes share `client_args`, so TLS reaches them too.
+        assert!(args.contains("--secure"), "got {args}");
         let _ = std::fs::remove_file(format!("{}.args", client.display()));
         let _ = std::fs::remove_file(&client);
     }

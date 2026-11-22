@@ -1,29 +1,23 @@
 //! The serving HTTP surface: routing, JSON-RPC dispatch, metrics and health.
 //!
-//! Deliberately dependency-free (std `TcpListener` only). Requests are parsed
-//! into a [`Request`], routed by [`Service::handle`] to the Esplora REST
-//! handlers, the Electrum JSON-RPC dispatcher, or the ops endpoints, and the
-//! result rendered as an [`HttpResponse`]. `handle` is pure with respect to
-//! I/O so it is unit-testable; [`serve_listener`] adds the socket loop.
-//!
-//! One request per connection, `Connection: close`. Thread-per-connection
-//! keeps a slow ClickHouse query from stalling the accept loop.
+//! Requests are parsed (by [`crate::server`]) into a [`Request`], checked
+//! against API-key auth and rate limits, answered from the in-process cache
+//! when possible, and otherwise routed by [`Service::handle`] to the Esplora
+//! REST handlers, the Electrum JSON-RPC dispatcher, or the ops endpoints.
+//! `handle` does no socket I/O (only the store does), so it is directly
+//! unit-testable.
 
+use crate::cache::{Cached, ResponseCache};
 use crate::config::Config;
 use crate::electrum::Electrum;
 use crate::esplora::{self, Esplora};
 use crate::health::Health;
+use crate::limits::{client_ip, extract_token, Decision, Limiter};
 use crate::metrics::Metrics;
 use crate::store::Store;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Maximum request body we will read (JSON-RPC batches are tiny).
-const MAX_BODY: usize = 1 << 20;
-/// Per-connection read/write timeout.
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
+use std::time::{Duration, Instant};
 
 /// A parsed HTTP request.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,17 +26,39 @@ pub struct Request {
     pub path: String,
     pub query: Vec<(String, String)>,
     pub body: String,
+    /// The raw request target (`/path?query`), used as the cache key.
+    pub target: String,
+    /// Header names are lowercased.
+    pub headers: Vec<(String, String)>,
+    pub peer: Option<IpAddr>,
+    /// Whether the client allows the connection to be reused.
+    pub keep_alive: bool,
 }
 
 impl Request {
-    pub fn new(method: &str, path: &str, body: &str) -> Self {
-        let (path, query) = split_query(path);
+    pub fn new(method: &str, target: &str, body: &str) -> Self {
+        let (path, query) = split_query(target);
         Request {
             method: method.to_string(),
             path,
             query,
             body: body.to_string(),
+            target: target.to_string(),
+            headers: Vec::new(),
+            peer: None,
+            keep_alive: false,
         }
+    }
+
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers
+            .push((name.to_ascii_lowercase(), value.to_string()));
+        self
+    }
+
+    pub fn with_peer(mut self, peer: IpAddr) -> Self {
+        self.peer = Some(peer);
+        self
     }
 
     pub fn query_param(&self, key: &str) -> Option<&str> {
@@ -51,6 +67,96 @@ impl Request {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
+
+    /// First header with this (lowercase) name.
+    pub fn header(&self, lower_name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == lower_name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A shared, immutable response body. Cloning is a refcount bump, so cache
+/// hits never copy the payload.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Body(Arc<str>);
+
+impl Body {
+    pub fn as_arc(&self) -> &Arc<str> {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Body {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Display for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for Body {
+    fn from(s: String) -> Self {
+        Body(Arc::from(s))
+    }
+}
+
+impl From<Arc<str>> for Body {
+    fn from(s: Arc<str>) -> Self {
+        Body(s)
+    }
+}
+
+impl PartialEq<str> for Body {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Body {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for Body {
+    fn eq(&self, other: &String) -> bool {
+        *self.0 == **other
+    }
+}
+
+/// `Cache-Control` policy for a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheControl {
+    NoStore,
+    /// Shared caches (CDNs) may store it for this many seconds.
+    Public(u64),
+    /// Only the client may store it — used when auth is required, so a CDN
+    /// never serves an authenticated response to an anonymous caller.
+    Private(u64),
+}
+
+impl std::fmt::Display for CacheControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheControl::NoStore => f.write_str("no-store"),
+            CacheControl::Public(0) | CacheControl::Private(0) => f.write_str("no-cache"),
+            CacheControl::Public(s) => write!(f, "public, max-age={s}"),
+            CacheControl::Private(s) => write!(f, "private, max-age={s}"),
+        }
+    }
 }
 
 /// An HTTP response with a rendered body.
@@ -58,22 +164,28 @@ impl Request {
 pub struct HttpResponse {
     pub status: u16,
     pub content_type: &'static str,
-    pub body: String,
+    pub body: Body,
+    pub cache_control: CacheControl,
+    pub retry_after: Option<u64>,
 }
 
 impl HttpResponse {
-    fn json(status: u16, body: String) -> Self {
+    pub fn json(status: u16, body: String) -> Self {
         HttpResponse {
             status,
             content_type: "application/json",
-            body,
+            body: body.into(),
+            cache_control: CacheControl::NoStore,
+            retry_after: None,
         }
     }
-    fn text(status: u16, body: impl Into<String>) -> Self {
+    pub fn text(status: u16, body: impl Into<String>) -> Self {
         HttpResponse {
             status,
             content_type: "text/plain; charset=utf-8",
-            body: body.into(),
+            body: body.into().into(),
+            cache_control: CacheControl::NoStore,
+            retry_after: None,
         }
     }
 
@@ -81,13 +193,27 @@ impl HttpResponse {
         match self.status {
             200 => "OK",
             400 => "Bad Request",
+            401 => "Unauthorized",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            429 => "Too Many Requests",
             500 => "Internal Server Error",
             503 => "Service Unavailable",
             _ => "Unknown",
         }
     }
+}
+
+/// How long a successful Esplora response may be cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freshness {
+    NoCache,
+    /// Changes every block (tip routes, unconfirmed-depth data).
+    Tip,
+    /// Changes whenever a matching output is created or spent.
+    Address,
+    /// Data anchored at a block height; immutable once buried deep enough.
+    AtHeight(u32),
 }
 
 /// Split `/path?a=1&b=2` into `("/path", [("a","1"),("b","2")])`.
@@ -114,6 +240,8 @@ pub struct Service {
     pub cfg: Arc<Config>,
     pub metrics: Arc<Metrics>,
     pub health: Arc<Health>,
+    limiter: Limiter,
+    cache: Option<ResponseCache>,
 }
 
 impl Service {
@@ -123,11 +251,18 @@ impl Service {
         metrics: Arc<Metrics>,
         health: Arc<Health>,
     ) -> Self {
+        let limiter = Limiter::new(&cfg.auth, &cfg.rate_limit);
+        let cache = cfg
+            .cache
+            .enabled
+            .then(|| ResponseCache::new(cfg.cache.max_entries));
         Service {
             store,
             cfg,
             metrics,
             health,
+            limiter,
+            cache,
         }
     }
 
@@ -159,8 +294,13 @@ impl Service {
     /// Route and answer one request. Pure w.r.t. sockets (only the store does
     /// I/O), so it is directly unit-testable.
     pub fn handle(&self, req: &Request) -> HttpResponse {
-        let (resp, surface) = self.route(req);
-        // Instrumentation.
+        let start = Instant::now();
+        self.metrics.inflight_inc();
+        let (resp, surface) = self.route(req, start);
+        self.metrics.inflight_dec();
+        self.metrics
+            .latency
+            .observe_micros(start.elapsed().as_micros() as u64);
         self.metrics.inc_queries();
         self.metrics.inc_surface(surface);
         self.metrics.inc_status(status_class(resp.status));
@@ -170,11 +310,11 @@ impl Service {
         resp
     }
 
-    fn route(&self, req: &Request) -> (HttpResponse, &'static str) {
-        // Ops endpoints are always available.
+    fn route(&self, req: &Request, now: Instant) -> (HttpResponse, &'static str) {
+        // Ops endpoints are always available and never throttled.
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/metrics") => {
-                return (HttpResponse::text(200, self.metrics.registry.render()), "ops");
+                return (HttpResponse::text(200, self.metrics.render()), "ops");
             }
             ("GET", "/healthz") => return (HttpResponse::text(200, "ok"), "ops"),
             ("GET", "/readyz") => {
@@ -185,10 +325,19 @@ impl Service {
             _ => {}
         }
 
+        let electrum = req.method == "POST" && (req.path == "/" || req.path == "/electrum");
+        let surface = if electrum { "electrum" } else { "esplora" };
+        if let Some(rejected) = self.admit(req, now) {
+            return (rejected, surface);
+        }
+
         // Electrum JSON-RPC: POST to the root or /electrum.
-        if req.method == "POST" && (req.path == "/" || req.path == "/electrum") {
+        if electrum {
             if !self.cfg.electrum_enabled {
-                return (HttpResponse::json(404, err_body("electrum disabled")), "ops");
+                return (
+                    HttpResponse::json(404, err_body("electrum disabled")),
+                    "ops",
+                );
             }
             return (self.electrum(req), "electrum");
         }
@@ -203,10 +352,120 @@ impl Service {
                 "esplora",
             );
         }
-        (self.esplora_route(req), "esplora")
+        (self.esplora_cached(req, now), "esplora")
     }
 
-    fn esplora_route(&self, req: &Request) -> HttpResponse {
+    /// Auth + rate limit. `Some(response)` when the request is rejected.
+    fn admit(&self, req: &Request, now: Instant) -> Option<HttpResponse> {
+        if self.limiter.is_noop() {
+            return None;
+        }
+        let token = extract_token(req.header("authorization"), req.header("x-api-key"));
+        let ip = client_ip(
+            req.peer,
+            req.header("x-forwarded-for"),
+            self.cfg.server.trust_forwarded_for,
+        );
+        match self.limiter.check(token, ip, now) {
+            Decision::Allow { tenant } => {
+                if let Some(name) = tenant.and_then(|t| self.limiter.tenant_name(t)) {
+                    self.metrics.inc_tenant(name);
+                }
+                None
+            }
+            Decision::Unauthorized => {
+                self.metrics.inc_unauthorized();
+                Some(HttpResponse::json(
+                    401,
+                    err_body("missing or invalid API key"),
+                ))
+            }
+            Decision::Limited {
+                tenant,
+                retry_after_secs,
+            } => {
+                self.metrics
+                    .inc_rate_limited(tenant.and_then(|t| self.limiter.tenant_name(t)));
+                let mut r = HttpResponse::json(429, err_body("rate limit exceeded"));
+                r.retry_after = Some(retry_after_secs);
+                Some(r)
+            }
+        }
+    }
+
+    fn esplora_cached(&self, req: &Request, now: Instant) -> HttpResponse {
+        if let Some(cache) = &self.cache {
+            if let Some(hit) = cache.get(&req.target, now) {
+                self.metrics.inc_cache_hit();
+                return HttpResponse {
+                    status: hit.status,
+                    content_type: hit.content_type,
+                    body: hit.body.into(),
+                    cache_control: self.cache_control(hit.max_age_secs),
+                    retry_after: None,
+                };
+            }
+            self.metrics.inc_cache_miss();
+        }
+        let (mut resp, freshness) = self.esplora_route(req);
+        let Some((ttl, max_age)) = self.ttl_for(resp.status, freshness) else {
+            return resp;
+        };
+        resp.cache_control = self.cache_control(max_age);
+        if let Some(cache) = &self.cache {
+            let entry = Cached::new(
+                resp.status,
+                resp.content_type,
+                resp.body.as_arc().clone(),
+                ttl,
+                max_age,
+                now,
+            );
+            cache.put(&req.target, entry, now);
+        }
+        resp
+    }
+
+    fn cache_control(&self, max_age: u64) -> CacheControl {
+        if self.cfg.auth.required {
+            CacheControl::Private(max_age)
+        } else {
+            CacheControl::Public(max_age)
+        }
+    }
+
+    /// `(in-process TTL, Cache-Control max-age secs)` for a response, or
+    /// `None` if it must not be cached (errors and not-found answers can
+    /// change at the next block).
+    fn ttl_for(&self, status: u16, f: Freshness) -> Option<(Duration, u64)> {
+        if status != 200 {
+            return None;
+        }
+        let c = &self.cfg.cache;
+        let tip = Some((Duration::from_millis(c.tip_ttl_ms), c.tip_ttl_ms / 1000));
+        match f {
+            Freshness::NoCache => None,
+            Freshness::Tip => tip,
+            Freshness::Address => Some((
+                Duration::from_millis(c.address_ttl_ms),
+                c.address_ttl_ms / 1000,
+            )),
+            Freshness::AtHeight(h) => {
+                let indexed = self.health.indexed_height();
+                let buried = indexed >= h && indexed - h + 1 >= c.confirmations.max(1);
+                if buried {
+                    Some((
+                        Duration::from_secs(c.immutable_ttl_secs),
+                        c.immutable_ttl_secs,
+                    ))
+                } else {
+                    tip
+                }
+            }
+        }
+    }
+
+    fn esplora_route(&self, req: &Request) -> (HttpResponse, Freshness) {
         let e = Esplora::with_metrics(&self.store, &self.cfg, &self.metrics);
         let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
         let limit = req
@@ -214,27 +473,45 @@ impl Service {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(100)
             .min(1000);
-        let r = match segs.as_slice() {
-            ["blocks", "tip", "height"] => e.tip_height(),
-            ["blocks", "tip", "hash"] => e.tip_hash(),
+        let (r, f) = match segs.as_slice() {
+            ["blocks", "tip", "height"] => (e.tip_height(), Freshness::Tip),
+            ["blocks", "tip", "hash"] => (e.tip_hash(), Freshness::Tip),
             ["blocks", h] => match h.parse::<u32>() {
-                Ok(n) => e.block(Some(n), None),
-                Err(_) => esplora::Response::bad_request("invalid height"),
+                Ok(n) => (e.block(Some(n), None), Freshness::AtHeight(n)),
+                Err(_) => (
+                    esplora::Response::bad_request("invalid height"),
+                    Freshness::NoCache,
+                ),
             },
-            ["block", hash] => e.block(None, Some(hash)),
+            ["block", hash] => {
+                let r = e.block(None, Some(hash));
+                let f = height_freshness(r.body.get("height"));
+                (r, f)
+            }
             ["block-height", h] => match h.parse::<u32>() {
-                Ok(n) => e.block_hash_at_height(n),
-                Err(_) => esplora::Response::bad_request("invalid height"),
+                Ok(n) => (e.block_hash_at_height(n), Freshness::AtHeight(n)),
+                Err(_) => (
+                    esplora::Response::bad_request("invalid height"),
+                    Freshness::NoCache,
+                ),
             },
-            ["address", seg] => e.address(seg),
-            ["address", seg, "utxo"] => e.address_utxo(seg, limit),
-            ["address", seg, "txs"] => e.address_txs(seg, limit),
-            ["tx", txid] => e.tx(txid),
-            ["tx", txid, "outspends"] => e.tx_outspends(txid),
-            ["address-prefix", prefix] => e.address_prefix(prefix),
-            _ => esplora::Response::not_found("unknown route"),
+            ["address", seg] => (e.address(seg), Freshness::Address),
+            ["address", seg, "utxo"] => (e.address_utxo(seg, limit), Freshness::Address),
+            ["address", seg, "txs"] => (e.address_txs(seg, limit), Freshness::Address),
+            ["tx", txid] => {
+                let r = e.tx(txid);
+                let f = height_freshness(r.body.get("status").and_then(|s| s.get("block_height")));
+                (r, f)
+            }
+            // Outspends change when a previously unspent output is spent.
+            ["tx", txid, "outspends"] => (e.tx_outspends(txid), Freshness::Address),
+            ["address-prefix", prefix] => (e.address_prefix(prefix), Freshness::Address),
+            _ => (
+                esplora::Response::not_found("unknown route"),
+                Freshness::NoCache,
+            ),
         };
-        render_esplora(r)
+        (render_esplora(r), f)
     }
 
     fn electrum(&self, req: &Request) -> HttpResponse {
@@ -243,7 +520,11 @@ impl Service {
             Err(e) => {
                 return HttpResponse::json(
                     200,
-                    json_rpc_error(serde_json::Value::Null, -32700, &format!("parse error: {e}")),
+                    json_rpc_error(
+                        serde_json::Value::Null,
+                        -32700,
+                        &format!("parse error: {e}"),
+                    ),
                 )
             }
         };
@@ -270,6 +551,16 @@ impl Service {
 fn render_esplora(r: esplora::Response) -> HttpResponse {
     let body = serde_json::to_string(&r.body).unwrap_or_else(|_| "{}".to_string());
     HttpResponse::json(r.status, body)
+}
+
+fn height_freshness(v: Option<&serde_json::Value>) -> Freshness {
+    match v
+        .and_then(|h| h.as_u64())
+        .and_then(|h| u32::try_from(h).ok())
+    {
+        Some(h) => Freshness::AtHeight(h),
+        None => Freshness::NoCache,
+    }
 }
 
 fn err_body(msg: &str) -> String {
@@ -320,92 +611,11 @@ fn fetch_node_height(node: &crate::config::NodeConfig) -> Option<u32> {
     v.get("result")?.as_u64().map(|n| n as u32)
 }
 
-/// Parse one HTTP/1.1 request from a stream.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Request> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    let mut parts = request_line.trim_end().split(' ');
-    let method = parts.next().unwrap_or("").to_string();
-    let target = parts.next().unwrap_or("/").to_string();
-    if method.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "empty request line",
-        ));
-    }
-    let mut content_length = 0usize;
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 || line == "\r\n" || line == "\n" {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0).min(MAX_BODY);
-            }
-        }
-    }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
-    let body = String::from_utf8_lossy(&body).to_string();
-    Ok(Request::new(&method, &target, &body))
-}
-
-/// Write one response and close.
-fn write_response(stream: &mut TcpStream, resp: &HttpResponse) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        resp.status,
-        resp.reason(),
-        resp.content_type,
-        resp.body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(resp.body.as_bytes())?;
-    stream.flush()
-}
-
-/// Serve on an already-bound listener. Each connection is handled on its own
-/// thread; a malformed request is answered 400 rather than dropping the loop.
-pub fn serve_listener(listener: TcpListener, service: Arc<Service>) {
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let service = service.clone();
-        std::thread::spawn(move || {
-            let resp = match read_request(&mut stream) {
-                Ok(req) => service.handle(&req),
-                Err(_) => HttpResponse::json(400, err_body("bad request")),
-            };
-            let _ = write_response(&mut stream, &resp);
-        });
-    }
-}
-
-/// Bind and serve on `addr`.
-pub fn serve(addr: &str, service: Arc<Service>) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr)?;
-    serve_bound(addr, listener, service);
-    Ok(())
-}
-
-/// Log and serve on an already-bound listener. Split from [`serve`] so the
-/// bind (fallible) and the accept loop (blocks forever) can be exercised
-/// independently.
-pub fn serve_bound(addr: &str, listener: TcpListener, service: Arc<Service>) {
-    tracing::info!("bidx serve listening on {addr}");
-    serve_listener(listener, service);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::{hex64, store as mock_store, wire};
+    use std::net::TcpListener;
 
     fn service_with(routes: &[(&str, &str)]) -> Arc<Service> {
         let (s, _) = mock_store(routes, r#"{"data":[],"rows":0}"#);
@@ -474,9 +684,14 @@ mod tests {
             ("FROM bitcoin.blocks", &block),
         ]);
 
-        assert_eq!(svc.handle(&Request::new("GET", "/blocks/tip/height", "")).body, "5");
         assert_eq!(
-            svc.handle(&Request::new("GET", "/blocks/tip/hash", "")).body,
+            svc.handle(&Request::new("GET", "/blocks/tip/height", ""))
+                .body,
+            "5"
+        );
+        assert_eq!(
+            svc.handle(&Request::new("GET", "/blocks/tip/hash", ""))
+                .body,
             format!("\"{disp}\"")
         );
         let b = svc.handle(&Request::new("GET", "/blocks/5", ""));
@@ -486,14 +701,12 @@ mod tests {
         assert_eq!(bh.body, format!("\"{disp}\""));
         // Bad height.
         assert_eq!(
-            svc.handle(&Request::new("GET", "/blocks/notanumber", "")).status,
+            svc.handle(&Request::new("GET", "/blocks/notanumber", ""))
+                .status,
             400
         );
         // Unknown route.
-        assert_eq!(
-            svc.handle(&Request::new("GET", "/nope", "")).status,
-            404
-        );
+        assert_eq!(svc.handle(&Request::new("GET", "/nope", "")).status, 404);
     }
 
     #[test]
@@ -523,19 +736,30 @@ mod tests {
         assert_eq!(r.body, "[]");
 
         // address-prefix.
-        let svc2 = service_with(&[("address_prefix", r#"{"data":[{"address":"bc1q","script_type":4}],"rows":1}"#)]);
+        let svc2 = service_with(&[(
+            "address_prefix",
+            r#"{"data":[{"address":"bc1q","script_type":4}],"rows":1}"#,
+        )]);
         let r = svc2.handle(&Request::new("GET", "/address-prefix/bc1q", ""));
         assert_eq!(r.body, "[\"bc1q\"]");
 
         // tx not found.
-        let r = svc.handle(&Request::new("GET", &format!("/tx/{disp}", disp = hex64(0xbb)), ""));
+        let r = svc.handle(&Request::new(
+            "GET",
+            &format!("/tx/{disp}", disp = hex64(0xbb)),
+            "",
+        ));
         assert_eq!(r.status, 404);
     }
 
     #[test]
     fn method_not_allowed_and_disabled_surfaces() {
         let svc = service_with(&[]);
-        assert_eq!(svc.handle(&Request::new("POST", "/blocks/tip/height", "")).status, 405);
+        assert_eq!(
+            svc.handle(&Request::new("POST", "/blocks/tip/height", ""))
+                .status,
+            405
+        );
 
         // Esplora disabled.
         let (s, _) = mock_store(&[], r#"{"data":[],"rows":0}"#);
@@ -547,7 +771,11 @@ mod tests {
             Arc::new(Metrics::new()),
             Arc::new(Health::new()),
         ));
-        assert_eq!(svc.handle(&Request::new("GET", "/blocks/tip/height", "")).status, 404);
+        assert_eq!(
+            svc.handle(&Request::new("GET", "/blocks/tip/height", ""))
+                .status,
+            404
+        );
 
         // Electrum disabled.
         let (s, _) = mock_store(&[], r#"{"data":[],"rows":0}"#);
@@ -587,7 +815,11 @@ mod tests {
         ));
         assert!(r.body.contains("-32601"));
         // params absent → null, handled.
-        let r = svc.handle(&Request::new("POST", "/", r#"{"id":4,"method":"server.ping"}"#));
+        let r = svc.handle(&Request::new(
+            "POST",
+            "/",
+            r#"{"id":4,"method":"server.ping"}"#,
+        ));
         assert!(r.body.contains("\"result\":null"));
     }
 
@@ -673,7 +905,10 @@ mod tests {
         // With a node configured, refresh_health must attempt the RPC. The
         // node here is unreachable, so the height stays unknown (lag 0) but
         // the attempt is exercised.
-        let (s, _) = mock_store(&[("max(height)", r#"{"data":[{"height":10}],"rows":1}"#)], r#"{"data":[],"rows":0}"#);
+        let (s, _) = mock_store(
+            &[("max(height)", r#"{"data":[{"height":10}],"rows":1}"#)],
+            r#"{"data":[],"rows":0}"#,
+        );
         let mut cfg = Config::default();
         cfg.node = Some(crate::config::NodeConfig {
             rpc_url: "http://127.0.0.1:1".into(),
@@ -716,7 +951,10 @@ mod tests {
     #[test]
     fn refresh_health_records_node_height_and_lag() {
         let url = mock_node(120);
-        let (s, _) = mock_store(&[("max(height)", r#"{"data":[{"height":100}],"rows":1}"#)], r#"{"data":[],"rows":0}"#);
+        let (s, _) = mock_store(
+            &[("max(height)", r#"{"data":[{"height":100}],"rows":1}"#)],
+            r#"{"data":[],"rows":0}"#,
+        );
         let mut cfg = Config::default();
         cfg.node = Some(crate::config::NodeConfig {
             rpc_url: url,
@@ -736,22 +974,10 @@ mod tests {
         assert_eq!(svc.health.lag(), 20);
         let text = metrics.registry.render();
         assert!(text.contains("bidx_node_height 120\n"), "metrics: {text}");
-        assert!(text.contains("bidx_indexer_lag_blocks 20\n"), "metrics: {text}");
-    }
-
-    #[test]
-    fn read_request_errors_on_truncated_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_request(&mut stream).is_err()
-        });
-        let mut c = TcpStream::connect(addr).unwrap();
-        // Declares 100 bytes of body but sends none, then closes.
-        c.write_all(b"POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n").unwrap();
-        drop(c);
-        assert!(handle.join().unwrap());
+        assert!(
+            text.contains("bidx_indexer_lag_blocks 20\n"),
+            "metrics: {text}"
+        );
     }
 
     #[test]
@@ -778,53 +1004,19 @@ mod tests {
         // /tx/:txid and /tx/:txid/outspends both reach the handler (404 here
         // because the mock store has no rows).
         assert_eq!(
-            svc.handle(&Request::new("GET", &format!("/tx/{}", hex64(0xaa)), "")).status,
+            svc.handle(&Request::new("GET", &format!("/tx/{}", hex64(0xaa)), ""))
+                .status,
             404
         );
         assert_eq!(
-            svc.handle(&Request::new("GET", &format!("/tx/{}/outspends", hex64(0xaa)), "")).status,
+            svc.handle(&Request::new(
+                "GET",
+                &format!("/tx/{}/outspends", hex64(0xaa)),
+                ""
+            ))
+            .status,
             404
         );
-    }
-
-    #[test]
-    fn serve_bound_logs_and_accepts_connections() {
-        let svc = service_with(&[]);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let svc2 = svc.clone();
-        std::thread::spawn(move || serve_bound("test", listener, svc2));
-        // A request answered proves the accept loop started.
-        let mut c = TcpStream::connect(addr).unwrap();
-        c.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let mut resp = String::new();
-        c.read_to_string(&mut resp).unwrap();
-        assert!(resp.contains("200 OK"), "got: {resp}");
-    }
-
-    #[test]
-    fn serve_binds_and_serves() {
-        let svc = service_with(&[]);
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe); // free the port for `serve`
-        let svc2 = svc.clone();
-        std::thread::spawn(move || {
-            let _ = serve(&addr.to_string(), svc2);
-        });
-        // Retry the connect briefly to avoid a race with bind().
-        let mut last = String::new();
-        for _ in 0..50 {
-            if let Ok(mut c) = TcpStream::connect(addr) {
-                c.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-                let _ = c.read_to_string(&mut last);
-                if last.contains("200 OK") {
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(last.contains("200 OK"), "got: {last}");
     }
 
     #[test]
@@ -846,56 +1038,303 @@ mod tests {
     }
 
     #[test]
-    fn read_request_parses_method_target_and_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Server side: read one request and echo the parsed fields as JSON.
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let req = read_request(&mut stream).unwrap();
-            serde_json::json!({
-                "method": req.method, "path": req.path, "body": req.body,
-                "limit": req.query_param("limit"),
-            })
-        });
-        let mut c = TcpStream::connect(addr).unwrap();
-        let body = "{\"x\":1}";
-        let raw = format!(
-            "POST /tx/abc?limit=5 HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        c.write_all(raw.as_bytes()).unwrap();
-        let v = handle.join().unwrap();
-        assert_eq!(v["method"], "POST");
-        assert_eq!(v["path"], "/tx/abc");
-        assert_eq!(v["body"], body);
-        assert_eq!(v["limit"], "5");
-    }
-
-    #[test]
-    fn read_request_rejects_empty_request_line() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_request(&mut stream).is_err()
-        });
-        let mut c = TcpStream::connect(addr).unwrap();
-        // A blank first line yields an empty method → InvalidData.
-        c.write_all(b"\r\n\r\n").unwrap();
-        assert!(handle.join().unwrap());
-    }
-
-    #[test]
     fn response_reasons() {
         assert_eq!(HttpResponse::text(200, "x").reason(), "OK");
         assert_eq!(HttpResponse::text(404, "x").reason(), "Not Found");
         assert_eq!(HttpResponse::text(405, "x").reason(), "Method Not Allowed");
         assert_eq!(HttpResponse::text(503, "x").reason(), "Service Unavailable");
-        assert_eq!(HttpResponse::text(500, "x").reason(), "Internal Server Error");
+        assert_eq!(
+            HttpResponse::text(500, "x").reason(),
+            "Internal Server Error"
+        );
         assert_eq!(HttpResponse::text(400, "x").reason(), "Bad Request");
+        assert_eq!(HttpResponse::text(401, "x").reason(), "Unauthorized");
+        assert_eq!(HttpResponse::text(429, "x").reason(), "Too Many Requests");
         assert_eq!(HttpResponse::text(418, "x").reason(), "Unknown");
+    }
+
+    fn block_row(height: u32) -> String {
+        format!(
+            r#"{{"data":[{{"height":{height},"hash":"{}","prev_hash":"{}","merkle_root":"{}","time":1,"version":1,"bits":1,"nonce":1,"tx_count":0,"size":1,"weight":1}}],"rows":1}}"#,
+            wire(&hex64(0xaa)),
+            wire(&hex64(0)),
+            wire(&hex64(0))
+        )
+    }
+
+    fn svc_cfg(
+        routes: &[(&str, &str)],
+        cfg: Config,
+    ) -> (Arc<Service>, Arc<crate::testutil::RouteMock>) {
+        let (s, mock) = mock_store(routes, r#"{"data":[],"rows":0}"#);
+        let names: Vec<&str> = cfg.auth.keys.iter().map(|k| k.name.as_str()).collect();
+        let metrics = Arc::new(Metrics::with_tenants(&names));
+        let svc = Service::new(
+            Arc::new(s),
+            Arc::new(cfg.clone()),
+            metrics,
+            Arc::new(Health::new()),
+        );
+        (Arc::new(svc), mock)
+    }
+
+    fn api_key(name: &str, token: &str, rate: f64, burst: f64) -> crate::config::ApiKey {
+        crate::config::ApiKey {
+            name: name.into(),
+            token_sha256: crate::config::ApiKey::hash_token(token),
+            rate_per_sec: rate,
+            burst,
+        }
+    }
+
+    #[test]
+    fn auth_required_gates_the_api_but_never_ops_endpoints() {
+        let mut cfg = Config::default();
+        cfg.auth.required = true;
+        cfg.auth.keys = vec![api_key("acme", "tok", 0.0, 1.0)];
+        let (svc, _) = svc_cfg(
+            &[("max(height)", r#"{"data":[{"height":7}],"rows":1}"#)],
+            cfg,
+        );
+
+        let r = svc.handle(&Request::new("GET", "/blocks/tip/height", ""));
+        assert_eq!(r.status, 401);
+        assert_eq!(r.reason(), "Unauthorized");
+        assert!(r.body.contains("API key"));
+        // Electrum is gated too, and counted under its surface.
+        let r = svc.handle(&Request::new("POST", "/", r#"{"method":"server.ping"}"#));
+        assert_eq!(r.status, 401);
+        let r = svc.handle(
+            &Request::new("GET", "/blocks/tip/height", "")
+                .with_header("Authorization", "Bearer nope"),
+        );
+        assert_eq!(r.status, 401);
+        // Probes and scrapes need no key.
+        assert_eq!(svc.handle(&Request::new("GET", "/healthz", "")).status, 200);
+
+        let ok = svc.handle(
+            &Request::new("GET", "/blocks/tip/height", "")
+                .with_header("Authorization", "Bearer tok"),
+        );
+        assert_eq!((ok.status, &*ok.body), (200, "7"));
+        // Authenticated responses must not be cached by shared caches.
+        assert_eq!(ok.cache_control, CacheControl::Private(1));
+        let ok = svc
+            .handle(&Request::new("GET", "/blocks/tip/height", "").with_header("X-API-Key", "tok"));
+        assert_eq!(ok.status, 200);
+
+        let m = svc.metrics.render();
+        assert!(m.contains("bidx_unauthorized_total 3\n"), "{m}");
+        assert!(
+            m.contains("bidx_tenant_requests_total{tenant=\"acme\"} 2\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("bidx_requests_by_surface_total{surface=\"electrum\"} 1\n"),
+            "{m}"
+        );
+        assert!(
+            m.contains("bidx_responses_by_status_total{status=\"4xx\"} 3\n"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn per_key_quota_returns_429_with_retry_after() {
+        let mut cfg = Config::default();
+        cfg.auth.keys = vec![api_key("small", "s", 0.5, 1.0)];
+        let (svc, _) = svc_cfg(&[], cfg);
+        let req = Request::new("GET", "/healthz-not", "").with_header("x-api-key", "s");
+        assert_eq!(svc.handle(&req).status, 404);
+        let r = svc.handle(&req);
+        assert_eq!(r.status, 429);
+        assert_eq!(r.reason(), "Too Many Requests");
+        assert_eq!(r.retry_after, Some(2));
+        // Anonymous access still works (auth not required, no IP limit).
+        assert_eq!(svc.handle(&Request::new("GET", "/nope", "")).status, 404);
+        let m = svc.metrics.render();
+        assert!(m.contains("bidx_rate_limited_total 1\n"), "{m}");
+        assert!(
+            m.contains("bidx_tenant_rate_limited_total{tenant=\"small\"} 1\n"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn per_ip_limit_applies_to_anonymous_traffic() {
+        let mut cfg = Config::default();
+        cfg.rate_limit.per_ip_rps = 0.001;
+        cfg.rate_limit.per_ip_burst = 1.0;
+        let (svc, _) = svc_cfg(&[], cfg.clone());
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let req = Request::new("GET", "/nope", "").with_peer(peer);
+        assert_eq!(svc.handle(&req).status, 404);
+        assert_eq!(svc.handle(&req).status, 429);
+        // X-Forwarded-For is ignored unless trusted...
+        let spoof = req.clone().with_header("X-Forwarded-For", "1.2.3.4");
+        assert_eq!(svc.handle(&spoof).status, 429);
+        // ...and honored when it is.
+        cfg.server.trust_forwarded_for = true;
+        let (svc, _) = svc_cfg(&[], cfg);
+        assert_eq!(svc.handle(&req).status, 404);
+        assert_eq!(svc.handle(&spoof).status, 404, "distinct forwarded client");
+        assert_eq!(svc.handle(&spoof).status, 429);
+    }
+
+    #[test]
+    fn cache_serves_repeats_without_querying_clickhouse() {
+        let (svc, mock) = svc_cfg(
+            &[("max(height)", r#"{"data":[{"height":9}],"rows":1}"#)],
+            Config::default(),
+        );
+        let a = svc.handle(&Request::new("GET", "/blocks/tip/height", ""));
+        let queries = mock.calls().len();
+        let b = svc.handle(&Request::new("GET", "/blocks/tip/height", ""));
+        assert_eq!(mock.calls().len(), queries, "second request hit the cache");
+        assert_eq!(a, b);
+        assert!(
+            Arc::ptr_eq(a.body.as_arc(), b.body.as_arc()),
+            "hit shares the body"
+        );
+        // A different query string is a different key.
+        svc.handle(&Request::new("GET", "/blocks/tip/height?x=1", ""));
+        assert!(mock.calls().len() > queries);
+        let m = svc.metrics.render();
+        assert!(m.contains("bidx_cache_hits_total 1\n"), "{m}");
+        assert!(m.contains("bidx_cache_misses_total 2\n"), "{m}");
+    }
+
+    #[test]
+    fn errors_and_not_found_are_never_cached() {
+        let (svc, mock) = svc_cfg(&[], Config::default());
+        let r = svc.handle(&Request::new("GET", "/blocks/999", ""));
+        assert_eq!((r.status, r.cache_control), (404, CacheControl::NoStore));
+        let n = mock.calls().len();
+        svc.handle(&Request::new("GET", "/blocks/999", ""));
+        assert!(mock.calls().len() > n, "404 re-queried");
+        let r = svc.handle(&Request::new("GET", "/blocks/abc", ""));
+        assert_eq!((r.status, r.cache_control), (400, CacheControl::NoStore));
+    }
+
+    #[test]
+    fn deep_blocks_are_immutable_and_shallow_ones_use_the_tip_ttl() {
+        let block = block_row(95);
+        let (svc, _) = svc_cfg(&[("FROM bitcoin.blocks", &block)], Config::default());
+        svc.health.set_indexed_height(Some(100));
+        // depth = 100 - 95 + 1 = 6 = confirmations → immutable.
+        let r = svc.handle(&Request::new("GET", "/blocks/95", ""));
+        assert_eq!(r.cache_control, CacheControl::Public(300));
+        let r = svc.handle(&Request::new("GET", "/block-height/95", ""));
+        assert_eq!(r.cache_control, CacheControl::Public(300));
+        // depth 5 → still reorgable.
+        let r = svc.handle(&Request::new("GET", "/blocks/96", ""));
+        assert_eq!(r.cache_control, CacheControl::Public(1));
+        // Above the indexed tip (stale health) → tip TTL, never immutable.
+        let r = svc.handle(&Request::new("GET", "/blocks/150", ""));
+        assert_eq!(r.cache_control, CacheControl::Public(1));
+        // By hash: the height comes from the body (95 → immutable).
+        let r = svc.handle(&Request::new("GET", &format!("/block/{}", hex64(0xaa)), ""));
+        assert_eq!(
+            (r.status, r.cache_control),
+            (200, CacheControl::Public(300))
+        );
+    }
+
+    #[test]
+    fn address_routes_use_the_address_ttl_and_ops_are_no_store() {
+        let stats = r#"{"data":[{"funded_count":1,"funded_sum":9,"spent_count":0,"spent_sum":0,"history_count":1}],"rows":1}"#;
+        let mut cfg = Config::default();
+        cfg.cache.address_ttl_ms = 4_000;
+        let (svc, _) = svc_cfg(&[("FROM bitcoin.address_stats", stats)], cfg);
+        let r = svc.handle(&Request::new(
+            "GET",
+            "/address/1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+            "",
+        ));
+        assert_eq!((r.status, r.cache_control), (200, CacheControl::Public(4)));
+        let r = svc.handle(&Request::new("GET", "/metrics", ""));
+        assert_eq!(r.cache_control, CacheControl::NoStore);
+        let r = svc.handle(&Request::new("POST", "/", r#"{"method":"server.ping"}"#));
+        assert_eq!(r.cache_control, CacheControl::NoStore);
+    }
+
+    #[test]
+    fn disabled_cache_still_emits_cache_control_for_cdns() {
+        let mut cfg = Config::default();
+        cfg.cache.enabled = false;
+        let (svc, mock) = svc_cfg(
+            &[("max(height)", r#"{"data":[{"height":3}],"rows":1}"#)],
+            cfg,
+        );
+        let r = svc.handle(&Request::new("GET", "/blocks/tip/height", ""));
+        assert_eq!(r.cache_control, CacheControl::Public(1));
+        let n = mock.calls().len();
+        svc.handle(&Request::new("GET", "/blocks/tip/height", ""));
+        assert!(mock.calls().len() > n);
+        assert!(svc.metrics.render().contains("bidx_cache_misses_total 0\n"));
+    }
+
+    #[test]
+    fn ttl_for_skips_uncacheable_and_non_200_responses() {
+        let (svc, _) = svc_cfg(&[], Config::default());
+        assert_eq!(svc.ttl_for(200, Freshness::NoCache), None);
+        assert_eq!(svc.ttl_for(404, Freshness::Tip), None);
+        assert_eq!(
+            svc.ttl_for(200, Freshness::Tip),
+            Some((Duration::from_secs(1), 1))
+        );
+        // confirmations = 0 is treated as 1: the tip block itself is immutable.
+        let mut cfg = Config::default();
+        cfg.cache.confirmations = 0;
+        let (svc, _) = svc_cfg(&[], cfg);
+        svc.health.set_indexed_height(Some(10));
+        assert_eq!(
+            svc.ttl_for(200, Freshness::AtHeight(10)),
+            Some((Duration::from_secs(300), 300))
+        );
+    }
+
+    #[test]
+    fn height_freshness_reads_numeric_heights_only() {
+        assert_eq!(
+            height_freshness(Some(&serde_json::json!(7))),
+            Freshness::AtHeight(7)
+        );
+        assert_eq!(
+            height_freshness(Some(&serde_json::json!("7"))),
+            Freshness::NoCache
+        );
+        assert_eq!(
+            height_freshness(Some(&serde_json::json!(u64::MAX))),
+            Freshness::NoCache
+        );
+        assert_eq!(height_freshness(None), Freshness::NoCache);
+    }
+
+    #[test]
+    fn cache_control_and_body_render() {
+        assert_eq!(CacheControl::NoStore.to_string(), "no-store");
+        assert_eq!(CacheControl::Public(0).to_string(), "no-cache");
+        assert_eq!(CacheControl::Private(0).to_string(), "no-cache");
+        assert_eq!(CacheControl::Public(30).to_string(), "public, max-age=30");
+        assert_eq!(CacheControl::Private(30).to_string(), "private, max-age=30");
+        let b: Body = Arc::<str>::from("hi").into();
+        assert_eq!(format!("{b}|{b:?}"), "hi|\"hi\"");
+        let owned = String::from("hi");
+        assert!(b == *"hi" && b == "hi" && b == owned);
+    }
+
+    #[test]
+    fn request_builders_set_headers_lowercased_and_peer() {
+        let peer: IpAddr = "::1".parse().unwrap();
+        let r = Request::new("GET", "/x?a=1", "")
+            .with_header("X-Thing", "v")
+            .with_peer(peer);
+        assert_eq!(r.header("x-thing"), Some("v"));
+        assert_eq!(r.header("missing"), None);
+        assert_eq!(r.peer, Some(peer));
+        assert_eq!(r.target, "/x?a=1");
+        assert!(!r.keep_alive);
     }
 
     #[test]
@@ -904,44 +1343,5 @@ mod tests {
         assert_eq!(status_class(404), "4xx");
         assert_eq!(status_class(500), "5xx");
         assert_eq!(status_class(503), "5xx");
-    }
-
-    #[test]
-    fn end_to_end_over_a_real_socket() {
-        let svc = service_with(&[("max(height)", r#"{"data":[{"height":123}],"rows":1}"#)]);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || serve_listener(listener, svc));
-
-        // GET request.
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream
-            .write_all(b"GET /blocks/tip/height HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        let mut resp = String::new();
-        stream.read_to_string(&mut resp).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
-        assert!(resp.contains("Content-Type: application/json"));
-        assert!(resp.trim_end().ends_with("123"));
-
-        // POST JSON-RPC request.
-        let body = r#"{"id":1,"method":"server.ping"}"#;
-        let req = format!(
-            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream.write_all(req.as_bytes()).unwrap();
-        let mut resp = String::new();
-        stream.read_to_string(&mut resp).unwrap();
-        assert!(resp.contains("\"result\":null"), "got: {resp}");
-
-        // Malformed request line → 400.
-        let mut stream = TcpStream::connect(addr).unwrap();
-        stream.write_all(b"\r\n\r\n").unwrap();
-        let mut resp = String::new();
-        let _ = stream.read_to_string(&mut resp);
-        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
     }
 }

@@ -8,9 +8,20 @@ surfaces:
   confirmed-chain queries.
 - **Ops** — Prometheus `/metrics` and `/healthz` / `/readyz`.
 
-The service is deliberately dependency-free at the HTTP layer (std
-`TcpListener`, one request per connection, `Connection: close`,
-thread-per-connection so a slow ClickHouse query cannot stall the accept loop).
+The HTTP layer is a small std-`TcpListener` server built for a fleet behind
+a load balancer:
+
+- **Fixed worker pool + bounded queue.** `[server] workers` threads serve
+  connections; when `queue` accepted connections are already waiting, new
+  ones get an immediate `503` with `Retry-After: 1` instead of piling up.
+- **HTTP/1.1 keep-alive**, closed after `max_requests_per_conn` so L4
+  balancers rebalance across replicas.
+- **Graceful shutdown** on SIGTERM/SIGINT: `/readyz` flips to 503, the API
+  keeps serving for `drain_delay_secs`, then stops accepting and waits up to
+  `shutdown_timeout_secs` for in-flight requests.
+- **Optional API keys + rate limits** (per key and per client IP).
+- **In-process response cache** plus `Cache-Control` headers for CDNs.
+- **ClickHouse replica failover** across a host list, over HTTP or HTTPS.
 
 > **Confirmed-chain only.** There is no mempool: mempool-related responses are
 > honest empty results (`get_mempool` returns `[]`, `estimatefee` returns `-1`).
@@ -20,6 +31,8 @@ thread-per-connection so a slow ClickHouse query cannot stall the accept loop).
 - [Running the service](#running-the-service)
 - [Configuration](#configuration)
 - [Environment variables](#environment-variables)
+- [Authentication and rate limits](#authentication-and-rate-limits)
+- [Caching](#caching)
 - [Esplora REST API](#esplora-rest-api)
 - [Electrum JSON-RPC](#electrum-json-rpc)
 - [Ops endpoints](#ops-endpoints)
@@ -40,8 +53,14 @@ Two listeners come up:
 | `metrics_addr` | `0.0.0.0:9101` | `/metrics`, `/healthz`, `/readyz`. |
 
 The serve layer talks to ClickHouse over its **HTTP** port
-(`clickhouse.http_port`, default `8123`), not the native `9000` port that
-`init-db`/`load` use.
+(`clickhouse.http_port`, default `8123`; usually `8443` with
+`scheme = "https"`), not the native `9000` port that `init-db`/`load` use.
+
+`clickhouse.host` may be a comma-separated list (`"ch-0:8123, ch-1:8123"`;
+entries without a port use `http_port`). Queries rotate round-robin; a host
+that fails at the connection level is skipped for 5 seconds and the query is
+retried on the next one. HTTP error statuses are not retried, since
+ClickHouse uses them for query errors that would fail the same everywhere.
 
 ## Configuration
 
@@ -70,7 +89,39 @@ rpc_url = "http://127.0.0.1:8332"
 # cookie = "/home/bitcoin/.bitcoin/.cookie"
 # user = "rpcuser"
 # password = "rpcpassword"
+
+[server]
+workers = 256                       # fixed worker threads
+queue = 1024                        # waiting connections before 503 shedding
+keep_alive_secs = 5                 # 0 disables keep-alive
+max_requests_per_conn = 1000
+drain_delay_secs = 5                # SIGTERM: not-ready this long, then stop
+shutdown_timeout_secs = 25          # then wait this long for in-flight work
+trust_forwarded_for = false         # use X-Forwarded-For as the client IP
+
+[cache]
+enabled = true
+max_entries = 100000
+tip_ttl_ms = 1000
+address_ttl_ms = 2000
+immutable_ttl_secs = 300
+confirmations = 6
+
+[auth]
+required = false
+# [[auth.keys]]
+# name = "acme"                     # metrics label
+# token_sha256 = "<hex>"            # or token = "..." (plaintext)
+# rate_per_sec = 200.0              # 0 = unlimited
+# burst = 400.0                     # default max(rate_per_sec, 1)
+
+[rate_limit]
+per_ip_rps = 0.0                    # anonymous traffic; 0 = off
+per_ip_burst = 0.0
 ```
+
+Unknown keys are rejected at startup, so a misspelled setting fails loudly
+instead of being silently ignored.
 
 Validation rules (the service refuses to start otherwise):
 
@@ -79,6 +130,12 @@ Validation rules (the service refuses to start otherwise):
 - `clickhouse.timeout_secs` must be > 0.
 - `clickhouse.http_port` must be > 0.
 - At least one of `esplora_enabled` / `electrum_enabled` must be true.
+- `clickhouse.scheme` is `http` or `https`; `clickhouse.host` lists at least
+  one host.
+- `server.workers`, `server.queue`, `server.max_requests_per_conn` > 0.
+- `cache.max_entries` > 0 when the cache is enabled.
+- `auth.required` needs at least one key; key names and tokens are unique.
+- A non-zero rate needs `burst >= 1`.
 
 ## Environment variables
 
@@ -102,6 +159,57 @@ hosts and secrets without editing the file:
 | `BIDX_CLICKHOUSE__TIMEOUT_SECS` | `clickhouse.timeout_secs`. |
 | `BIDX_NODE__RPC_URL` | `node.rpc_url` (also creates the node section). |
 | `BIDX_NODE__COOKIE` | `node.cookie` (ignored if no RPC URL is set). |
+| `BIDX_CLICKHOUSE__SCHEME` | `clickhouse.scheme`. |
+| `BIDX_SERVER__WORKERS` / `__QUEUE` / `__KEEP_ALIVE_SECS` / `__MAX_REQUESTS_PER_CONN` | `server.*`. |
+| `BIDX_SERVER__DRAIN_DELAY_SECS` / `__SHUTDOWN_TIMEOUT_SECS` / `__TRUST_FORWARDED_FOR` | `server.*`. |
+| `BIDX_CACHE__ENABLED` / `__MAX_ENTRIES` / `__TIP_TTL_MS` / `__ADDRESS_TTL_MS` / `__IMMUTABLE_TTL_SECS` / `__CONFIRMATIONS` | `cache.*`. |
+| `BIDX_AUTH__REQUIRED` | `auth.required`. |
+| `BIDX_AUTH__KEYS` | Replaces `auth.keys`: `name:token[:rps[:burst]]`, comma-separated. |
+| `BIDX_RATE_LIMIT__PER_IP_RPS` / `__PER_IP_BURST` | `rate_limit.*`. |
+
+## Authentication and rate limits
+
+Ops endpoints (`/metrics`, `/healthz`, `/readyz`) are never authenticated or
+throttled, so probes and scrapes keep working under load.
+
+- A key is presented as `Authorization: Bearer <token>` or `X-API-Key: <token>`.
+  Keys are matched by SHA-256, so config can hold `token_sha256` instead of
+  the plaintext token.
+- An **unknown** key is always rejected with `401`, even when anonymous
+  access is allowed, so a misconfigured client finds out instead of being
+  silently downgraded.
+- `auth.required = true`: requests without a valid key get `401` with
+  `WWW-Authenticate: Bearer`.
+- `auth.required = false` (default): keys are optional. Keyed requests use
+  the key's quota and are counted per tenant; anonymous requests share the
+  per-IP limit (`rate_limit.per_ip_rps`, if set).
+- Over quota → `429 Too Many Requests` with `Retry-After: <seconds>`.
+- Quotas are token buckets **per replica**: with N serve pods, a key's
+  effective fleet-wide limit is about N × `rate_per_sec`. Size quotas with
+  that in mind, or enforce global quotas at your API gateway.
+- Behind a load balancer, set `server.trust_forwarded_for = true` so the
+  per-IP limit sees the client (the rightmost `X-Forwarded-For` entry), not
+  the balancer. Leave it false when clients connect directly, or they can
+  spoof the header.
+
+## Caching
+
+Successful (`200`) Esplora responses are cached in process, keyed by path and
+query string, and sent with a `Cache-Control` header so a CDN or reverse
+proxy can cache them too:
+
+| Route | TTL | `Cache-Control` |
+|-------|-----|-----------------|
+| `/blocks/tip/*` | `tip_ttl_ms` | `public, max-age=<tip_ttl_ms/1000>` |
+| `/blocks/:h`, `/block-height/:h`, `/block/:hash`, `/tx/:txid` buried ≥ `confirmations` deep | `immutable_ttl_secs` | `public, max-age=<immutable_ttl_secs>` |
+| The same, shallower than `confirmations` | `tip_ttl_ms` | as tip |
+| `/address/*`, `/address-prefix/*`, `/tx/:txid/outspends` | `address_ttl_ms` | `public, max-age=<address_ttl_ms/1000>` |
+| Errors, 404s, Electrum, ops | not cached | `no-store` |
+
+A max-age of 0 is sent as `no-cache`. When `auth.required` is on, `public`
+becomes `private`, so a shared cache never serves an authenticated response
+to an anonymous caller. Setting `cache.enabled = false` turns off the
+in-process cache but keeps the headers.
 
 ## Esplora REST API
 
@@ -267,7 +375,7 @@ Notes:
 | `/readyz` | 200 when ready, else 503 | JSON with per-check detail |
 | `/metrics` | 200 | Prometheus text exposition |
 
-`/readyz` body:
+`/readyz` body (`draining` turns true, and `ready` false, after SIGTERM):
 
 ```json
 {
@@ -277,13 +385,15 @@ Notes:
     "index_has_tip": true,
     "indexed_height": 840000,
     "node_height": 840005,
-    "lag_blocks": 5
+    "lag_blocks": 5,
+    "draining": false
   }
 }
 ```
 
-Readiness requires **both** a verified ClickHouse connection **and** a non-zero
-indexed tip — a fresh, empty database is not ready to serve.
+Readiness requires a verified ClickHouse connection, a non-zero indexed tip (a
+fresh, empty database is not ready to serve), and that the process is not
+draining.
 
 ## Metrics reference
 
@@ -297,6 +407,16 @@ indexed tip — a fresh, empty database is not ready to serve.
 | `bidx_address_not_found_total` | counter | — | Address queries that matched no outputs. |
 | `bidx_requests_by_surface_total` | counter | `surface` = `esplora`/`electrum`/`ops` | Requests by surface. |
 | `bidx_responses_by_status_total` | counter | `status` = `2xx`/`4xx`/`5xx` | Responses by HTTP status class. |
+| `bidx_request_duration_seconds` | histogram | `le` | Time from parsed request to built response (buckets 1 ms – 10 s). |
+| `bidx_inflight_requests` | gauge | — | Requests being handled right now. Scale on this when ClickHouse is the bottleneck. |
+| `bidx_shed_total` | counter | — | Connections refused with 503 because the worker queue was full. |
+| `bidx_cache_hits_total` | counter | — | Responses served from the in-process cache. |
+| `bidx_cache_misses_total` | counter | — | Cacheable requests that queried ClickHouse. |
+| `bidx_unauthorized_total` | counter | — | Requests rejected with 401. |
+| `bidx_rate_limited_total` | counter | — | Requests rejected with 429. |
+| `bidx_tenant_requests_total` | counter | `tenant` | Admitted requests per API key (present when keys are configured). |
+| `bidx_tenant_rate_limited_total` | counter | `tenant` | 429s per API key. |
+| `bidx_draining` | gauge | — | 1 after SIGTERM while draining. |
 
 The serving loop refreshes health/metrics once at startup and every 10 seconds
 thereafter; `/metrics` renders on scrape.
@@ -319,3 +439,4 @@ thereafter; `/metrics` renders on scrape.
 - [schema.md](schema.md) — the tables these queries read.
 - [query-cookbook.md](query-cookbook.md) — the SQL behind each surface.
 - [cli.md](cli.md#serve) — the `bidx serve` command and its flags.
+- [cloud-deployment.md](cloud-deployment.md) — running a scaled fleet on Kubernetes.

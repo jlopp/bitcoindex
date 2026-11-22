@@ -274,10 +274,7 @@ pub fn run_bench(cfg: BenchConfig) -> Result<()> {
     let utxo_path = match (&cfg.utxo, cfg.mode) {
         (Some(p), _) => p.clone(),
         (None, m) if m.needs_utxo() => {
-            let root = cfg
-                .utxo_dir
-                .clone()
-                .unwrap_or_else(default_perf_dir);
+            let root = cfg.utxo_dir.clone().unwrap_or_else(default_perf_dir);
             // The root may not exist yet (first run in a fresh checkout), so
             // create it before the per-run subdirectory.
             std::fs::create_dir_all(&root)?;
@@ -411,8 +408,8 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
 
     // --- Stage 1: header pass ---
     let t = StageTimer::start();
-    let (index, stats) = bidx_parser::build_chain_index(&cfg.blocks_dir)
-        .context("header pass failed")?;
+    let (index, stats) =
+        bidx_parser::build_chain_index(&cfg.blocks_dir).context("header pass failed")?;
     let header_m = t.stop();
     stages.push(report_stage("header_pass", &header_m, cfg.threads));
     if cfg.mode == BenchMode::Headers {
@@ -502,8 +499,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
 
     let progress = ProgressBar::new(total);
     progress.set_style(
-        ProgressStyle::with_template("{spinner} [{elapsed}] {pos}/{len} ({per_sec})")
-            .unwrap(),
+        ProgressStyle::with_template("{spinner} [{elapsed}] {pos}/{len} ({per_sec})").unwrap(),
     );
 
     let pipeline_start = std::time::Instant::now();
@@ -520,7 +516,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     // block that lets the consumer drain, and the pipeline would deadlock. So
     // the worker whose `height` equals this is exempt from backpressure.
     let next_height = Arc::new(AtomicU32::new(start));
-    let watchdog = Arc::new(crate::bench::OomWatchdog::start(crate::pipeline::max_rss_kb()));
+    let watchdog = Arc::new(crate::bench::OomWatchdog::start(
+        crate::pipeline::max_rss_kb(),
+    ));
     let consumer_handle = if do_parse_stages {
         let (tx, rx) = crossbeam_channel::bounded::<WorkItem>(tuning.channel_depth);
         let parsed = Arc::clone(&blocks_done);
@@ -620,7 +618,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // allowed to run, or no block can ever unblock the
                         // consumer and the whole pipeline deadlocks.
                         //
-                        // coverage-exempt: 631-636 — mirror of the production
+                        // coverage-exempt: 629, 631-635 — mirror of the production
                         // spin in `pipeline::run_parse`. The body (and the
                         // second `&&` clause, which short-circuits) only runs
                         // when the consumer is `reorder_high` blocks behind
@@ -649,7 +647,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // consumer is gone, which is usually the RSS watchdog
                         // having aborted it. Surface the real cause.
                         //
-                        // coverage-exempt: 657-661 — the map_err closure body
+                        // coverage-exempt: 656-660 — the map_err closure body
                         // only runs when a send to the consumer fails, which
                         // needs the consumer thread to have aborted mid-run;
                         // the fixtures never provoke that. The closure's
@@ -673,7 +671,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     };
 
     if let Some(h) = consumer_handle {
-        let us = h.join().map_err(|_| anyhow::anyhow!("consumer panicked"))??;
+        let us = h
+            .join()
+            .map_err(|_| anyhow::anyhow!("consumer panicked"))??;
         utxo_samples = us;
     } else {
         utxo_samples = Vec::new(); // coverage-exempt: unreachable — every mode that reaches here spawns the consumer (do_parse_stages is true; Headers returns early)
@@ -730,8 +730,11 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     stages.push(StageReport {
         name: "pipeline_wall_total",
         wall_secs: pipeline_secs,
-        cpu_util: jiffies_to_secs(pipeline_end_res.cpu_jiffies().saturating_sub(pipeline_start_res.cpu_jiffies()))
-            / pipeline_secs.max(1e-6)
+        cpu_util: jiffies_to_secs(
+            pipeline_end_res
+                .cpu_jiffies()
+                .saturating_sub(pipeline_start_res.cpu_jiffies()),
+        ) / pipeline_secs.max(1e-6)
             / cfg.threads.unwrap_or(num_cpus()) as f64,
         // Process high-water mark, not the instantaneous sample: the pipeline
         // stage is exactly where a reorder buffer balloons and drains, so the
@@ -778,7 +781,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         blocks_per_sec,
         blocks_per_sec_ex_header,
         user_cpu_secs: jiffies_to_secs(
-            pipeline_end_res.cpu_jiffies().saturating_sub(pipeline_start_res.cpu_jiffies()),
+            pipeline_end_res
+                .cpu_jiffies()
+                .saturating_sub(pipeline_start_res.cpu_jiffies()),
         ),
         peak_rss_mb: peak_rss_kb() as f64 / 1024.0,
         missing_utxos: missing,
@@ -793,7 +798,11 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     })
 }
 
-fn report_stage(name: &'static str, m: &metrics::StageMeasure, threads: Option<usize>) -> StageReport {
+fn report_stage(
+    name: &'static str,
+    m: &metrics::StageMeasure,
+    threads: Option<usize>,
+) -> StageReport {
     StageReport {
         name,
         wall_secs: m.wall_secs(),
@@ -808,7 +817,9 @@ fn jiffies_to_secs(jiffies: u64) -> f64 {
 }
 
 fn num_cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// Default root for benchmark scratch output: `./bidx-perf` under the current
@@ -886,7 +897,7 @@ pub(crate) struct OomWatchdog {
 /// process.
 fn rss_trips(rss_kb: u64, max_rss_kb: u64) -> bool {
     if rss_kb > max_rss_kb {
-        // coverage-exempt: 894-895 — the `tracing::error!` field expressions
+        // coverage-exempt: 905-906 — the `tracing::error!` field expressions
         // are only evaluated when a subscriber is installed; the unit tests
         // run without one, so only the macro's target line is instrumented.
         // The branch itself is covered by `rss_trips_logs_and_trips_only_over_the_limit`.
@@ -1162,7 +1173,10 @@ fn print_trial(r: &TrialReport) {
         "blocks/s incl. header pass: {:.1}",
         r.blocks_per_sec_ex_header
     );
-    println!("user cpu: {:.1}s peak rss: {:.1} MB", r.user_cpu_secs, r.peak_rss_mb);
+    println!(
+        "user cpu: {:.1}s peak rss: {:.1} MB",
+        r.user_cpu_secs, r.peak_rss_mb
+    );
     println!("missing utxos: {}", r.missing_utxos);
     // H2 instrumentation. Read this before considering a batched prefetch:
     // `db_lookups` is the only set a prefetch could cover, and `db_nanos` is
@@ -1203,7 +1217,10 @@ fn print_trial(r: &TrialReport) {
     if r.parse_latency.n > 0 {
         println!(
             "per-block parse   p50 {:>7.2}ms  p99 {:>8.2}ms  max {:>8.2}ms  (n={})",
-            r.parse_latency.p50_ms, r.parse_latency.p99_ms, r.parse_latency.max_ms, r.parse_latency.n
+            r.parse_latency.p50_ms,
+            r.parse_latency.p99_ms,
+            r.parse_latency.max_ms,
+            r.parse_latency.n
         );
     }
     if r.utxo_latency.n > 0 {
@@ -1386,7 +1403,11 @@ mod tests {
         let r = LatencyReport::from_samples(samples);
         assert_eq!(r.n, 101);
         assert!((r.p50_ms - 1.0).abs() < 1e-9);
-        assert!((r.p99_ms - 1.0).abs() < 1e-9, "p99 {} should be 1ms", r.p99_ms);
+        assert!(
+            (r.p99_ms - 1.0).abs() < 1e-9,
+            "p99 {} should be 1ms",
+            r.p99_ms
+        );
         assert!((r.max_ms - 500.0).abs() < 1e-9);
         // 100 * 1ms + 500ms = 0.6s
         assert!((r.sum_secs - 0.6).abs() < 1e-6, "sum {}", r.sum_secs);
@@ -1454,7 +1475,8 @@ mod tests {
 
     #[test]
     fn out_dir_for_honours_explicit_out_dir() {
-        let explicit = std::env::temp_dir().join(format!("bidx-bench-explicit-{}", std::process::id()));
+        let explicit =
+            std::env::temp_dir().join(format!("bidx-bench-explicit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&explicit);
         let mut cfg = test_cfg(BenchMode::Full);
         cfg.out_dir = Some(explicit.clone());
@@ -1472,7 +1494,8 @@ mod tests {
 
     #[test]
     fn out_dir_for_reuses_existing_explicit_dir() {
-        let explicit = std::env::temp_dir().join(format!("bidx-bench-reuse-{}", std::process::id()));
+        let explicit =
+            std::env::temp_dir().join(format!("bidx-bench-reuse-{}", std::process::id()));
         std::fs::create_dir_all(&explicit).unwrap();
         let mut cfg = test_cfg(BenchMode::Full);
         cfg.out_dir = Some(explicit.clone());
@@ -1483,7 +1506,8 @@ mod tests {
 
     #[test]
     fn run_bench_rejects_empty_blocks_dir() {
-        let empty = std::env::temp_dir().join(format!("bidx-bench-empty-blocks-{}", std::process::id()));
+        let empty =
+            std::env::temp_dir().join(format!("bidx-bench-empty-blocks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         let mut cfg = test_cfg(BenchMode::Full);
@@ -1670,7 +1694,11 @@ mod tests {
         use crossbeam_channel::bounded;
         let (tx, rx) = bounded::<WorkItem>(4);
         for (h, b) in blocks {
-            tx.send(WorkItem::Block { height: h, block: b }).unwrap();
+            tx.send(WorkItem::Block {
+                height: h,
+                block: b,
+            })
+            .unwrap();
         }
         drop(tx);
 
@@ -1748,7 +1776,11 @@ mod tests {
         let out_dir = consume_out_dir("reorder");
         let (tx, rx) = bounded::<WorkItem>(4);
         for h in 0..3u32 {
-            tx.send(WorkItem::Block { height: h, block: synth_block(h) }).unwrap();
+            tx.send(WorkItem::Block {
+                height: h,
+                block: synth_block(h),
+            })
+            .unwrap();
         }
         drop(tx);
 
@@ -1922,7 +1954,16 @@ mod tests {
         let mut b = synth_block(0);
         b.inputs[0].is_coinbase = false; // now a real spend of a missing outpoint
         let out_dir = consume_out_dir("utxomode");
-        let got = drive_consume(vec![(0, b)], 1, 1, false, true, true, Some(&store), &out_dir);
+        let got = drive_consume(
+            vec![(0, b)],
+            1,
+            1,
+            false,
+            true,
+            true,
+            Some(&store),
+            &out_dir,
+        );
         assert_eq!(got.blocks_done, 1);
         assert_eq!(got.missing, 1);
         assert_eq!(got.utxo_samples.len(), 1);
@@ -1967,7 +2008,10 @@ mod tests {
         let store = UtxoStore::open(&dir).unwrap();
         let out_dir = consume_out_dir("samples");
 
-        let blocks: Vec<(u32, _)> = [0u32, 1, 2].into_iter().map(|h| (h, synth_block(h))).collect();
+        let blocks: Vec<(u32, _)> = [0u32, 1, 2]
+            .into_iter()
+            .map(|h| (h, synth_block(h)))
+            .collect();
         let got = drive_consume(blocks, 3, 10, false, true, true, Some(&store), &out_dir);
         assert_eq!(got.blocks_done, 3);
         assert_eq!(got.utxo_samples.len(), 3);
@@ -1981,7 +2025,8 @@ mod tests {
         // Coinbase-only blocks: every input is coinbase, so apply_block
         // reports missing == 0 and the trial must succeed.
         let (dir, _) = make_chain(3);
-        let utxo = std::env::temp_dir().join(format!("bidx-bench-full-utxo-{}", std::process::id()));
+        let utxo =
+            std::env::temp_dir().join(format!("bidx-bench-full-utxo-{}", std::process::id()));
         let out = std::env::temp_dir().join(format!("bidx-bench-full-out-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&utxo);
         let _ = std::fs::remove_dir_all(&out);
@@ -2014,7 +2059,8 @@ mod tests {
         // results; without the consumer nothing would be received and the run
         // would report zero blocks.
         let (dir, _) = make_chain(4);
-        let report = std::env::temp_dir().join(format!("bidx-bench-drain-{}.json", std::process::id()));
+        let report =
+            std::env::temp_dir().join(format!("bidx-bench-drain-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&report);
         let mut cfg = test_cfg(BenchMode::Drain);
         cfg.blocks_dir = dir.clone();
@@ -2034,7 +2080,8 @@ mod tests {
     #[test]
     fn run_bench_utxo_mode_without_out_dir_uses_temp() {
         let (dir, _) = make_chain(3);
-        let utxo = std::env::temp_dir().join(format!("bidx-bench-utxo-only-{}", std::process::id()));
+        let utxo =
+            std::env::temp_dir().join(format!("bidx-bench-utxo-only-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&utxo);
         std::fs::create_dir_all(&utxo).unwrap();
         let mut cfg = test_cfg(BenchMode::Utxo);
@@ -2083,7 +2130,10 @@ mod tests {
         assert!(w.is_tripped(), "watchdog never tripped on a 1 KiB limit");
         let msg = w.tripped_error().to_string();
         assert!(msg.contains("watchdog"), "got {msg}");
-        assert!(msg.contains("--threads"), "error must name the remedy: {msg}");
+        assert!(
+            msg.contains("--threads"),
+            "error must name the remedy: {msg}"
+        );
     }
 
     #[test]
@@ -2121,7 +2171,11 @@ mod tests {
         let store = UtxoStore::open(&dir).unwrap();
 
         let (tx, rx) = crossbeam_channel::bounded::<WorkItem>(4);
-        tx.send(WorkItem::Block { height: 0, block: synth_block(0) }).unwrap();
+        tx.send(WorkItem::Block {
+            height: 0,
+            block: synth_block(0),
+        })
+        .unwrap();
         drop(tx);
 
         let blocks_done = AtomicU64::new(0);
@@ -2167,7 +2221,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("watchdog"), "got {e}");
-        assert_eq!(blocks_done.load(Ordering::Relaxed), 0, "must abort before applying");
+        assert_eq!(
+            blocks_done.load(Ordering::Relaxed),
+            0,
+            "must abort before applying"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out_dir);
@@ -2197,7 +2255,8 @@ mod tests {
     #[test]
     fn run_bench_writes_json_report_and_stdout_variant() {
         let (dir, _) = make_chain(3);
-        let report = std::env::temp_dir().join(format!("bidx-bench-report-{}.json", std::process::id()));
+        let report =
+            std::env::temp_dir().join(format!("bidx-bench-report-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&report);
         let mut cfg = test_cfg(BenchMode::Headers);
         cfg.blocks_dir = dir.clone();
@@ -2233,7 +2292,11 @@ mod tests {
         run_bench(cfg).unwrap();
         // The generated subdir must be gone; the root itself remains.
         let leftovers: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().collect();
-        assert!(leftovers.is_empty(), "expected cleanup, found {:?}", leftovers);
+        assert!(
+            leftovers.is_empty(),
+            "expected cleanup, found {:?}",
+            leftovers
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2244,7 +2307,8 @@ mod tests {
         let utxo = std::env::temp_dir().join(format!("bidx-bench-rdbstats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&utxo);
         std::fs::create_dir_all(&utxo).unwrap();
-        let report = std::env::temp_dir().join(format!("bidx-bench-rdbstats-{}.json", std::process::id()));
+        let report =
+            std::env::temp_dir().join(format!("bidx-bench-rdbstats-{}.json", std::process::id()));
         let mut cfg = test_cfg(BenchMode::Full);
         cfg.blocks_dir = dir.clone();
         cfg.utxo = Some(utxo.clone());
@@ -2299,12 +2363,25 @@ mod tests {
             pending_hits: 0,
             cache_hits: 0,
             stages: vec![
-                StageReport { name: "header_pass", wall_secs: 0.5, cpu_util: 0.9, peak_rss_mb: 64.0 },
-                StageReport { name: "pipeline_wall_total", wall_secs: 20.0, cpu_util: 0.8, peak_rss_mb: 128.0 },
+                StageReport {
+                    name: "header_pass",
+                    wall_secs: 0.5,
+                    cpu_util: 0.9,
+                    peak_rss_mb: 64.0,
+                },
+                StageReport {
+                    name: "pipeline_wall_total",
+                    wall_secs: 20.0,
+                    cpu_util: 0.8,
+                    peak_rss_mb: 128.0,
+                },
             ],
             parse_latency: LatencyReport::from_samples(vec![1_000_000, 2_000_000]),
             utxo_latency: LatencyReport::from_samples(vec![3_000_000]),
-            rocksdb: vec![RocksDbProperty { name: "stall_micros".into(), value: "0".into() }],
+            rocksdb: vec![RocksDbProperty {
+                name: "stall_micros".into(),
+                value: "0".into(),
+            }],
         };
         let mut t1 = t0.clone();
         t1.trial = 1;
@@ -2385,27 +2462,56 @@ mod tests {
 
             let txid0 = [0x11u8; 32];
             let tx0 = TxRow {
-                height: 0, tx_index: 0, txid: txid0, version: 1, locktime: 0,
-                size: 0, weight: 0, fee: 0, input_count: 1, output_count: 1,
+                height: 0,
+                tx_index: 0,
+                txid: txid0,
+                version: 1,
+                locktime: 0,
+                size: 0,
+                weight: 0,
+                fee: 0,
+                input_count: 1,
+                output_count: 1,
                 has_witness: false,
             };
             let out0 = OutputRow {
-                height: 0, tx_index: 0, output_index: 0, txid: txid0,
-                value_sat: 1000, script_pubkey_len: 0, script_type: 0,
+                height: 0,
+                tx_index: 0,
+                output_index: 0,
+                txid: txid0,
+                value_sat: 1000,
+                script_pubkey_len: 0,
+                script_type: 0,
                 address_hash: [0u8; 32],
             };
             store.apply_block(0, &[tx0], &[], &[out0]).unwrap();
 
             let txid1 = [0x22u8; 32];
             let tx1 = TxRow {
-                height: 1, tx_index: 0, txid: txid1, version: 1, locktime: 0,
-                size: 0, weight: 0, fee: 0, input_count: 1, output_count: 0,
+                height: 1,
+                tx_index: 0,
+                txid: txid1,
+                version: 1,
+                locktime: 0,
+                size: 0,
+                weight: 0,
+                fee: 0,
+                input_count: 1,
+                output_count: 0,
                 has_witness: false,
             };
             let inp1 = InputRow {
-                height: 1, tx_index: 0, input_index: 0, txid: txid1,
-                prev_txid: txid0, prev_vout: 0, script_sig_len: 0, sequence: 0,
-                witness_items: 0, witness_bytes: 0, is_coinbase: false,
+                height: 1,
+                tx_index: 0,
+                input_index: 0,
+                txid: txid1,
+                prev_txid: txid0,
+                prev_vout: 0,
+                script_sig_len: 0,
+                sequence: 0,
+                witness_items: 0,
+                witness_bytes: 0,
+                is_coinbase: false,
             };
             let res = store.apply_block(1, &[tx1], &[inp1], &[]).unwrap();
             drop(store);
@@ -2414,7 +2520,10 @@ mod tests {
         }
 
         let cached = run(1);
-        assert_eq!(cached.cache_hits, 1, "a recent output must be served from the cache");
+        assert_eq!(
+            cached.cache_hits, 1,
+            "a recent output must be served from the cache"
+        );
         assert_eq!(cached.db_lookups, 0, "cache hit must not touch the DB");
 
         let uncached = run(0);
@@ -2471,7 +2580,10 @@ mod tests {
         // Over-shooting `end` (defensive) is also fine; only short is an error.
         assert!(finalize_consume(6, 5).is_ok());
         let e = finalize_consume(3, 5).unwrap_err();
-        assert!(e.to_string().contains("channel closed early at height 3"), "got {e}");
+        assert!(
+            e.to_string().contains("channel closed early at height 3"),
+            "got {e}"
+        );
     }
 
     #[test]
@@ -2516,7 +2628,10 @@ mod tests {
             &out_dir,
         );
         assert_eq!(got.blocks_done, 2);
-        assert_eq!(got.missing, 0, "block 1 spends block 0's output, so none missing");
+        assert_eq!(
+            got.missing, 0,
+            "block 1 spends block 0's output, so none missing"
+        );
         assert!(got.sink_wall > 0);
         assert!(out_dir.join("spends").join("part-00000.parquet").exists());
 

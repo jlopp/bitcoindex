@@ -21,7 +21,10 @@ use std::io::{stdin, stdout};
 use bidx_core::Network;
 
 #[derive(Parser)]
-#[command(name = "bidx-udf", about = "ClickHouse executable UDFs for bitcoindex address rendering")]
+#[command(
+    name = "bidx-udf",
+    about = "ClickHouse executable UDFs for bitcoindex address rendering"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -106,9 +109,19 @@ mod tests {
     #[test]
     fn cli_parses_both_subcommands_and_defaults_to_mainnet() {
         let c = Cli::try_parse_from(["bidx-udf", "address"]).unwrap();
-        assert!(matches!(c.cmd, Cmd::Address { network: NetworkArg::Mainnet }));
+        assert!(matches!(
+            c.cmd,
+            Cmd::Address {
+                network: NetworkArg::Mainnet
+            }
+        ));
         let c = Cli::try_parse_from(["bidx-udf", "parse", "--network", "testnet3"]).unwrap();
-        assert!(matches!(c.cmd, Cmd::Parse { network: NetworkArg::Testnet3 }));
+        assert!(matches!(
+            c.cmd,
+            Cmd::Parse {
+                network: NetworkArg::Testnet3
+            }
+        ));
         assert!(Cli::try_parse_from(["bidx-udf", "bogus"]).is_err());
     }
 }

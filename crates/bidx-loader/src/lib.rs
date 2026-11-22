@@ -39,6 +39,9 @@ pub struct ChConfig {
     pub user: String,
     pub password: Option<String>,
     pub database: String,
+    /// Connect over TLS (`clickhouse-client --secure`). Required by ClickHouse
+    /// Cloud and any server that only exposes the secure native port (9440).
+    pub secure: bool,
 }
 
 impl Default for ChConfig {
@@ -49,8 +52,40 @@ impl Default for ChConfig {
             user: "default".into(),
             password: None,
             database: "bitcoin".into(),
+            secure: false,
         }
     }
+}
+
+impl ChConfig {
+    /// Connection arguments for `clickhouse-client`, shared by every caller
+    /// that spawns the client so TLS and credentials are applied uniformly.
+    pub fn client_args(&self) -> Vec<String> {
+        let mut a = vec![
+            format!("--host={}", self.host),
+            format!("--port={}", self.port),
+            format!("--user={}", self.user),
+        ];
+        if let Some(p) = &self.password {
+            a.push(format!("--password={p}"));
+        }
+        if self.secure {
+            a.push("--secure".to_string());
+        }
+        a
+    }
+}
+
+/// How `load_all_with` moves Parquet into ClickHouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    /// `INSERT ... SELECT FROM file()` — the server reads the files from its
+    /// own `user_files` directory. Fastest, but the Parquet must be on the
+    /// ClickHouse host.
+    ServerFile,
+    /// Stream each file from this machine over the client connection. Works
+    /// against any reachable server, including ClickHouse Cloud.
+    Upload,
 }
 
 pub struct ChLoader {
@@ -79,15 +114,7 @@ impl ChLoader {
     }
 
     fn base_args(&self) -> Vec<String> {
-        let mut a = vec![
-            format!("--host={}", self.cfg.host),
-            format!("--port={}", self.cfg.port),
-            format!("--user={}", self.cfg.user),
-        ];
-        if let Some(p) = &self.cfg.password {
-            a.push(format!("--password={p}"));
-        }
-        a
+        self.cfg.client_args()
     }
 
     fn run_query(&self, sql: &str) -> Result<(), LoadError> {
@@ -96,7 +123,9 @@ impl ChLoader {
             .arg(format!("--query={sql}"))
             .output()?;
         if !out.status.success() {
-            return Err(LoadError::Client(String::from_utf8_lossy(&out.stderr).into_owned()));
+            return Err(LoadError::Client(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
         }
         Ok(())
     }
@@ -111,7 +140,9 @@ impl ChLoader {
             .arg(format!("--query={sql}"))
             .output()?;
         if !out.status.success() {
-            return Err(LoadError::Client(String::from_utf8_lossy(&out.stderr).into_owned()));
+            return Err(LoadError::Client(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
         }
         Ok(())
     }
@@ -119,7 +150,10 @@ impl ChLoader {
     /// Create database, all base + index tables, and all materialized views
     /// (idempotent), then record the current schema version.
     pub fn init_schema(&self) -> Result<(), LoadError> {
-        self.run_query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.cfg.database))?;
+        self.run_query(&format!(
+            "CREATE DATABASE IF NOT EXISTS {}",
+            self.cfg.database
+        ))?;
         for ddl in schema::all_ddl(&self.cfg.database) {
             self.run_query(&ddl)?;
         }
@@ -141,7 +175,9 @@ impl ChLoader {
             .arg(format!("--query={sql}"))
             .output()?;
         if !out.status.success() {
-            return Err(LoadError::Client(String::from_utf8_lossy(&out.stderr).into_owned()));
+            return Err(LoadError::Client(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
@@ -165,9 +201,7 @@ impl ChLoader {
                 // Partition-aligned: drop the whole (>= height) partition range
                 // cheaply. `PARTITION` takes the partition id (height / 10000).
                 let part = height / 10_000;
-                self.run_query(&format!(
-                    "ALTER TABLE {db}.{table} DROP PARTITION {part}"
-                ))?;
+                self.run_query(&format!("ALTER TABLE {db}.{table} DROP PARTITION {part}"))?;
             } else {
                 self.run_query(&format!(
                     "DELETE FROM {db}.{table} WHERE height >= {height}"
@@ -236,16 +270,71 @@ impl ChLoader {
         self.run_query(&sql)
     }
 
-    pub fn load_all(&self, parquet_dir: &Path) -> Result<(), LoadError> {        for entity in schema::ENTITIES {
+    /// Upload every part file for an entity from the *client* side: each file
+    /// is streamed to `INSERT INTO ... FORMAT Parquet` over the client's
+    /// stdin. Unlike [`load_entity`](Self::load_entity) this needs no access to
+    /// the server's filesystem, so it works against ClickHouse Cloud or any
+    /// remote cluster. Files are sent in name order (part files are named by
+    /// block range). Returns the number of files uploaded.
+    pub fn upload_entity(&self, entity: &str, parquet_dir: &Path) -> Result<usize, LoadError> {
+        let dir = parquet_dir.join(entity);
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        files.sort_unstable();
+        let sql = format!("INSERT INTO {}.{entity} FORMAT Parquet", self.cfg.database);
+        for path in &files {
+            let input = std::fs::File::open(path)?;
+            let out = std::process::Command::new(&self.client)
+                .args(self.base_args())
+                .arg(format!("--query={sql}"))
+                .stdin(input)
+                .output()?;
+            if !out.status.success() {
+                return Err(LoadError::Client(format!(
+                    "upload of {} failed: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                )));
+            }
+        }
+        Ok(files.len())
+    }
+
+    pub fn load_all(&self, parquet_dir: &Path) -> Result<(), LoadError> {
+        self.load_all_with(parquet_dir, LoadMode::ServerFile)
+    }
+
+    /// Load every base entity (plus the optional witness table) using `mode`.
+    pub fn load_all_with(&self, parquet_dir: &Path, mode: LoadMode) -> Result<(), LoadError> {
+        let load = |entity: &str| -> Result<(), LoadError> {
+            match mode {
+                LoadMode::ServerFile => self.load_entity(entity, parquet_dir),
+                LoadMode::Upload => {
+                    let n = self.upload_entity(entity, parquet_dir)?;
+                    tracing::info!(entity, files = n, "uploaded");
+                    Ok(())
+                }
+            }
+        };
+        for entity in schema::ENTITIES {
             tracing::info!(entity, "loading into ClickHouse");
-            self.load_entity(entity, parquet_dir)?;
+            load(entity)?;
         }
         // The witness payload table is optional: a normal `parse` does not
         // produce it, so only load it when the directory is present.
         let wit_dir = parquet_dir.join(schema::WITNESS_ENTITY);
         if wit_dir.is_dir() {
-            tracing::info!(entity = schema::WITNESS_ENTITY, "loading optional witness payload table");
-            self.load_entity(schema::WITNESS_ENTITY, parquet_dir)?;
+            tracing::info!(
+                entity = schema::WITNESS_ENTITY,
+                "loading optional witness payload table"
+            );
+            load(schema::WITNESS_ENTITY)?;
         } else {
             tracing::info!("no witness payload output present; skipping witnesses table");
         }
@@ -258,7 +347,9 @@ impl ChLoader {
     /// because it needs a Rust-side address renderer.
     pub fn rebuild_index(&self, name: &str) -> Result<(), LoadError> {
         match name {
-            "coinstats_by_height" => self.run_multiquery(&schema::backfill_coinstats(&self.cfg.database)),
+            "coinstats_by_height" => {
+                self.run_multiquery(&schema::backfill_coinstats(&self.cfg.database))
+            }
             "scripthash_map" => {
                 self.run_multiquery(&schema::backfill_scripthash_map(&self.cfg.database))
             }
@@ -307,7 +398,9 @@ impl ChLoader {
                 LoadError::Client(format!("bad script_type in address_prefix row: {line:?}"))
             })?;
             let hash = parse_hash32(hash_hex.trim())?;
-            let Some(addr) = render(ty, &hash) else { continue };
+            let Some(addr) = render(ty, &hash) else {
+                continue;
+            };
             batch.push((addr, ty, hash_hex.trim().to_ascii_lowercase()));
             if batch.len() >= Self::ADDRESS_PREFIX_BATCH {
                 self.run_query(&schema::insert_address_prefix(&db, &batch))?;
@@ -437,15 +530,27 @@ mod tests {
             user: "u".into(),
             password: Some("sekret".into()),
             database: "db".into(),
+            secure: false,
         };
         let loader = ChLoader {
             cfg,
             client: PathBuf::from("/definitely/not/a/real/binary/clickhouse-client"),
         };
         let args = loader.base_args();
-        assert_eq!(args, vec![
-            "--host=h", "--port=9999", "--user=u", "--password=sekret",
-        ]);
+        assert_eq!(
+            args,
+            vec!["--host=h", "--port=9999", "--user=u", "--password=sekret",]
+        );
+        // TLS appends `--secure`; no password means no `--password` arg.
+        let tls = ChConfig {
+            secure: true,
+            password: None,
+            ..loader.cfg.clone()
+        };
+        assert_eq!(
+            tls.client_args(),
+            vec!["--host=h", "--port=9999", "--user=u", "--secure"]
+        );
         // run_query must surface Spawn failure as LoadError::Io (the binary
         // does not exist → spawn returns ENOENT).
         let e = loader.run_query("SELECT 1");
@@ -525,10 +630,7 @@ mod tests {
     /// `--query=` argument, or (when `fail` is set) exits 1 with a message.
     /// Returns the path to the script.
     fn fake_client(tag: &str, fail: bool) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bidx-fake-ch-{tag}-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("bidx-fake-ch-{tag}-{}", std::process::id()));
         let body = if fail {
             "#!/bin/sh\necho 'simulated failure' >&2\nexit 1\n".to_string()
         } else {
@@ -539,10 +641,8 @@ mod tests {
         // The script's inode is therefore never open for writing at its final
         // path, so a concurrently-forked test that inherits the write fd cannot
         // make `execve` fail with ETXTBSY.
-        let tmp = std::env::temp_dir().join(format!(
-            "bidx-fake-ch-{tag}-{}-tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-fake-ch-{tag}-{}-tmp", std::process::id()));
         std::fs::write(&tmp, body).unwrap();
         let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
@@ -552,7 +652,13 @@ mod tests {
     }
 
     fn loader_with(client: PathBuf) -> ChLoader {
-        ChLoader { cfg: ChConfig { database: "db".into(), ..ChConfig::default() }, client }
+        ChLoader {
+            cfg: ChConfig {
+                database: "db".into(),
+                ..ChConfig::default()
+            },
+            client,
+        }
     }
 
     /// Tests that spawn the fake client must not run concurrently: a fork
@@ -585,10 +691,8 @@ mod tests {
              case \"$q\" in *system.tables*) echo '{probe}';; esac\nexit 0\n"
         );
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!(
-            "bidx-log-ch-{tag}-{}-tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-log-ch-{tag}-{}-tmp", std::process::id()));
         std::fs::write(&tmp, body).unwrap();
         let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
@@ -599,6 +703,146 @@ mod tests {
 
     fn read_log(script: &Path) -> String {
         std::fs::read_to_string(format!("{}.log", script.display())).unwrap_or_default()
+    }
+
+    /// A client that appends `<query>|<stdin bytes>` per invocation to
+    /// `$0.log`, so an upload test can assert which file went to which table
+    /// and in what order. `fail` makes every invocation exit 1.
+    fn upload_client(tag: &str, fail: bool) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("bidx-up-ch-{tag}-{}", std::process::id()));
+        let tail = if fail {
+            "echo 'upload refused' >&2\nexit 1\n"
+        } else {
+            "exit 0\n"
+        };
+        let body = format!(
+            "#!/bin/sh\nq=''\nfor a in \"$@\"; do case \"$a\" in --query=*) q=\"$a\";; esac; done\n\
+             printf '%s|%s\\n' \"$q\" \"$(cat)\" >> \"$0.log\"\n{tail}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("bidx-up-ch-{tag}-{}-tmp", std::process::id()));
+        std::fs::write(&tmp, body).unwrap();
+        let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        path
+    }
+
+    fn parquet_tree(tag: &str, with_witness: bool) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("bidx-up-tree-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for entity in schema::ENTITIES {
+            let d = root.join(entity);
+            std::fs::create_dir_all(&d).unwrap();
+            // Written out of order to prove the upload sorts by name.
+            std::fs::write(d.join("part-00001.parquet"), format!("{entity}-1")).unwrap();
+            std::fs::write(d.join("part-00000.parquet"), format!("{entity}-0")).unwrap();
+            std::fs::write(d.join("README.txt"), "not parquet").unwrap();
+        }
+        if with_witness {
+            let d = root.join(schema::WITNESS_ENTITY);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("part-00000.parquet"), "wit-0").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn upload_entity_streams_each_parquet_file_in_name_order() {
+        let _g = fork_guard();
+        let client = upload_client("order", false);
+        let loader = loader_with(client.clone());
+        let root = parquet_tree("order", false);
+        assert_eq!(loader.upload_entity("blocks", &root).unwrap(), 2);
+        let log = read_log(&client);
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "--query=INSERT INTO db.blocks FORMAT Parquet|blocks-0",
+                "--query=INSERT INTO db.blocks FORMAT Parquet|blocks-1",
+            ],
+            "non-parquet files must be skipped and parts sent in order"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+        let _ = std::fs::remove_file(&client);
+    }
+
+    #[test]
+    fn upload_entity_handles_missing_dir_non_dir_and_client_failure() {
+        let _g = fork_guard();
+        let client = upload_client("edge", false);
+        let loader = loader_with(client.clone());
+        let root = std::env::temp_dir().join(format!("bidx-up-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Missing entity dir → nothing to upload, not an error.
+        assert_eq!(loader.upload_entity("blocks", &root).unwrap(), 0);
+        assert!(
+            read_log(&client).is_empty(),
+            "no client call for an absent dir"
+        );
+        // A *file* where the entity dir should be is a real I/O error.
+        std::fs::write(root.join("blocks"), "x").unwrap();
+        assert!(matches!(
+            loader.upload_entity("blocks", &root),
+            Err(LoadError::Io(_))
+        ));
+        let _ = std::fs::remove_file(&client);
+
+        // A refusing server surfaces the file path and stderr.
+        let bad = upload_client("refuse", true);
+        let loader = loader_with(bad.clone());
+        let tree = parquet_tree("refuse", false);
+        match loader.upload_entity("outputs", &tree) {
+            Err(LoadError::Client(m)) => {
+                assert!(
+                    m.contains("part-00000.parquet") && m.contains("upload refused"),
+                    "{m}"
+                )
+            }
+            other => panic!("expected Client error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&tree);
+        let _ = std::fs::remove_file(format!("{}.log", bad.display()));
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn load_all_with_upload_sends_every_entity_and_the_witness_table() {
+        let _g = fork_guard();
+        let client = upload_client("all", false);
+        let loader = loader_with(client.clone());
+        let root = parquet_tree("all", true);
+        loader.load_all_with(&root, LoadMode::Upload).unwrap();
+        let log = read_log(&client);
+        for entity in schema::ENTITIES {
+            assert!(
+                log.contains(&format!(
+                    "INSERT INTO db.{entity} FORMAT Parquet|{entity}-0"
+                )),
+                "{log}"
+            );
+        }
+        assert!(
+            log.contains("INSERT INTO db.witnesses FORMAT Parquet|wit-0"),
+            "{log}"
+        );
+        // ServerFile never streams stdin: every line is a file() query.
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+        loader.load_all_with(&root, LoadMode::ServerFile).unwrap();
+        let log = read_log(&client);
+        assert!(
+            log.lines()
+                .all(|l| l.contains("FROM file(") && l.ends_with('|')),
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+        let _ = std::fs::remove_file(&client);
     }
 
     /// A reorg floor in the middle of a 10,000-block partition cannot drop the
@@ -708,7 +952,11 @@ mod tests {
         // query has no leading digits, so parsing yields 0 → every migration
         // (currently just v2, the address_stats rebuild) is applied.
         let applied = loader.migrate().expect("fake client succeeds");
-        assert_eq!(applied, vec![2], "v2 address_stats rebuild is pending at v0");
+        assert_eq!(
+            applied,
+            vec![2],
+            "v2 address_stats rebuild is pending at v0"
+        );
         let _ = std::fs::remove_file(&client);
     }
 
@@ -760,7 +1008,10 @@ mod tests {
         // above it (a migration for a future version would be unreachable).
         assert!(schema::SCHEMA_VERSION >= 1);
         for (v, stmts) in schema::migrations() {
-            assert!(v > 0 && v <= schema::SCHEMA_VERSION, "migration {v} out of range");
+            assert!(
+                v > 0 && v <= schema::SCHEMA_VERSION,
+                "migration {v} out of range"
+            );
             assert!(!stmts.is_empty(), "migration {v} has no statements");
         }
     }
@@ -795,8 +1046,12 @@ mod tests {
         let client = fake_client("rebuild", false);
         let loader = loader_with(client.clone());
         // The SQL-only backfill names reach the client and succeed.
-        loader.rebuild_index("coinstats_by_height").expect("coinstats ok");
-        loader.rebuild_index("scripthash_map").expect("scripthash_map ok");
+        loader
+            .rebuild_index("coinstats_by_height")
+            .expect("coinstats ok");
+        loader
+            .rebuild_index("scripthash_map")
+            .expect("scripthash_map ok");
         // `address_prefix` needs a Rust renderer, so it is refused here rather
         // than silently truncating the table (use `rebuild_address_prefix`).
         match loader.rebuild_index("address_prefix") {
@@ -816,10 +1071,8 @@ mod tests {
     /// TSV body (so `rebuild_address_prefix` has rows to render) and echoes any
     /// other query. `fail` makes it exit 1.
     fn fake_prefix_client(tag: &str, rows: &str, fail: bool) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "bidx-fake-prefix-{tag}-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("bidx-fake-prefix-{tag}-{}", std::process::id()));
         let body = if fail {
             "#!/bin/sh\necho 'simulated failure' >&2\nexit 1\n".to_string()
         } else {
@@ -833,10 +1086,8 @@ mod tests {
             )
         };
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!(
-            "bidx-fake-prefix-{tag}-{}-tmp",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-fake-prefix-{tag}-{}-tmp", std::process::id()));
         std::fs::write(&tmp, body).unwrap();
         let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
         perms.set_mode(0o755);
@@ -923,14 +1174,24 @@ mod tests {
         // No rows at all: `query_scalar` trims, so this is the empty string.
         let client = fake_prefix_client("empty", "\n", false);
         let loader = loader_with(client.clone());
-        assert_eq!(loader.rebuild_address_prefix(|_, _| Some("x".into())).unwrap(), 0);
+        assert_eq!(
+            loader
+                .rebuild_address_prefix(|_, _| Some("x".into()))
+                .unwrap(),
+            0
+        );
         let _ = std::fs::remove_file(&client);
 
         // An internal blank line (survives the outer trim) is skipped.
         let body = format!("2\t{}\n\n4\t{}\n", "ab".repeat(32), "cd".repeat(32));
         let client = fake_prefix_client("blank", &body, false);
         let loader = loader_with(client.clone());
-        assert_eq!(loader.rebuild_address_prefix(|_, _| Some("x".into())).unwrap(), 2);
+        assert_eq!(
+            loader
+                .rebuild_address_prefix(|_, _| Some("x".into()))
+                .unwrap(),
+            2
+        );
         let _ = std::fs::remove_file(&client);
     }
 
@@ -943,7 +1204,9 @@ mod tests {
         let body = row.repeat(ChLoader::ADDRESS_PREFIX_BATCH + 1);
         let client = fake_prefix_client("batch", &body, false);
         let loader = loader_with(client.clone());
-        let n = loader.rebuild_address_prefix(|_, _| Some("1x".into())).unwrap();
+        let n = loader
+            .rebuild_address_prefix(|_, _| Some("1x".into()))
+            .unwrap();
         assert_eq!(n, ChLoader::ADDRESS_PREFIX_BATCH + 1);
         let _ = std::fs::remove_file(&client);
     }
@@ -952,7 +1215,10 @@ mod tests {
     fn parse_hash32_validates_length_and_hex() {
         assert_eq!(parse_hash32(&"0f".repeat(32)).unwrap()[0], 0x0f);
         assert!(matches!(parse_hash32("abcd"), Err(LoadError::Client(_))));
-        assert!(matches!(parse_hash32(&"zz".repeat(32)), Err(LoadError::Client(_))));
+        assert!(matches!(
+            parse_hash32(&"zz".repeat(32)),
+            Err(LoadError::Client(_))
+        ));
     }
 
     #[test]

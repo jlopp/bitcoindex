@@ -49,9 +49,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Or use the published image: ghcr.io/jameson/bitcoindex:<version>
     image: bitcoindex/bidx:local
     container_name: bidx-serve
     restart: unless-stopped
+    # SIGTERM drain (server.drain_delay_secs + shutdown_timeout_secs).
+    stop_grace_period: 40s
     depends_on:
       clickhouse:
         condition: service_healthy

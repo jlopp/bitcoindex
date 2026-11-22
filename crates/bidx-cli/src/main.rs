@@ -27,6 +27,41 @@ impl From<NetworkArg> for Network {
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
+/// ClickHouse connection flags shared by every command that talks to the
+/// server through `clickhouse-client`. Each flag falls back to the same
+/// `BIDX_CLICKHOUSE__*` variable `bidx serve` reads, so one set of env vars
+/// (e.g. a Kubernetes Secret) configures every command.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ChArgs {
+    #[arg(long, env = "BIDX_CLICKHOUSE__HOST", default_value = "localhost")]
+    host: String,
+    /// Native protocol port (9000 plain, 9440 TLS).
+    #[arg(long, env = "BIDX_CLICKHOUSE__PORT", default_value_t = 9000)]
+    port: u16,
+    #[arg(long, env = "BIDX_CLICKHOUSE__USER", default_value = "default")]
+    user: String,
+    #[arg(long, env = "BIDX_CLICKHOUSE__PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+    #[arg(long, env = "BIDX_CLICKHOUSE__DATABASE", default_value = "bitcoin")]
+    database: String,
+    /// Connect over TLS (required by ClickHouse Cloud; use port 9440).
+    #[arg(long, env = "BIDX_CLICKHOUSE__SECURE")]
+    secure: bool,
+}
+
+impl From<ChArgs> for bidx_loader::ChConfig {
+    fn from(a: ChArgs) -> Self {
+        bidx_loader::ChConfig {
+            host: a.host,
+            port: a.port,
+            user: a.user,
+            password: a.password,
+            database: a.database,
+            secure: a.secure,
+        }
+    }
+}
+
 mod bench;
 mod diskguard;
 mod live;
@@ -51,7 +86,11 @@ pub mod testlock {
 }
 
 #[derive(Parser)]
-#[command(name = "bidx", version, about = "Bitcoin blockchain indexer: blk*.dat -> Parquet -> ClickHouse")]
+#[command(
+    name = "bidx",
+    version,
+    about = "Bitcoin blockchain indexer: blk*.dat -> Parquet -> ClickHouse"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -130,16 +169,8 @@ enum Cmd {
 
     /// Create ClickHouse schema (idempotent).
     InitDb {
-        #[arg(long, default_value = "localhost")]
-        host: String,
-        #[arg(long, default_value_t = 9000)]
-        port: u16,
-        #[arg(long, default_value = "default")]
-        user: String,
-        #[arg(long)]
-        password: Option<String>,
-        #[arg(long, default_value = "bitcoin")]
-        database: String,
+        #[command(flatten)]
+        ch: ChArgs,
     },
 
     /// Bulk-load Parquet files into ClickHouse.
@@ -147,37 +178,39 @@ enum Cmd {
         /// Parquet output directory from `parse`.
         #[arg(long)]
         input: PathBuf,
-        #[arg(long, default_value = "localhost")]
-        host: String,
-        #[arg(long, default_value_t = 9000)]
-        port: u16,
-        #[arg(long, default_value = "default")]
-        user: String,
-        #[arg(long)]
-        password: Option<String>,
-        #[arg(long, default_value = "bitcoin")]
-        database: String,
+        /// Stream the Parquet from this machine over the client connection
+        /// instead of having the server read it from its own `user_files`.
+        /// Required for ClickHouse Cloud or any server that cannot see the
+        /// output directory.
+        #[arg(long, env = "BIDX_LOAD__UPLOAD")]
+        upload: bool,
+        #[command(flatten)]
+        ch: ChArgs,
     },
 
     /// Track the chain tip live: reconcile with the node, apply new blocks,
     /// and handle reorgs via the UTXO undo log. Optionally appends to Parquet.
     Live {
         /// Bitcoin Core RPC URL.
-        #[arg(long, default_value = "http://127.0.0.1:8332")]
+        #[arg(
+            long,
+            env = "BIDX_NODE__RPC_URL",
+            default_value = "http://127.0.0.1:8332"
+        )]
         rpc_url: String,
         /// Path to the node's .cookie file (used if user/password not given).
-        #[arg(long)]
+        #[arg(long, env = "BIDX_NODE__COOKIE")]
         cookie: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, env = "BIDX_NODE__USER")]
         rpc_user: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "BIDX_NODE__PASSWORD", hide_env_values = true)]
         rpc_password: Option<String>,
         /// ZMQ hashblock endpoint, e.g. tcp://127.0.0.1:28332. If omitted,
         /// falls back to a 2s RPC poll loop.
-        #[arg(long)]
+        #[arg(long, env = "BIDX_LIVE__ZMQ")]
         zmq: Option<String>,
         /// RocksDB UTXO store path (must match the one used by `parse`).
-        #[arg(long)]
+        #[arg(long, env = "BIDX_LIVE__UTXO")]
         utxo: PathBuf,
         /// Optional Parquet output directory; if set, live blocks append to
         /// rolling part files in the same layout as `parse`.
@@ -208,18 +241,21 @@ enum Cmd {
         /// Insert each applied block directly into ClickHouse over the client's
         /// stdin, bypassing Parquet, so the tip is queryable within the block's
         /// own apply time. Mutually exclusive with `--out`.
-        #[arg(long)]
+        #[arg(long, env = "BIDX_LIVE__CH_LIVE")]
         ch_live: bool,
-        #[arg(long, default_value = "localhost")]
+        #[arg(long, env = "BIDX_CLICKHOUSE__HOST", default_value = "localhost")]
         ch_host: String,
-        #[arg(long, default_value_t = 9000)]
+        #[arg(long, env = "BIDX_CLICKHOUSE__PORT", default_value_t = 9000)]
         ch_port: u16,
-        #[arg(long, default_value = "default")]
+        #[arg(long, env = "BIDX_CLICKHOUSE__USER", default_value = "default")]
         ch_user: String,
-        #[arg(long)]
+        #[arg(long, env = "BIDX_CLICKHOUSE__PASSWORD", hide_env_values = true)]
         ch_password: Option<String>,
-        #[arg(long, default_value = "bitcoin")]
+        #[arg(long, env = "BIDX_CLICKHOUSE__DATABASE", default_value = "bitcoin")]
         ch_database: String,
+        /// Connect the direct-insert pipes over TLS.
+        #[arg(long, env = "BIDX_CLICKHOUSE__SECURE")]
+        ch_secure: bool,
     },
 
     /// Parse a single block at a height and print it as JSON (debug).
@@ -262,16 +298,8 @@ enum Cmd {
     /// coinbase per block, spend linking) plus optional agreement with a
     /// Bitcoin Core node tip. Exits non-zero when any hard check fails.
     Verify {
-        #[arg(long, default_value = "localhost")]
-        host: String,
-        #[arg(long, default_value_t = 9000)]
-        port: u16,
-        #[arg(long, default_value = "default")]
-        user: String,
-        #[arg(long)]
-        password: Option<String>,
-        #[arg(long, default_value = "bitcoin")]
-        database: String,
+        #[command(flatten)]
+        ch: ChArgs,
         /// Bitcoin Core RPC URL for the node-agreement check.
         #[arg(long)]
         rpc_url: Option<String>,
@@ -286,16 +314,8 @@ enum Cmd {
 
     /// Apply pending schema migrations and report the schema version.
     Migrate {
-        #[arg(long, default_value = "localhost")]
-        host: String,
-        #[arg(long, default_value_t = 9000)]
-        port: u16,
-        #[arg(long, default_value = "default")]
-        user: String,
-        #[arg(long)]
-        password: Option<String>,
-        #[arg(long, default_value = "bitcoin")]
-        database: String,
+        #[command(flatten)]
+        ch: ChArgs,
     },
 
     /// Benchmark the ingest pipeline: run bidx against a blocks directory
@@ -319,16 +339,8 @@ enum IndexAction {
         /// right base58/bech32 prefix. Ignored by the SQL-only backfills.
         #[arg(long, value_enum, default_value = "mainnet")]
         network: NetworkArg,
-        #[arg(long, default_value = "localhost")]
-        host: String,
-        #[arg(long, default_value_t = 9000)]
-        port: u16,
-        #[arg(long, default_value = "default")]
-        user: String,
-        #[arg(long)]
-        password: Option<String>,
-        #[arg(long, default_value = "bitcoin")]
-        database: String,
+        #[command(flatten)]
+        ch: ChArgs,
     },
 }
 
@@ -354,8 +366,8 @@ fn main() -> Result<()> {
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Headers { blocks_dir } => {
-            let (index, stats) = bidx_parser::build_chain_index(&blocks_dir)
-                .context("header pass failed")?;
+            let (index, stats) =
+                bidx_parser::build_chain_index(&blocks_dir).context("header pass failed")?;
             println!(
                 "scanned {} files, {} records, {} unique blocks",
                 stats.files_scanned, stats.total_records, stats.unique_blocks
@@ -402,40 +414,20 @@ fn run(cli: Cli) -> Result<()> {
             })?;
         }
 
-        Cmd::InitDb {
-            host,
-            port,
-            user,
-            password,
-            database,
-        } => {
-            let loader = bidx_loader::ChLoader::new(bidx_loader::ChConfig {
-                host,
-                port,
-                user,
-                password,
-                database,
-            })?;
+        Cmd::InitDb { ch } => {
+            let loader = bidx_loader::ChLoader::new(ch.into())?;
             loader.init_schema()?;
             println!("schema initialized");
         }
 
-        Cmd::Load {
-            input,
-            host,
-            port,
-            user,
-            password,
-            database,
-        } => {
-            let loader = bidx_loader::ChLoader::new(bidx_loader::ChConfig {
-                host,
-                port,
-                user,
-                password,
-                database,
-            })?;
-            loader.load_all(&input)?;
+        Cmd::Load { input, upload, ch } => {
+            let loader = bidx_loader::ChLoader::new(ch.into())?;
+            let mode = if upload {
+                bidx_loader::LoadMode::Upload
+            } else {
+                bidx_loader::LoadMode::ServerFile
+            };
+            loader.load_all_with(&input, mode)?;
             println!("load complete");
         }
 
@@ -449,22 +441,8 @@ fn run(cli: Cli) -> Result<()> {
                     println!("{:<26} {:<20} {}", spec.name, spec.mechanism, spec.target);
                 }
             }
-            IndexAction::Rebuild {
-                name,
-                network,
-                host,
-                port,
-                user,
-                password,
-                database,
-            } => {
-                let loader = bidx_loader::ChLoader::new(bidx_loader::ChConfig {
-                    host,
-                    port,
-                    user,
-                    password,
-                    database,
-                })?;
+            IndexAction::Rebuild { name, network, ch } => {
+                let loader = bidx_loader::ChLoader::new(ch.into())?;
                 if name == "address_prefix" {
                     // Needs base58/bech32 rendering, which the loader can't do.
                     let net: Network = network.into();
@@ -489,22 +467,14 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Serve { config } => serve::run_serve(serve::ServeArgs { config })?,
 
         Cmd::Verify {
-            host,
-            port,
-            user,
-            password,
-            database,
+            ch,
             rpc_url,
             rpc_cookie,
             rpc_user,
             rpc_password,
         } => {
             verify::run_verify(verify::VerifyArgs {
-                host,
-                port,
-                user,
-                password,
-                database,
+                ch: ch.into(),
                 rpc_url,
                 rpc_cookie,
                 rpc_user,
@@ -512,23 +482,14 @@ fn run(cli: Cli) -> Result<()> {
             })?;
         }
 
-        Cmd::Migrate {
-            host,
-            port,
-            user,
-            password,
-            database,
-        } => {
-            let loader = bidx_loader::ChLoader::new(bidx_loader::ChConfig {
-                host,
-                port,
-                user,
-                password,
-                database,
-            })?;
+        Cmd::Migrate { ch } => {
+            let loader = bidx_loader::ChLoader::new(ch.into())?;
             let applied = loader.migrate()?;
             if applied.is_empty() {
-                println!("schema up to date (version {})", bidx_loader::schema::SCHEMA_VERSION);
+                println!(
+                    "schema up to date (version {})",
+                    bidx_loader::schema::SCHEMA_VERSION
+                );
             } else {
                 println!("applied migrations: {applied:?}");
             }
@@ -554,6 +515,7 @@ fn run(cli: Cli) -> Result<()> {
             ch_user,
             ch_password,
             ch_database,
+            ch_secure,
         } => {
             live::run_live(live::LiveConfig {
                 rpc_url,
@@ -576,6 +538,7 @@ fn run(cli: Cli) -> Result<()> {
                     user: ch_user,
                     password: ch_password,
                     database: ch_database,
+                    secure: ch_secure,
                 },
             })?;
         }
@@ -612,10 +575,14 @@ mod tests {
         assert!(c.is_ok(), "{:?}", c.err());
         // Parse (minimal)
         let c = Cli::try_parse_from([
-            "bidx", "parse",
-            "--blocks-dir", "/tmp/x",
-            "--out", "/tmp/y",
-            "--utxo", "/tmp/z",
+            "bidx",
+            "parse",
+            "--blocks-dir",
+            "/tmp/x",
+            "--out",
+            "/tmp/y",
+            "--utxo",
+            "/tmp/z",
         ]);
         assert!(c.is_ok(), "{:?}", c.err());
         // Load
@@ -628,11 +595,7 @@ mod tests {
         let c = Cli::try_parse_from(["bidx", "live", "--utxo", "/tmp/z"]);
         assert!(c.is_ok(), "{:?}", c.err());
         // Bench with sensible args
-        let c = Cli::try_parse_from([
-            "bidx", "bench",
-            "--blocks-dir", "/tmp/x",
-            "--mode", "full",
-        ]);
+        let c = Cli::try_parse_from(["bidx", "bench", "--blocks-dir", "/tmp/x", "--mode", "full"]);
         assert!(c.is_ok(), "{:?}", c.err());
         // Serve with no config (defaults + env).
         let c = Cli::try_parse_from(["bidx", "serve"]);
@@ -667,7 +630,12 @@ mod tests {
         assert!(c.is_err());
         // Global log filter accepted.
         let c = Cli::try_parse_from([
-            "bidx", "--log", "bidx=debug", "headers", "--blocks-dir", "/tmp/x",
+            "bidx",
+            "--log",
+            "bidx=debug",
+            "headers",
+            "--blocks-dir",
+            "/tmp/x",
         ]);
         assert!(c.is_ok());
         assert_eq!(c.unwrap().log, "bidx=debug");
@@ -675,6 +643,69 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn ch_args_map_onto_loader_config_including_tls() {
+        let c = cli(&[
+            "bidx",
+            "init-db",
+            "--host",
+            "ch.cloud",
+            "--port",
+            "9440",
+            "--user",
+            "ingest",
+            "--password",
+            "pw",
+            "--database",
+            "btc",
+            "--secure",
+        ]);
+        let Cmd::InitDb { ch } = c.cmd else {
+            panic!("expected init-db")
+        };
+        let cfg: bidx_loader::ChConfig = ch.into();
+        assert_eq!(
+            (
+                cfg.host.as_str(),
+                cfg.port,
+                cfg.user.as_str(),
+                cfg.password.as_deref(),
+                cfg.database.as_str(),
+                cfg.secure
+            ),
+            ("ch.cloud", 9440, "ingest", Some("pw"), "btc", true)
+        );
+        // Defaults: plain TCP to localhost:9000, no password.
+        let Cmd::Migrate { ch } = cli(&["bidx", "migrate"]).cmd else {
+            panic!("expected migrate")
+        };
+        let cfg: bidx_loader::ChConfig = ch.into();
+        assert!(!cfg.secure && cfg.password.is_none() && cfg.port == 9000);
+        // load --upload and live --ch-secure parse.
+        let Cmd::Load { upload, .. } = cli(&["bidx", "load", "--input", "/x", "--upload"]).cmd
+        else {
+            panic!("expected load")
+        };
+        assert!(upload);
+        let Cmd::Live { ch_secure, .. } = cli(&["bidx", "live", "--utxo", "/x", "--ch-secure"]).cmd
+        else {
+            panic!("expected live")
+        };
+        assert!(ch_secure);
+    }
+
+    #[test]
+    fn run_load_upload_arm_reaches_success_with_a_fake_client() {
+        with_fake_client("upload", || {
+            let dir = std::env::temp_dir().join(format!("bidx-cli-upload-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join("blocks")).unwrap();
+            std::fs::write(dir.join("blocks").join("part-00000.parquet"), b"PAR1").unwrap();
+            let c = cli(&["bidx", "load", "--upload", "--input", dir.to_str().unwrap()]);
+            assert!(run(c).is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     /// Run `f` with `BIDX_CLICKHOUSE_CLIENT` pointing at a fake client that
@@ -711,7 +742,14 @@ mod tests {
     #[test]
     fn run_udf_config_prints_the_fragment_for_the_network() {
         // Pure: prints the XML fragment; no ClickHouse or child process.
-        let c = cli(&["bidx", "udf-config", "--udf-bin", "/opt/bidx-udf", "--network", "regtest"]);
+        let c = cli(&[
+            "bidx",
+            "udf-config",
+            "--udf-bin",
+            "/opt/bidx-udf",
+            "--network",
+            "regtest",
+        ]);
         assert!(run(c).is_ok());
     }
 
@@ -724,7 +762,14 @@ mod tests {
 
     #[test]
     fn run_inspect_fails_on_a_missing_block() {
-        let c = cli(&["bidx", "inspect", "--blocks-dir", "/definitely/not/here", "--height", "0"]);
+        let c = cli(&[
+            "bidx",
+            "inspect",
+            "--blocks-dir",
+            "/definitely/not/here",
+            "--height",
+            "0",
+        ]);
         assert!(run(c).is_err());
     }
 
@@ -818,7 +863,12 @@ mod tests {
             assert!(run(cli(&["bidx", "index", "rebuild", "address_prefix"])).is_ok());
             // An explicit network arg is accepted too.
             assert!(run(cli(&[
-                "bidx", "index", "rebuild", "address_prefix", "--network", "testnet3",
+                "bidx",
+                "index",
+                "rebuild",
+                "address_prefix",
+                "--network",
+                "testnet3",
             ]))
             .is_ok());
         });
@@ -895,11 +945,16 @@ mod tests {
     fn run_parse_arm_builds_config_then_fails_on_a_missing_dir() {
         let _g = testlock::fork_guard();
         let c = cli(&[
-            "bidx", "parse",
-            "--blocks-dir", "/definitely/not/here",
-            "--out", "/tmp/bidx-out",
-            "--utxo", "/tmp/bidx-utxo",
-            "--network", "regtest",
+            "bidx",
+            "parse",
+            "--blocks-dir",
+            "/definitely/not/here",
+            "--out",
+            "/tmp/bidx-out",
+            "--utxo",
+            "/tmp/bidx-utxo",
+            "--network",
+            "regtest",
         ]);
         assert!(run(c).is_err());
     }
@@ -908,9 +963,12 @@ mod tests {
     fn run_bench_arm_fails_on_a_missing_blocks_dir() {
         let _g = testlock::fork_guard();
         let c = cli(&[
-            "bidx", "bench",
-            "--blocks-dir", "/definitely/not/here",
-            "--mode", "headers",
+            "bidx",
+            "bench",
+            "--blocks-dir",
+            "/definitely/not/here",
+            "--mode",
+            "headers",
         ]);
         assert!(run(c).is_err());
     }
@@ -920,8 +978,10 @@ mod tests {
         let _g = testlock::fork_guard();
         // run_live fails fast when the UTXO store path cannot be created.
         let c = cli(&[
-            "bidx", "live",
-            "--utxo", "/proc/definitely/not/writable",
+            "bidx",
+            "live",
+            "--utxo",
+            "/proc/definitely/not/writable",
             "--skip-disk-check",
         ]);
         assert!(run(c).is_err());

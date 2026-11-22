@@ -24,8 +24,8 @@
 
 use anyhow::{Context, Result};
 use bidx_core::{
-    append_checkpoint, dir_size_bytes, free_space_bytes, projected_total_bytes,
-    read_checkpoints, DiskCheckpoint, Network,
+    append_checkpoint, dir_size_bytes, free_space_bytes, projected_total_bytes, read_checkpoints,
+    DiskCheckpoint, Network,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -217,13 +217,9 @@ impl DiskRecorder {
             height,
             total_bytes: total,
         };
-        append_checkpoint(&self.cfg.checkpoint_file, self.cfg.network, cp)
-            .with_context(|| {
-                format!(
-                    "write checkpoint to {}",
-                    self.cfg.checkpoint_file.display()
-                )
-            })?;
+        append_checkpoint(&self.cfg.checkpoint_file, self.cfg.network, cp).with_context(|| {
+            format!("write checkpoint to {}", self.cfg.checkpoint_file.display())
+        })?;
         info!(
             height,
             total_gib = format_args!("{:.2}", total as f64 / (1u64 << 30) as f64),
@@ -267,7 +263,8 @@ mod tests {
     }
 
     fn tmp_cfg(id: &str) -> (DiskGuardConfig, PathBuf) {
-        let tmp = std::env::temp_dir().join(format!("bidx-guard-test-{}-{}", std::process::id(), id));
+        let tmp =
+            std::env::temp_dir().join(format!("bidx-guard-test-{}-{}", std::process::id(), id));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let ck = tmp.join("ckpt.txt");
@@ -290,7 +287,10 @@ mod tests {
         append_checkpoint(
             &ck,
             Network::Mainnet,
-            DiskCheckpoint { height: 100_000, total_bytes: 1 << 30 },
+            DiskCheckpoint {
+                height: 100_000,
+                total_bytes: 1 << 30,
+            },
         )
         .unwrap();
         let r = cfg.run_pre_flight(1_000_000_000, 100_000, bidx_core::MIN_FREE_BYTES);
@@ -305,7 +305,9 @@ mod tests {
     fn pre_flight_succeeds_with_no_checkpoints() {
         let (cfg, _ck) = tmp_cfg("nockpt");
         // No checkpoints: projection unavailable, but must not crash.
-        let r = cfg.run_pre_flight(900_000, 0, bidx_core::MIN_FREE_BYTES).unwrap();
+        let r = cfg
+            .run_pre_flight(900_000, 0, bidx_core::MIN_FREE_BYTES)
+            .unwrap();
         assert_eq!(r.checkpoints_used, 0);
         // Fields are populated sensibly.
         assert_eq!(r.network, Network::Mainnet);
@@ -327,8 +329,15 @@ mod tests {
         cfg.tracked_dirs = vec![tiny.clone()];
         // Historical growth: 0.5 GiB per 100k blocks — 0.005 B/blk.
         for (h, bytes) in [(100_000u32, 1u64 << 29), (200_000u32, 1u64 << 30)] {
-            append_checkpoint(&ck, Network::Mainnet, DiskCheckpoint { height: h, total_bytes: bytes })
-                .unwrap();
+            append_checkpoint(
+                &ck,
+                Network::Mainnet,
+                DiskCheckpoint {
+                    height: h,
+                    total_bytes: bytes,
+                },
+            )
+            .unwrap();
         }
         // Currently indexed 200k, total 1 GiB on disk; project another 200k blocks.
         let r = cfg.run_pre_flight(400_000, 200_000, 0).unwrap();
@@ -396,7 +405,15 @@ mod tests {
         let _g = env_lock();
         std::env::set_var("BIDX_DISK_CHECKPOINT_STEP", "10");
         let (cfg, ck) = tmp_cfg("boots");
-        append_checkpoint(&ck, Network::Mainnet, DiskCheckpoint { height: 20, total_bytes: 1 }).unwrap();
+        append_checkpoint(
+            &ck,
+            Network::Mainnet,
+            DiskCheckpoint {
+                height: 20,
+                total_bytes: 1,
+            },
+        )
+        .unwrap();
         let rec = DiskRecorder::new(cfg);
         // Re-seeded from existing file: below-max h is rejected.
         assert!(!rec.on_block_applied(10).unwrap());
@@ -441,7 +458,15 @@ mod tests {
         std::fs::create_dir_all(&tiny).unwrap();
         std::fs::write(tiny.join("only"), [0u8; 32]).unwrap();
         cfg2.tracked_dirs = vec![tiny.clone()];
-        append_checkpoint(&ck2, Network::Mainnet, DiskCheckpoint { height: 100_000, total_bytes: 1 << 20 }).unwrap();
+        append_checkpoint(
+            &ck2,
+            Network::Mainnet,
+            DiskCheckpoint {
+                height: 100_000,
+                total_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
         let r2 = cfg2.run_pre_flight(200_000, 100_000, 0).unwrap();
         assert_eq!(r2.checkpoints_used, 1);
 
@@ -452,7 +477,9 @@ mod tests {
         let (cfg3, ck3) = tmp_cfg("log-rec");
         let rec = DiskRecorder::new(cfg3.clone());
         assert!(rec.on_block_applied(5).unwrap());
-        assert!(read_checkpoints(&ck3, Network::Mainnet).iter().any(|c| c.height == 5));
+        assert!(read_checkpoints(&ck3, Network::Mainnet)
+            .iter()
+            .any(|c| c.height == 5));
 
         std::env::remove_var("BIDX_DISK_CHECKPOINT_STEP");
         let _ = std::fs::remove_dir_all(&tiny);

@@ -42,9 +42,7 @@ pub fn bech32_hrp(network: Network) -> &'static str {
 fn base58_versions(network: Network) -> (u8, u8) {
     match network {
         Network::Mainnet => (0x00, 0x05),
-        Network::Testnet3 | Network::Testnet4 | Network::Signet | Network::Regtest => {
-            (0x6f, 0xc4)
-        }
+        Network::Testnet3 | Network::Testnet4 | Network::Signet | Network::Regtest => (0x6f, 0xc4),
     }
 }
 
@@ -167,8 +165,7 @@ pub fn scripthash_of(script_type: u8, address_hash: &[u8; 32]) -> Option<[u8; 32
 // base58check
 // ---------------------------------------------------------------------------
 
-const B58_ALPHABET: &[u8; 58] =
-    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const B58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 fn base58_encode(input: &[u8]) -> String {
     let mut digits: Vec<u8> = vec![0];
@@ -267,7 +264,13 @@ fn base58check_decode(s: &str) -> Option<(Vec<u8>, bool)> {
 // ---------------------------------------------------------------------------
 
 fn bech32_polymod(values: &[u8]) -> u32 {
-    const GEN: [u32; 5] = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    const GEN: [u32; 5] = [
+        0x3b6a_57b2,
+        0x2650_8e6d,
+        0x1ea1_19fa,
+        0x3d42_33dd,
+        0x2a14_62b3,
+    ];
     let mut chk: u32 = 1;
     for &v in values {
         let b = chk >> 25;
@@ -341,7 +344,11 @@ fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Option<Vec<u8>> {
 
 /// Encode a segwit address. `version` 0 uses bech32; 1..16 use bech32m.
 fn segwit_encode(hrp: &str, version: u8, program: &[u8]) -> String {
-    let constant = if version == 0 { BECH32_CONST } else { BECH32M_CONST };
+    let constant = if version == 0 {
+        BECH32_CONST
+    } else {
+        BECH32M_CONST
+    };
     let mut data = vec![version];
     let converted = convert_bits(program, 8, 5, true).expect("program fits in 5-bit groups");
     data.extend_from_slice(&converted);
@@ -492,9 +499,17 @@ mod tests {
         // Bad base58 checksum.
         assert!(parse_address(Network::Mainnet, "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divfna").is_none());
         // Bad bech32 checksum.
-        assert!(parse_address(Network::Mainnet, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5").is_none());
+        assert!(parse_address(
+            Network::Mainnet,
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5"
+        )
+        .is_none());
         // Mixed case is invalid in bech32.
-        assert!(parse_address(Network::Mainnet, "bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4").is_none());
+        assert!(parse_address(
+            Network::Mainnet,
+            "bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4"
+        )
+        .is_none());
         // Too short.
         assert!(parse_address(Network::Mainnet, "bc1q").is_none());
         // Empty.
@@ -509,8 +524,14 @@ mod tests {
 
     #[test]
     fn op_return_and_unknown_have_no_address() {
-        assert_eq!(render_address(Network::Mainnet, ScriptType::OpReturn as u8, &[0u8; 32]), None);
-        assert_eq!(render_address(Network::Mainnet, ScriptType::Unknown as u8, &[0u8; 32]), None);
+        assert_eq!(
+            render_address(Network::Mainnet, ScriptType::OpReturn as u8, &[0u8; 32]),
+            None
+        );
+        assert_eq!(
+            render_address(Network::Mainnet, ScriptType::Unknown as u8, &[0u8; 32]),
+            None
+        );
     }
 
     #[test]

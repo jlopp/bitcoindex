@@ -110,10 +110,10 @@ impl NodeClient {
                 "no rpc credentials: provide user/password or cookie_path".into(),
             ));
         };
-        let auth_header = format!("Basic {}", base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            auth,
-        ));
+        let auth_header = format!(
+            "Basic {}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth,)
+        );
         let http = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()?;
@@ -131,7 +131,11 @@ impl NodeClient {
         NodeClient { transport }
     }
 
-    fn call<T: for<'de> Deserialize<'de>>(&self, method: &str, params: serde_json::Value) -> Result<T, RpcError> {
+    fn call<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, RpcError> {
         let body = serde_json::json!({
             "jsonrpc": "1.0",
             "id": "bidx",
@@ -194,18 +198,15 @@ impl NodeClient {
             // Walk back along this branch to collect hashes.
             let mut cur_hash: Hash32 = match Hash32::from_hex(&tip.hash) {
                 Ok(h) => h,
-                Err(e) => return Err(RpcError::BadResponse(format!(
-                    "getchaintips bad hash: {e}"
-                ))),
+                Err(e) => return Err(RpcError::BadResponse(format!("getchaintips bad hash: {e}"))),
             };
             for _ in 0..tip.branch_len {
                 out.insert(cur_hash);
                 let hdr: BlockHeaderInfo = self.get_block_header(&cur_hash)?;
                 match hdr.previous.as_deref() {
                     Some(prev) => {
-                        cur_hash = Hash32::from_hex(prev).map_err(|e| {
-                            RpcError::BadResponse(e.to_string())
-                        })?;
+                        cur_hash = Hash32::from_hex(prev)
+                            .map_err(|e| RpcError::BadResponse(e.to_string()))?;
                     }
                     None => break,
                 }
@@ -230,7 +231,10 @@ mod tests {
 
     impl ScriptTransport {
         fn scripted(resp_list: Vec<serde_json::Value>) -> Self {
-            ScriptTransport { script: resp_list, calls: AtomicUsize::new(0) }
+            ScriptTransport {
+                script: resp_list,
+                calls: AtomicUsize::new(0),
+            }
         }
     }
 
@@ -303,7 +307,10 @@ mod tests {
         assert_eq!(c.get_block_raw(&h).unwrap(), raw);
 
         let c = client_with(vec![serde_json::json!({ "result": "xx", "error": null })]);
-        assert!(matches!(c.get_block_raw(&Hash32::ZERO), Err(RpcError::BadResponse(_))));
+        assert!(matches!(
+            c.get_block_raw(&Hash32::ZERO),
+            Err(RpcError::BadResponse(_))
+        ));
     }
 
     #[test]
@@ -421,7 +428,10 @@ mod tests {
             tips,
             parents: Default::default(),
         }));
-        assert!(matches!(c.orphan_block_hashes(), Err(RpcError::BadResponse(_))));
+        assert!(matches!(
+            c.orphan_block_hashes(),
+            Err(RpcError::BadResponse(_))
+        ));
     }
 
     #[test]
@@ -515,7 +525,10 @@ mod tests {
             }
         }
         let c = NodeClient::with_transport(Box::new(BadParent(tip)));
-        assert!(matches!(c.orphan_block_hashes(), Err(RpcError::BadResponse(_))));
+        assert!(matches!(
+            c.orphan_block_hashes(),
+            Err(RpcError::BadResponse(_))
+        ));
     }
 
     /// A one-shot HTTP server that answers a single request with a fixed body,

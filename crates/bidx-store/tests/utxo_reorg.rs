@@ -130,7 +130,11 @@ fn apply_then_disconnect_restores_utxo() {
     let ins2b = vec![coinbase_in(2, 0, 0xB9), sp_in2];
     let outs2b = vec![coinbase_out(2, 0, 0xB9, 5_000_000_000), sp_out2];
     let r2b = utxo.apply_block(2, &txs2b, &ins2b, &outs2b).unwrap();
-    assert_eq!(r2b.spends.len(), 1, "A must be spendable again after disconnect");
+    assert_eq!(
+        r2b.spends.len(),
+        1,
+        "A must be spendable again after disconnect"
+    );
     assert_eq!(r2b.fees[1], 500_000_000, "fee = 50 in - 45 out");
 
     // Disconnect the competing block, then block 1 (full unwind to genesis).

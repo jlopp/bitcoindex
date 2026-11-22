@@ -65,6 +65,11 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.title="bitcoindex" \
+      org.opencontainers.image.description="Bitcoin blockchain indexer: Parquet/ClickHouse pipeline plus Esplora/Electrum-compatible serving API" \
+      org.opencontainers.image.source="https://github.com/jameson/bitcoindex" \
+      org.opencontainers.image.licenses="MIT"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libzmq5 \

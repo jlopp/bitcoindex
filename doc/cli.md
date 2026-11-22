@@ -122,6 +122,14 @@ bidx live \
 | `--ch-user <USER>` | `default` | ClickHouse user for `--ch-live`. |
 | `--ch-password <PASS>` | *(none)* | ClickHouse password for `--ch-live`. |
 | `--ch-database <DB>` | `bitcoin` | ClickHouse database for `--ch-live`. |
+| `--ch-secure` | off | Connect the direct-insert pipes over TLS (native port, usually `9440`). |
+
+Every node, ZMQ, UTXO and ClickHouse flag above also reads an env var, so a
+container can be configured without arguments: `BIDX_NODE__RPC_URL`,
+`BIDX_NODE__COOKIE`, `BIDX_NODE__USER`, `BIDX_NODE__PASSWORD`,
+`BIDX_LIVE__ZMQ`, `BIDX_LIVE__UTXO`, `BIDX_LIVE__CH_LIVE`, and
+`BIDX_CLICKHOUSE__{HOST,PORT,USER,PASSWORD,DATABASE,SECURE}`. An explicit
+flag wins over the env var.
 
 Notes:
 
@@ -150,24 +158,40 @@ bidx init-db --database bitcoin
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host <HOST>` | `localhost` | ClickHouse host. |
-| `--port <PORT>` | `9000` | **Native** protocol port (used via `clickhouse-client`). |
+| `--port <PORT>` | `9000` | **Native** protocol port (used via `clickhouse-client`); `9440` for TLS. |
 | `--user <USER>` | `default` | ClickHouse user. |
 | `--password <PASS>` | *(none)* | ClickHouse password. |
 | `--database <DB>` | `bitcoin` | Database name. |
+| `--secure` | off | Connect over TLS (`clickhouse-client --secure`), as managed services require. |
 
 Requires `clickhouse-client` on `PATH` (or `BIDX_CLICKHOUSE_CLIENT` pointing at
 a client binary).
+
+The same connection flags (`--host`, `--port`, `--user`, `--password`,
+`--database`, `--secure`) are shared by `load`, `migrate`, `verify`, and
+`index rebuild`, and each falls back to an env var:
+`BIDX_CLICKHOUSE__HOST`, `__PORT`, `__USER`, `__PASSWORD`, `__DATABASE`,
+`__SECURE`.
 
 ---
 
 ## load
 
-Bulk-load Parquet files into ClickHouse using the `file()` table function over
-a Parquet glob, one entity at a time. Derived index tables are populated
-automatically by the materialized views.
+Bulk-load Parquet files into ClickHouse, one entity at a time. Derived index
+tables are populated automatically by the materialized views.
+
+By default the load is **server-side**: ClickHouse reads the Parquet through
+its `file()` table function, so the files must be visible to the ClickHouse
+server (the Compose stack mounts them into `user_files`). With `--upload`,
+each file is instead streamed from this machine over the client connection
+(`INSERT … FORMAT Parquet`). Use `--upload` for remote or managed ClickHouse
+that cannot see your filesystem.
 
 ```bash
 bidx load --input ./out --database bitcoin
+# Managed ClickHouse over TLS:
+bidx load --input ./out --upload --secure --host abc.clickhouse.cloud --port 9440 \
+  --user default --password "$CH_PASSWORD"
 ```
 
 | Flag | Default | Description |
@@ -178,6 +202,8 @@ bidx load --input ./out --database bitcoin
 | `--user <USER>` | `default` | ClickHouse user. |
 | `--password <PASS>` | *(none)* | ClickHouse password. |
 | `--database <DB>` | `bitcoin` | Database name. |
+| `--secure` | off | Connect over TLS. |
+| `--upload` | off | Stream Parquet from the client instead of reading it server-side (env `BIDX_LOAD__UPLOAD`). |
 
 Run `bidx init-db` first. Loading is per-entity, so a failed load retries
 cleanly.
@@ -200,6 +226,7 @@ bidx migrate --database bitcoin
 | `--user <USER>` | `default` | ClickHouse user. |
 | `--password <PASS>` | *(none)* | ClickHouse password. |
 | `--database <DB>` | `bitcoin` | Database name. |
+| `--secure` | off | Connect over TLS. |
 
 Prints `schema up to date (version N)` when nothing was pending, otherwise
 `applied migrations: [...]`.
@@ -244,6 +271,7 @@ bidx index rebuild address_prefix --network mainnet --database bitcoin
 | `--user <USER>` | `default` | ClickHouse user. |
 | `--password <PASS>` | *(none)* | ClickHouse password. |
 | `--database <DB>` | `bitcoin` | Database name. |
+| `--secure` | off | Connect over TLS. |
 
 ---
 
@@ -267,7 +295,13 @@ Two listeners:
 - `metrics_addr` (default `0.0.0.0:9101`) — `/metrics`, `/healthz`, `/readyz`.
 
 The serve layer talks to ClickHouse over its **HTTP** port (`http_port`,
-default `8123`), not the native `9000` port used by `init-db`/`load`.
+default `8123`), not the native `9000` port used by `init-db`/`load`. It can
+use HTTPS (`clickhouse.scheme = "https"`) and a comma-separated replica list
+with failover.
+
+`serve` handles SIGTERM/SIGINT gracefully: `/readyz` turns 503, the API keeps
+serving for `server.drain_delay_secs`, then stops accepting and waits up to
+`server.shutdown_timeout_secs` for in-flight requests before exiting 0.
 
 ---
 
@@ -287,6 +321,7 @@ bidx verify --database bitcoin --rpc-url http://127.0.0.1:8332
 | `--user <USER>` | `default` | ClickHouse user. |
 | `--password <PASS>` | *(none)* | ClickHouse password. |
 | `--database <DB>` | `bitcoin` | Database name. |
+| `--secure` | off | Connect over TLS. |
 | `--rpc-url <URL>` | *(none)* | Enables the node-agreement check. |
 | `--rpc-cookie <PATH>` | *(none)* | Node `.cookie` file. |
 | `--rpc-user <USER>` | *(none)* | Explicit RPC user. |
@@ -454,7 +489,11 @@ bidx index rebuild address_prefix --network mainnet --database bitcoin
 | `BIDX_API_ADDR`, `BIDX_METRICS_ADDR` | `serve` listener addresses. |
 | `BIDX_ESPLORA_ENABLED`, `BIDX_ELECTRUM_ENABLED` | Toggle the two serving surfaces. |
 | `BIDX_RUST_LOG` | `serve` log filter. |
-| `BIDX_CLICKHOUSE__{HOST,PORT,HTTP_PORT,USER,PASSWORD,DATABASE,TIMEOUT_SECS}` | `serve` ClickHouse settings (`__` nests). |
-| `BIDX_NODE__{RPC_URL,COOKIE}` | `serve` node connection. |
+| `BIDX_CLICKHOUSE__{HOST,PORT,USER,PASSWORD,DATABASE,SECURE}` | ClickHouse connection for `init-db`, `load`, `migrate`, `verify`, `index rebuild`, and `live --ch-live`. |
+| `BIDX_CLICKHOUSE__{SCHEME,HTTP_PORT,TIMEOUT_SECS}` | `serve`-only ClickHouse settings; `serve` also accepts a comma-separated `HOST` list. |
+| `BIDX_LOAD__UPLOAD` | `load --upload`. |
+| `BIDX_NODE__{RPC_URL,COOKIE,USER,PASSWORD}` | Node connection for `live` (and `serve`'s RPC URL/cookie). |
+| `BIDX_LIVE__{ZMQ,UTXO,CH_LIVE}` | `live` flags. |
+| `BIDX_SERVER__*`, `BIDX_CACHE__*`, `BIDX_AUTH__*`, `BIDX_RATE_LIMIT__*` | `serve` server sizing, cache, API keys, rate limits. |
 
 See [serving-api.md](serving-api.md) for the full configuration reference.

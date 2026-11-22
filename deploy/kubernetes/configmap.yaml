@@ -1,0 +1,71 @@
+# Non-secret configuration. Secrets (ClickHouse password, API keys, node RPC
+# credentials) come from the `bidx-secrets` Secret as BIDX_* env vars, which
+# override this file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bidx-config
+data:
+  bidx.toml: |
+    network = "mainnet"
+    api_addr = "0.0.0.0:8432"
+    metrics_addr = "0.0.0.0:9101"
+    esplora_enabled = true
+    electrum_enabled = true
+    log = "info"
+
+    [clickhouse]
+    # One host, or a comma-separated replica list the serve pods rotate
+    # across with failover, e.g. "ch-0.ch:8123, ch-1.ch:8123".
+    host = "clickhouse.clickhouse.svc.cluster.local"
+    # "https" for managed ClickHouse (ClickHouse Cloud, Altinity, Aiven...),
+    # usually with http_port = 8443.
+    scheme = "http"
+    http_port = 8123
+    user = "bidx_reader"
+    database = "bitcoin"
+    timeout_secs = 10
+
+    [server]
+    workers = 256
+    queue = 1024
+    keep_alive_secs = 5
+    max_requests_per_conn = 1000
+    # Must be < terminationGracePeriodSeconds - shutdown_timeout_secs.
+    drain_delay_secs = 5
+    shutdown_timeout_secs = 25
+    # The Ingress controller / cloud LB sets X-Forwarded-For.
+    trust_forwarded_for = true
+
+    [cache]
+    enabled = true
+    max_entries = 50000
+    tip_ttl_ms = 1000
+    address_ttl_ms = 2000
+    immutable_ttl_secs = 300
+    confirmations = 6
+
+    [auth]
+    # Keys come from BIDX_AUTH__KEYS in the Secret.
+    required = false
+
+    [rate_limit]
+    # Anonymous per-client-IP limit; 0 disables.
+    per_ip_rps = 20.0
+    per_ip_burst = 40.0
+---
+# Ingest settings, consumed as env (envFrom) by `bidx live`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bidx-ingest-env
+data:
+  # The PVC is mounted at /data; the disk-space checkpoint file is written
+  # next to the UTXO dir, so /data must be writable.
+  BIDX_LIVE__UTXO: /data/utxo
+  BIDX_LIVE__ZMQ: tcp://bitcoind.bitcoin.svc.cluster.local:28332
+  BIDX_NODE__RPC_URL: http://bitcoind.bitcoin.svc.cluster.local:8332
+  # The writer uses the native protocol (clickhouse-client). One host only.
+  BIDX_CLICKHOUSE__HOST: clickhouse.clickhouse.svc.cluster.local
+  BIDX_CLICKHOUSE__PORT: "9000"
+  BIDX_CLICKHOUSE__DATABASE: bitcoin

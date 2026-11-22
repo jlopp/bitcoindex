@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use bidx_serve::config::Config;
 use bidx_serve::health::Health;
 use bidx_serve::metrics::Metrics;
-use bidx_serve::service::{serve, serve_listener, Service};
+use bidx_serve::server::{serve, serve_until, ServerOptions};
+use bidx_serve::service::Service;
+use bidx_serve::shutdown::{self, Shutdown};
 use bidx_serve::store::{ChHttpTransport, Store};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,20 +25,21 @@ pub struct ServeArgs {
 /// this is directly testable.
 pub fn build_service(cfg: Config) -> Result<Arc<Service>> {
     cfg.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let transport = ChHttpTransport::with_database(
-        &cfg.clickhouse.host,
-        cfg.clickhouse.http_port,
-        &cfg.clickhouse.user,
-        cfg.clickhouse.password.clone(),
-        &cfg.clickhouse.database,
-        cfg.clickhouse.timeout_secs,
+    let ch = &cfg.clickhouse;
+    let transport = ChHttpTransport::with_endpoints(
+        &ch.scheme,
+        &ch.hosts(),
+        ch.http_port,
+        &ch.user,
+        ch.password.clone(),
+        &ch.database,
+        ch.timeout_secs,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let store = Arc::new(Store::new(
-        Box::new(transport),
-        cfg.clickhouse.database.clone(),
-    ));
-    let metrics = Arc::new(Metrics::new());
+    tracing::info!(endpoints = ?transport.endpoint_urls(), "clickhouse transport");
+    let store = Arc::new(Store::new(Box::new(transport), ch.database.clone()));
+    let tenants: Vec<&str> = cfg.auth.keys.iter().map(|k| k.name.as_str()).collect();
+    let metrics = Arc::new(Metrics::with_tenants(&tenants));
     let health = Arc::new(Health::new());
     Ok(Arc::new(Service::new(
         store,
@@ -57,11 +60,23 @@ pub fn run_serve(args: ServeArgs) -> Result<()> {
 /// blocking API loop (`serve` in production).
 pub fn run_serve_with<F>(cfg: Config, serve_fn: F) -> Result<()>
 where
-    F: FnOnce(&str, Arc<Service>) -> std::io::Result<()>,
+    F: FnOnce(&str, Arc<Service>, Arc<Shutdown>) -> std::io::Result<()>,
 {
     let metrics_addr = cfg.metrics_addr.clone();
     let api_addr = cfg.api_addr.clone();
+    let drain_delay = Duration::from_secs(cfg.server.drain_delay_secs);
     let service = build_service(cfg)?;
+
+    // SIGTERM → not-ready → drain delay → stop accepting → finish in-flight.
+    let stop = Arc::new(Shutdown::new());
+    shutdown::install_signal_handlers().context("installing signal handlers")?;
+    {
+        let (stop, svc) = (stop.clone(), service.clone());
+        std::thread::spawn(move || {
+            shutdown::wait_for_signal(Duration::from_millis(100));
+            stop.drain(&svc.health, &svc.metrics, drain_delay);
+        });
+    }
 
     // Prime readiness/metrics before accepting traffic.
     service.refresh_health();
@@ -75,20 +90,29 @@ where
         });
     }
 
-    // Ops listener (metrics/health) on its own address, if distinct. Bind
+    // Ops listener (metrics/health) on its own address and small pool. Bind
     // synchronously so a bad address is logged immediately rather than
-    // surfacing later inside a detached thread.
+    // surfacing later inside a detached thread. It is never stopped: probes
+    // must keep seeing `/readyz` = 503 for the whole drain.
     match std::net::TcpListener::bind(&metrics_addr) {
         Ok(listener) => {
             tracing::info!("bidx metrics listening on {metrics_addr}");
             let svc = service.clone();
-            std::thread::spawn(move || serve_listener(listener, svc));
+            std::thread::spawn(move || {
+                serve_until(
+                    listener,
+                    svc,
+                    ServerOptions::ops(),
+                    Arc::new(Shutdown::new()),
+                )
+            });
         }
         Err(e) => tracing::error!("failed to bind metrics addr {metrics_addr}: {e}"),
     }
 
-    // Main API listener (blocks).
-    serve_fn(&api_addr, service).context("serve failed")?;
+    // Main API listener (blocks until drained).
+    serve_fn(&api_addr, service, stop).context("serve failed")?;
+    tracing::info!("bidx serve stopped");
     Ok(())
 }
 
@@ -135,11 +159,15 @@ mod tests {
         cfg.api_addr = "127.0.0.1:18432".into();
 
         let mut primed = false;
-        let res = run_serve_with(cfg, |addr, svc| {
+        let res = run_serve_with(cfg, |addr, svc, _stop| {
             // The API address is forwarded verbatim.
             assert_eq!(addr, "127.0.0.1:18432");
             // Startup must have primed the metrics/health state already.
-            primed = svc.metrics.registry.render().contains("bidx_indexed_height");
+            primed = svc
+                .metrics
+                .registry
+                .render()
+                .contains("bidx_indexed_height");
             Ok(())
         });
         assert!(res.is_ok(), "{res:?}");
@@ -154,7 +182,7 @@ mod tests {
         cfg.metrics_addr = "not-a-valid-addr:99999".into();
         cfg.api_addr = "127.0.0.1:18433".into();
 
-        let res = run_serve_with(cfg, |_, _| {
+        let res = run_serve_with(cfg, |_, _, _| {
             Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "boom"))
         });
         let e = res.unwrap_err();
@@ -175,8 +203,56 @@ mod tests {
         )
         .unwrap();
 
-        let e = run_serve(ServeArgs { config: Some(cfg_path) }).unwrap_err();
+        let e = run_serve(ServeArgs {
+            config: Some(cfg_path),
+        })
+        .unwrap_err();
         assert!(e.to_string().contains("serve failed"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sigterm_drains_then_stops_the_api_listener() {
+        let mut cfg = Config {
+            api_addr: "127.0.0.1:18434".into(),
+            metrics_addr: "127.0.0.1:0".into(),
+            ..Config::default()
+        };
+        cfg.server.drain_delay_secs = 0;
+        let res = run_serve_with(cfg, |_, svc, stop| {
+            assert!(!stop.is_stopping());
+            // SAFETY: run_serve_with installed a handler for SIGTERM.
+            unsafe {
+                libc::raise(libc::SIGTERM);
+            }
+            for _ in 0..500 {
+                if stop.is_stopping() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(stop.is_stopping(), "watcher drained and stopped");
+            assert!(svc.health.draining());
+            Ok(())
+        });
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[test]
+    fn build_service_wires_replica_list_and_tenant_metrics() {
+        let mut cfg = Config::default();
+        cfg.clickhouse.host = "a, b:8443".into();
+        cfg.clickhouse.scheme = "https".into();
+        cfg.auth.keys = vec![bidx_serve::config::ApiKey {
+            name: "acme".into(),
+            token_sha256: bidx_serve::config::ApiKey::hash_token("t"),
+            rate_per_sec: 0.0,
+            burst: 1.0,
+        }];
+        let svc = build_service(cfg).unwrap();
+        assert!(svc
+            .metrics
+            .render()
+            .contains("bidx_tenant_requests_total{tenant=\"acme\"} 0\n"));
     }
 }

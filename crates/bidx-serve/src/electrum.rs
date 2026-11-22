@@ -86,7 +86,8 @@ impl<'a> Electrum<'a> {
             .get(0)
             .and_then(|v| v.as_str())
             .ok_or_else(|| RpcError::invalid_params("missing scripthash"))?;
-        let wire = store::reverse_hex(sh).map_err(|_| RpcError::invalid_params("bad scripthash"))?;
+        let wire =
+            store::reverse_hex(sh).map_err(|_| RpcError::invalid_params("bad scripthash"))?;
         let bytes =
             store::parse_hex32(&wire).map_err(|_| RpcError::invalid_params("bad scripthash"))?;
         self.store
@@ -231,11 +232,23 @@ mod tests {
     fn server_methods() {
         let (s, _) = store(&[], r#"{"data":[],"rows":0}"#);
         let e = Electrum::new(&s, &cfg());
-        assert_eq!(e.handle("server.version", &json!([])).unwrap(), json!(["bidx", "1.4"]));
+        assert_eq!(
+            e.handle("server.version", &json!([])).unwrap(),
+            json!(["bidx", "1.4"])
+        );
         assert_eq!(e.handle("server.ping", &json!([])).unwrap(), Value::Null);
-        assert_eq!(e.handle("blockchain.estimatefee", &json!([2])).unwrap(), json!(-1));
-        assert_eq!(e.handle("blockchain.relayfee", &json!([])).unwrap(), json!(0.00001));
-        assert_eq!(e.handle("mempool.get_fee_histogram", &json!([])).unwrap(), json!([]));
+        assert_eq!(
+            e.handle("blockchain.estimatefee", &json!([2])).unwrap(),
+            json!(-1)
+        );
+        assert_eq!(
+            e.handle("blockchain.relayfee", &json!([])).unwrap(),
+            json!(0.00001)
+        );
+        assert_eq!(
+            e.handle("mempool.get_fee_histogram", &json!([])).unwrap(),
+            json!([])
+        );
         assert!(e.handle("bogus.method", &json!([])).is_err());
     }
 
@@ -258,17 +271,23 @@ mod tests {
         );
         let e = Electrum::new(&s, &cfg());
 
-        let r = e.handle("blockchain.headers.subscribe", &json!([])).unwrap();
+        let r = e
+            .handle("blockchain.headers.subscribe", &json!([]))
+            .unwrap();
         assert_eq!(r["height"], 800000);
         assert_eq!(r["hex"].as_str().unwrap().len(), 160);
 
-        let r = e.handle("blockchain.block.header", &json!([800000])).unwrap();
+        let r = e
+            .handle("blockchain.block.header", &json!([800000]))
+            .unwrap();
         assert_eq!(r.as_str().unwrap().len(), 160);
 
         // Missing height param.
         assert!(e.handle("blockchain.block.header", &json!([])).is_err());
         // Out-of-range height.
-        assert!(e.handle("blockchain.block.header", &json!([999999])).is_err());
+        assert!(e
+            .handle("blockchain.block.header", &json!([999999]))
+            .is_err());
     }
 
     #[test]
@@ -291,7 +310,9 @@ mod tests {
             r#"{"data":[],"rows":0}"#,
         );
         let e = Electrum::new(&s, &cfg());
-        let r = e.handle("blockchain.block.headers", &json!([10, 5])).unwrap();
+        let r = e
+            .handle("blockchain.block.headers", &json!([10, 5]))
+            .unwrap();
         assert_eq!(r["count"], 2, "stops at the first missing height");
         assert_eq!(r["hex"].as_str().unwrap().len(), 320);
         assert_eq!(r["max"], 2016);
@@ -330,22 +351,30 @@ mod tests {
         let e = Electrum::new(&s, &cfg());
         let sh = hex64(0x55); // display-order scripthash
 
-        let r = e.handle("blockchain.scripthash.get_balance", &json!([sh])).unwrap();
+        let r = e
+            .handle("blockchain.scripthash.get_balance", &json!([sh]))
+            .unwrap();
         assert_eq!(r["confirmed"], 6000);
         assert_eq!(r["unconfirmed"], 0);
 
-        let r = e.handle("blockchain.scripthash.get_history", &json!([sh])).unwrap();
+        let r = e
+            .handle("blockchain.scripthash.get_history", &json!([sh]))
+            .unwrap();
         let arr = r.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["tx_hash"], hex64(0xaa));
         assert_eq!(arr[0]["height"], 50);
 
-        let r = e.handle("blockchain.scripthash.listunspent", &json!([sh])).unwrap();
+        let r = e
+            .handle("blockchain.scripthash.listunspent", &json!([sh]))
+            .unwrap();
         assert_eq!(r[0]["tx_hash"], hex64(0xaa));
         assert_eq!(r[0]["tx_pos"], 2);
         assert_eq!(r[0]["value"], 6000);
 
-        let r = e.handle("blockchain.scripthash.get_mempool", &json!([sh])).unwrap();
+        let r = e
+            .handle("blockchain.scripthash.get_mempool", &json!([sh]))
+            .unwrap();
         assert_eq!(r, json!([]));
     }
 
@@ -356,7 +385,10 @@ mod tests {
             r#"{{"data":[{{"script_type":2,"address_hash":"{}"}}],"rows":1}}"#,
             hex64(0x11)
         );
-        let (s, _) = store(&[("FROM bitcoin.scripthash_map", &map)], r#"{"data":[],"rows":0}"#);
+        let (s, _) = store(
+            &[("FROM bitcoin.scripthash_map", &map)],
+            r#"{"data":[],"rows":0}"#,
+        );
         let e = Electrum::new(&s, &cfg());
         let r = e
             .handle("blockchain.scripthash.get_balance", &json!([hex64(0x55)]))
@@ -383,14 +415,18 @@ mod tests {
             r#"{"data":[],"rows":0}"#,
         );
         let e = Electrum::new(&s, &cfg());
-        let r = e.handle("blockchain.scripthash.subscribe", &json!([hex64(0x55)])).unwrap();
+        let r = e
+            .handle("blockchain.scripthash.subscribe", &json!([hex64(0x55)]))
+            .unwrap();
         // Non-empty history → 64-char status hash.
         assert_eq!(r.as_str().unwrap().len(), 64);
 
         // Empty history → null.
         let (s, _) = scripthash_setup();
         let e = Electrum::new(&s, &cfg());
-        let r = e.handle("blockchain.scripthash.subscribe", &json!([hex64(0x55)])).unwrap();
+        let r = e
+            .handle("blockchain.scripthash.subscribe", &json!([hex64(0x55)]))
+            .unwrap();
         assert_eq!(r, Value::Null);
     }
 
@@ -416,11 +452,17 @@ mod tests {
         let (s, _) = store(&[], r#"{"data":[],"rows":0}"#);
         let e = Electrum::new(&s, &cfg());
         // Missing param.
-        assert!(e.handle("blockchain.scripthash.get_balance", &json!([])).is_err());
+        assert!(e
+            .handle("blockchain.scripthash.get_balance", &json!([]))
+            .is_err());
         // Bad hex.
-        assert!(e.handle("blockchain.scripthash.get_balance", &json!(["zz"])).is_err());
+        assert!(e
+            .handle("blockchain.scripthash.get_balance", &json!(["zz"]))
+            .is_err());
         // Unknown scripthash (no map row).
-        assert!(e.handle("blockchain.scripthash.get_balance", &json!([hex64(0x55)])).is_err());
+        assert!(e
+            .handle("blockchain.scripthash.get_balance", &json!([hex64(0x55)]))
+            .is_err());
     }
 
     #[test]
