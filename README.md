@@ -101,14 +101,20 @@ The authoritative sources are the Rust code, not the docs; see
 ## Build
 
 Requires a C toolchain and clang headers for RocksDB's bindgen step. On a
-machine where `stdbool.h` isn't in clang's default path, point bindgen at a
-shim (this repo creates `.build-shim/include` from gcc's builtins):
+machine where `stdbool.h` isn't in clang's default path, generate the shim
+(`.build-shim/include` holds gcc's copies of the C standard headers) and point
+bindgen at it:
 
 ```bash
-export LIBCLANG_PATH=/usr/lib/llvm-18/lib   # wherever libclang lives
+./scripts/build-shim.sh                              # writes .build-shim/include
+export LIBCLANG_PATH=/usr/lib/llvm-18/lib            # wherever libclang lives
 export BINDGEN_EXTRA_CLANG_ARGS="-I$PWD/.build-shim/include"
 cargo build --release
 ```
+
+`.build-shim/` is machine-specific and gitignored — the `Dockerfile` and the
+release workflow run the same script to generate it, so it is never committed
+and never copied from the build context.
 
 ## Testing & coverage
 

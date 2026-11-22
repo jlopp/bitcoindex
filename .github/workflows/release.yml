@@ -60,11 +60,26 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
 
-      # The two workarounds the repo documents for GCC 15 / bindgen. Passed
-      # through into the `cross` container by Cross.toml's [build.env].
+      # The two workarounds the repo documents for GCC 15 / bindgen.
+      #
+      # The shim is generated here rather than committed: `.build-shim/` is
+      # gitignored, so a fresh checkout has no such directory.
+      #
+      # BINDGEN_EXTRA_CLANG_ARGS must name the path *inside the container the
+      # compiler runs in*, which differs per target:
+      #   * native `cargo` runs in the workspace itself → the host path;
+      #   * `cross` bind-mounts the project at `/project` (its working dir), so
+      #     the host path does not exist and the include would be dropped.
+      # Cross.toml passes the variable through into the `cross` container.
+      - name: Generate bindgen header shim
+        run: ./scripts/build-shim.sh "${GITHUB_WORKSPACE}/.build-shim/include"
+
       - name: Build release binary
         env:
-          BINDGEN_EXTRA_CLANG_ARGS: "-I${{ github.workspace }}/.build-shim/include"
+          BINDGEN_EXTRA_CLANG_ARGS: >-
+            ${{ matrix.use_cross == 'true'
+                && '-I/project/.build-shim/include'
+                || format('-I{0}/.build-shim/include', github.workspace) }}
           CXXFLAGS: "-include cstdint"
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then

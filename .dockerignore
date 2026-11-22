@@ -1,5 +1,6 @@
 target/
 bidx-perf/
+.build-shim/
 **/*.rs.bk
 .git/
 .github/

@@ -31,16 +31,19 @@ mode, the system `libzmq`. Building from source needs a C/C++ toolchain,
 ```bash
 sudo apt-get install -y clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev
 
-# If stdbool.h isn't in clang's default include path, point bindgen at the
-# shim this repo creates from gcc's builtins:
+# If stdbool.h isn't in clang's default include path, generate the shim from
+# gcc's builtins and point bindgen at it:
+./scripts/build-shim.sh
 export LIBCLANG_PATH=/usr/lib/llvm-18/lib       # wherever libclang lives
 export BINDGEN_EXTRA_CLANG_ARGS="-I$PWD/.build-shim/include"
 export CXXFLAGS="-include cstdint"               # rocksdb 8.x transitive <cstdint>
 cargo build --release
 ```
 
-The `Dockerfile` bakes in both workarounds, so the container build needs no
-special environment.
+The `Dockerfile` bakes in both workarounds — it runs `scripts/build-shim.sh`
+inside the builder stage — so the container build needs no special environment.
+The shim itself is machine-specific and gitignored, which is why it is generated
+rather than shipped.
 
 Prebuilt binaries for `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
 and `aarch64-unknown-linux-gnu` are attached to each `v*` tag release, together
@@ -318,6 +321,7 @@ The run aborts asking for a rescan. Re-run `parse` for the affected range, or
 raise `--max-reorg-depth` if you accept the cost of a deeper walk.
 
 **Bindgen fails with a missing `stdbool.h`.**
-Point `BINDGEN_EXTRA_CLANG_ARGS` at the repo's `.build-shim/include` (see
-[Building the binary](#building-the-binary)) or build via the `Dockerfile`,
-which sets it.
+Run `./scripts/build-shim.sh` and point `BINDGEN_EXTRA_CLANG_ARGS` at the
+`.build-shim/include` it writes (see [Building the
+binary](#building-the-binary)), or build via the `Dockerfile`, which generates
+the shim and sets the variable itself.

@@ -5,8 +5,10 @@
 #
 # RocksDB's build needs a full C/C++ toolchain and libclang (bindgen). We also
 # bake in the two workarounds the repo documents for modern GCC/clang:
-#   * BINDGEN_EXTRA_CLANG_ARGS points bindgen at .build-shim/include (gcc
-#     builtins) so `stdbool.h` resolves.
+#   * BINDGEN_EXTRA_CLANG_ARGS points bindgen at .build-shim/include, which
+#     `scripts/build-shim.sh` generates from gcc's builtins at build time, so
+#     `stdbool.h` resolves. The directory is gitignored and never COPYed from
+#     the build context.
 #   * CXXFLAGS=-include cstdint works around rocksdb 8.x's reliance on
 #     transitive <cstdint> includes that GCC 15 no longer provides.
 # ---------------------------------------------------------------------------
@@ -42,9 +44,9 @@ RUN set -eux; \
     echo 'fn main() {}' > crates/bidx-cli/src/main.rs; \
     cargo build --release -p bidx-cli || true
 
-# Real sources + the bindgen shim, then the actual build.
-COPY .build-shim ./.build-shim
+# Real sources, then the actual build.
 COPY crates ./crates
+COPY scripts/build-shim.sh ./scripts/build-shim.sh
 # The stub build above recorded fingerprints for the placeholder sources.
 # cargo's freshness check is mtime-based, and `COPY` preserves the mtimes from
 # the build context — which for a fresh clone are *older* than the stubs just
@@ -54,6 +56,7 @@ COPY crates ./crates
 # recompiles our crates; third-party deps stay cached.
 RUN set -eux; \
     find crates -name '*.rs' -exec touch {} +; \
+    ./scripts/build-shim.sh /src/.build-shim/include; \
     export BINDGEN_EXTRA_CLANG_ARGS="-I/src/.build-shim/include"; \
     export CXXFLAGS="-include cstdint"; \
     cargo build --release --locked -p bidx-cli; \
