@@ -194,6 +194,28 @@ pub struct SpendRow {
     pub spent_height: u32,
 }
 
+/// Optional witness payload for one input of one transaction. Produced only
+/// when witness capture is enabled (it is off by default: witness data roughly
+/// doubles the on-disk size of a modern block and is not needed for the hot
+/// tables, which already carry `witness_items`/`witness_bytes` counts).
+///
+/// One row per witness *item*, so a multi-item script-path spend produces
+/// several rows. `item_bytes` holds the raw stack element, not a hash, so it is
+/// variable-length (`Binary` in Parquet, `String` in ClickHouse).
+#[derive(Debug, Clone)]
+pub struct WitnessRow {
+    pub height: u32,
+    pub tx_index: u32,
+    pub input_index: u32,
+    /// Position of this item within the input's witness stack.
+    pub item_index: u32,
+    /// Length of `item_bytes` (stored alongside so a query can filter on item
+    /// size without materializing the blob).
+    pub item_len: u32,
+    /// Raw witness stack element bytes.
+    pub item_bytes: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

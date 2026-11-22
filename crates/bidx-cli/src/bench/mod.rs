@@ -350,7 +350,59 @@ impl Tuning {
     fn sink_config(&self) -> SinkConfig {
         SinkConfig {
             batch_size: self.sink_batch_rows,
+            capture_witness: false,
         }
+    }
+}
+
+/// Open the UTXO store for a trial, selecting the statistics and block-cache
+/// variants from the two opt-in flags. Split out so the four-way `(stats,
+/// cache)` matrix is unit-testable without running a whole trial.
+fn open_utxo_for_bench(
+    path: &Path,
+    rocksdb_stats: bool,
+    cache_mb: usize,
+) -> Result<UtxoStore, bidx_store::UtxoError> {
+    match (rocksdb_stats, cache_mb) {
+        (true, 0) => UtxoStore::open_statistics(path),
+        (false, 0) => UtxoStore::open(path),
+        (true, mb) => UtxoStore::open_cached_statistics(path, mb << 20),
+        (false, mb) => UtxoStore::open_cached(path, mb << 20),
+    }
+}
+
+/// Render the `stall_lines` property: `"none"` when statistics were enabled but
+/// no stall lines were recorded, otherwise the joined lines. Distinguishing the
+/// two is the point — an empty vector here means "measured, saw none", not "not
+/// measured".
+fn stall_lines_value(stalls: &[String]) -> String {
+    if stalls.is_empty() {
+        "none".to_string()
+    } else {
+        stalls.join(" | ")
+    }
+}
+
+/// The cold-store guard: a run that reports missing spent outpoints measured a
+/// UTXO store that was not seeded for the block range, so its `utxo_apply`
+/// figure is meaningless. Returns the loud error to surface (unless the
+/// operator opted out with `--allow-missing-utxos`). Split out so both the
+/// failing and the opt-out branches are unit-testable.
+fn cold_store_error(
+    trial: u32,
+    do_utxo: bool,
+    missing: u64,
+    allow_missing: bool,
+) -> Option<anyhow::Error> {
+    if do_utxo && missing > 0 && !allow_missing {
+        Some(anyhow::anyhow!(
+            "trial {trial}: {missing} spent outpoints were missing from the UTXO store — \
+             this run measured a cold store and its `utxo_apply` number is not meaningful. \
+             Use a fresh `--utxo` dir seeded from genesis, or pass --allow-missing-utxos \
+             to accept it."
+        ))
+    } else {
+        None
     }
 }
 
@@ -440,15 +492,11 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     // statistics are on. That open has slightly higher per-op overhead, so
     // it is opt-in and the flag is reported alongside the numbers.
     let utxo = if do_utxo {
-        let store = match (cfg.rocksdb_stats, cfg.utxo_cache_mb) {
-            (true, 0) => UtxoStore::open_statistics(utxo_path),
-            (false, 0) => UtxoStore::open(utxo_path),
-            (true, mb) => UtxoStore::open_cached_statistics(utxo_path, mb << 20),
-            (false, mb) => UtxoStore::open_cached(utxo_path, mb << 20),
-        };
+        let store = open_utxo_for_bench(utxo_path, cfg.rocksdb_stats, cfg.utxo_cache_mb);
         Some(Arc::new(store.context(
             "open utxo (delete existing dir to reset between different start heights)",
-        )?))    } else {
+        )?))
+    } else {
         None
     };
 
@@ -571,6 +619,14 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // height the consumer is waiting for must always be
                         // allowed to run, or no block can ever unblock the
                         // consumer and the whole pipeline deadlocks.
+                        //
+                        // coverage-exempt: 631-636 — mirror of the production
+                        // spin in `pipeline::run_parse`. The body (and the
+                        // second `&&` clause, which short-circuits) only runs
+                        // when the consumer is `reorder_high` blocks behind
+                        // *and* this worker's height is not the one awaited,
+                        // i.e. under memory pressure the small unit fixtures
+                        // never create.
                         while reorder.load(Ordering::Relaxed) > reorder_high_w
                             && next_h.load(Ordering::Relaxed) != height
                         {
@@ -592,6 +648,12 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // As in `pipeline::run_parse`: a failed send means the
                         // consumer is gone, which is usually the RSS watchdog
                         // having aborted it. Surface the real cause.
+                        //
+                        // coverage-exempt: 657-661 — the map_err closure body
+                        // only runs when a send to the consumer fails, which
+                        // needs the consumer thread to have aborted mid-run;
+                        // the fixtures never provoke that. The closure's
+                        // construction is covered.
                         tx.send(WorkItem::Block { height, block }).map_err(|_| {
                             if watchdog.is_tripped() {
                                 watchdog.tripped_error()
@@ -607,14 +669,14 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         drop(tx);
         Some(consumer)
     } else {
-        None
+        None // coverage-exempt: unreachable — every mode that reaches here spawns the consumer (do_parse_stages is true; Headers returns early)
     };
 
     if let Some(h) = consumer_handle {
         let us = h.join().map_err(|_| anyhow::anyhow!("consumer panicked"))??;
         utxo_samples = us;
     } else {
-        utxo_samples = Vec::new();
+        utxo_samples = Vec::new(); // coverage-exempt: unreachable — every mode that reaches here spawns the consumer (do_parse_stages is true; Headers returns early)
     }
     let pipeline_wall = pipeline_start.elapsed();
     let pipeline_end_res = ResourceSample::now();
@@ -682,13 +744,8 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
 
     // A cold UTXO store makes apply_block look free, which is the single most
     // misleading result this tool can produce. Fail loudly instead.
-    if do_utxo && missing > 0 && !cfg.allow_missing_utxos {
-        anyhow::bail!(
-            "trial {trial}: {missing} spent outpoints were missing from the UTXO store — \
-             this run measured a cold store and its `utxo_apply` number is not meaningful. \
-             Use a fresh `--utxo` dir seeded from genesis, or pass --allow-missing-utxos \
-             to accept it."
-        );
+    if let Some(e) = cold_store_error(trial, do_utxo, missing, cfg.allow_missing_utxos) {
+        return Err(e); // coverage-exempt: 748 — the guard is fully branch-tested via cold_store_error; this is its trivial propagation
     }
 
     let rocksdb = if cfg.rocksdb_stats {
@@ -705,11 +762,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                 let stalls = u.stall_report();
                 props.push(RocksDbProperty {
                     name: "stall_lines".to_string(),
-                    value: if stalls.is_empty() {
-                        "none".to_string()
-                    } else {
-                        stalls.join(" | ")
-                    },
+                    value: stall_lines_value(&stalls),
                 });
                 props
             })
@@ -771,11 +824,17 @@ fn num_cpus() -> usize {
 /// Falls back to `std::env::temp_dir()` only if the CWD cannot be determined,
 /// which in practice means the process was started in a deleted directory.
 pub(crate) fn default_perf_dir() -> PathBuf {
-    match std::env::current_dir() {
+    perf_dir_from(std::env::current_dir(), std::env::temp_dir())
+}
+
+/// The pure half of [`default_perf_dir`], with the CWD and temp-dir lookups
+/// injected so both the success and the CWD-gone fallback are testable.
+fn perf_dir_from(cwd: std::io::Result<PathBuf>, temp: PathBuf) -> PathBuf {
+    match cwd {
         Ok(cwd) => cwd.join("bidx-perf"),
         // CWD is gone (deleted underneath us). Temp is the only sane fallback;
         // the caller still gets a usable path rather than a hard error.
-        Err(_) => std::env::temp_dir().join("bidx-perf"),
+        Err(_) => temp.join("bidx-perf"),
     }
 }
 
@@ -820,6 +879,28 @@ pub(crate) struct OomWatchdog {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Decide whether an RSS sample exceeds the ceiling, logging the trip once at
+/// the moment it happens (so the message is present even if the caller is slow
+/// to observe the flag). Split out so the trip branch — including its log line
+/// — is exercised by a direct unit test rather than only by a live over-limit
+/// process.
+fn rss_trips(rss_kb: u64, max_rss_kb: u64) -> bool {
+    if rss_kb > max_rss_kb {
+        // coverage-exempt: 894-895 — the `tracing::error!` field expressions
+        // are only evaluated when a subscriber is installed; the unit tests
+        // run without one, so only the macro's target line is instrumented.
+        // The branch itself is covered by `rss_trips_logs_and_trips_only_over_the_limit`.
+        tracing::error!(
+            rss_mb = rss_kb / 1024,
+            limit_mb = max_rss_kb / 1024,
+            "watchdog: RSS exceeded limit; aborting pipeline"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 impl OomWatchdog {
     pub(crate) fn start(max_rss_kb: u64) -> Self {
         let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -827,14 +908,7 @@ impl OomWatchdog {
         let handle = std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let rss = ResourceSample::now().rss_kb;
-            if rss > max_rss_kb {
-                // Log at the moment of tripping so the message is present even
-                // if the caller is slow to observe the flag.
-                tracing::error!(
-                    rss_mb = rss / 1024,
-                    limit_mb = max_rss_kb / 1024,
-                    "watchdog: RSS exceeded limit; aborting pipeline"
-                );
+            if rss_trips(rss, max_rss_kb) {
                 t2.store(true, Ordering::SeqCst);
                 return;
             }
@@ -1044,10 +1118,40 @@ fn bench_consume(
     if let Some(s) = sink.take() {
         s.finish()?;
     }
+    finalize_consume(next, end)?;
+    Ok(utxo_samples)
+}
+
+/// The consumer's completion check: once the channel closes, a run that did not
+/// reach `end` has been truncated by a producer/worker abort and must fail
+/// loudly rather than silently writing a partial index. Split out so the
+/// truncated-run branch is unit-testable without provoking a real abort.
+fn finalize_consume(next: u32, end: u32) -> Result<()> {
     if next < end {
         anyhow::bail!("channel closed early at height {next}");
     }
-    Ok(utxo_samples)
+    Ok(())
+}
+
+/// The db/pending share of UTXO lookups, as a percentage. Zero when there were
+/// no lookups at all, so the report never divides by zero.
+fn db_share(db_lookups: u64, pending_hits: u64) -> f64 {
+    let total = db_lookups + pending_hits;
+    if total > 0 {
+        100.0 * db_lookups as f64 / total as f64
+    } else {
+        0.0
+    }
+}
+
+/// The optional cache-hits line: `Some` only when the cache was actually used,
+/// so a store without a block cache does not print a misleading zero.
+fn cache_hits_line(cache_hits: u64) -> Option<String> {
+    if cache_hits > 0 {
+        Some(format!("utxo cache hits: {cache_hits}"))
+    } else {
+        None
+    }
 }
 
 fn print_trial(r: &TrialReport) {
@@ -1079,16 +1183,12 @@ fn print_trial(r: &TrialReport) {
         "utxo lookups: {} db / {} pending ({}% db)  db_time: {:.3}s ({:.1}% of apply)",
         r.db_lookups,
         r.pending_hits,
-        if r.db_lookups + r.pending_hits > 0 {
-            100.0 * r.db_lookups as f64 / (r.db_lookups + r.pending_hits) as f64
-        } else {
-            0.0
-        },
+        db_share(r.db_lookups, r.pending_hits),
         r.db_nanos as f64 / 1e9,
         share,
     );
-    if r.cache_hits > 0 {
-        println!("utxo cache hits: {}", r.cache_hits);
+    if let Some(line) = cache_hits_line(r.cache_hits) {
+        println!("{line}");
     }
     println!("stages:");
     for s in &r.stages {
@@ -1543,6 +1643,7 @@ mod tests {
                 script_type: 0,
                 address_hash: [0u8; 32],
             }],
+            witnesses: vec![],
         }
     }
 
@@ -1746,6 +1847,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("channel closed early"));
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn bench_consume_finishes_cleanly_when_the_range_is_empty() {
+        // start == end: the channel closes with nothing to drain, so the
+        // consumer takes the tail path — flush the sink, then `finalize_consume`
+        // succeeds and the samples vector is returned. (The mid-loop
+        // `next >= end` early return is not taken because no block arrives.)
+        let out_dir = consume_out_dir("empty-range");
+        let got = drive_consume(Vec::new(), 0, 1, true, false, false, None, &out_dir);
+        assert_eq!(got.blocks_done, 0);
+        assert!(got.utxo_samples.is_empty());
         let _ = std::fs::remove_dir_all(out_dir);
     }
 
@@ -2221,6 +2335,215 @@ mod tests {
             stages: vec![StageReport {
                 name: "header_pass",
                 wall_secs: 1.0,
+                cpu_util: 0.5,
+                peak_rss_mb: 8.0,
+            }],
+            parse_latency: LatencyReport::default(),
+            utxo_latency: LatencyReport::default(),
+            rocksdb: Vec::new(),
+        };
+        print_trial(&t);
+    }
+
+    #[test]
+    fn open_utxo_for_bench_selects_variant_by_flags() {
+        // The four-way (statistics, block-cache) matrix must pick the matching
+        // `open*` variant. Each arm opens a real store in its own dir so the
+        // branch is genuinely executed; `statistics_enabled` distinguishes the
+        // statistics axis, and `cached_open_answers_a_recent_output_from_memory`
+        // below distinguishes the block-cache axis.
+        for (stats, mb) in [(true, 0usize), (false, 0), (true, 4), (false, 4)] {
+            let dir = std::env::temp_dir().join(format!(
+                "bidx-bench-open-{}-{}-{mb}",
+                std::process::id(),
+                stats as u8
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = open_utxo_for_bench(&dir, stats, mb).unwrap();
+            assert_eq!(store.statistics_enabled(), stats, "stats={stats} mb={mb}");
+            drop(store);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn cached_open_answers_a_recent_output_from_memory() {
+        use bidx_core::types::{InputRow, OutputRow, TxRow};
+
+        // Build a two-block sequence: block 0 creates output X:0, block 1
+        // spends it. With a block cache the spend is answered from memory
+        // (cache_hits == 1, no DB lookup); without one it falls through to the
+        // database (cache_hits == 0, one lookup). This is the observable
+        // difference the (stats, cache) match arms select between.
+        fn run(cache_mb: usize) -> bidx_store::SpendResult {
+            let dir = std::env::temp_dir().join(format!(
+                "bidx-bench-cache-{}-{cache_mb}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = open_utxo_for_bench(&dir, false, cache_mb).unwrap();
+
+            let txid0 = [0x11u8; 32];
+            let tx0 = TxRow {
+                height: 0, tx_index: 0, txid: txid0, version: 1, locktime: 0,
+                size: 0, weight: 0, fee: 0, input_count: 1, output_count: 1,
+                has_witness: false,
+            };
+            let out0 = OutputRow {
+                height: 0, tx_index: 0, output_index: 0, txid: txid0,
+                value_sat: 1000, script_pubkey_len: 0, script_type: 0,
+                address_hash: [0u8; 32],
+            };
+            store.apply_block(0, &[tx0], &[], &[out0]).unwrap();
+
+            let txid1 = [0x22u8; 32];
+            let tx1 = TxRow {
+                height: 1, tx_index: 0, txid: txid1, version: 1, locktime: 0,
+                size: 0, weight: 0, fee: 0, input_count: 1, output_count: 0,
+                has_witness: false,
+            };
+            let inp1 = InputRow {
+                height: 1, tx_index: 0, input_index: 0, txid: txid1,
+                prev_txid: txid0, prev_vout: 0, script_sig_len: 0, sequence: 0,
+                witness_items: 0, witness_bytes: 0, is_coinbase: false,
+            };
+            let res = store.apply_block(1, &[tx1], &[inp1], &[]).unwrap();
+            drop(store);
+            let _ = std::fs::remove_dir_all(&dir);
+            res
+        }
+
+        let cached = run(1);
+        assert_eq!(cached.cache_hits, 1, "a recent output must be served from the cache");
+        assert_eq!(cached.db_lookups, 0, "cache hit must not touch the DB");
+
+        let uncached = run(0);
+        assert_eq!(uncached.cache_hits, 0, "no cache means no cache hits");
+        assert_eq!(uncached.db_lookups, 1, "no cache means a DB lookup");
+    }
+
+    #[test]
+    fn cold_store_error_reports_a_cold_store_and_honours_opt_out() {
+        // A missing-spend run with the guard on must produce the loud error.
+        let e = cold_store_error(3, true, 7, false).expect("cold store must error");
+        let msg = e.to_string();
+        assert!(msg.contains("trial 3"), "got {msg}");
+        assert!(msg.contains('7'), "got {msg}");
+        assert!(msg.contains("--allow-missing-utxos"), "got {msg}");
+        // Opt-out silences it, as does a run with no missing spends or no UTXO.
+        assert!(cold_store_error(0, true, 7, true).is_none());
+        assert!(cold_store_error(0, true, 0, false).is_none());
+        assert!(cold_store_error(0, false, 7, false).is_none());
+    }
+
+    #[test]
+    fn stall_lines_value_renders_none_and_joined_lines() {
+        assert_eq!(stall_lines_value(&[]), "none");
+        assert_eq!(
+            stall_lines_value(&["a".to_string(), "b".to_string()]),
+            "a | b"
+        );
+    }
+
+    #[test]
+    fn perf_dir_from_falls_back_to_temp_when_cwd_is_gone() {
+        // Normal CWD: scratch goes under it.
+        let got = perf_dir_from(Ok(PathBuf::from("/work")), PathBuf::from("/tmp"));
+        assert_eq!(got, PathBuf::from("/work/bidx-perf"));
+        // Deleted CWD: the temp dir is the only sane fallback.
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "cwd gone");
+        let got = perf_dir_from(Err(err), PathBuf::from("/tmp"));
+        assert_eq!(got, PathBuf::from("/tmp/bidx-perf"));
+    }
+
+    #[test]
+    fn rss_trips_logs_and_trips_only_over_the_limit() {
+        // Over the ceiling trips; at or under it does not (the comparison is
+        // strict, so a sample exactly at the limit is not a trip).
+        assert!(rss_trips(2000, 1000));
+        assert!(!rss_trips(1000, 1000));
+        assert!(!rss_trips(999, 1000));
+    }
+
+    #[test]
+    fn finalize_consume_fails_on_a_truncated_run_and_passes_on_completion() {
+        assert!(finalize_consume(5, 5).is_ok());
+        // Over-shooting `end` (defensive) is also fine; only short is an error.
+        assert!(finalize_consume(6, 5).is_ok());
+        let e = finalize_consume(3, 5).unwrap_err();
+        assert!(e.to_string().contains("channel closed early at height 3"), "got {e}");
+    }
+
+    #[test]
+    fn db_share_is_zero_without_lookups_and_percentage_otherwise() {
+        assert_eq!(db_share(0, 0), 0.0);
+        assert_eq!(db_share(1, 0), 100.0);
+        assert_eq!(db_share(0, 1), 0.0);
+        assert_eq!(db_share(1, 3), 25.0);
+    }
+
+    #[test]
+    fn cache_hits_line_is_none_without_hits_and_some_with_them() {
+        assert!(cache_hits_line(0).is_none());
+        assert_eq!(cache_hits_line(12).unwrap(), "utxo cache hits: 12");
+    }
+
+    #[test]
+    fn bench_consume_sink_mode_writes_spend_rows_when_utxo_present() {
+        // do_sink && do_utxo: block 0's coinbase output becomes a UTXO, and
+        // block 1 spends it, so `res.spends` is non-empty and the sink's
+        // `push_spend` loop runs.
+        let dir = std::env::temp_dir().join(format!("bidx-bench-spends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = UtxoStore::open(&dir).unwrap();
+
+        let b0 = synth_block(0); // coinbase output: txid [0;32], vout 0
+        let mut b1 = synth_block(1);
+        b1.inputs[0].is_coinbase = false;
+        b1.inputs[0].prev_txid = [0u8; 32];
+        b1.inputs[0].prev_vout = 0;
+
+        let out_dir = consume_out_dir("spends");
+        let got = drive_consume(
+            vec![(0, b0), (1, b1)],
+            2,
+            10,
+            true,
+            true,
+            true,
+            Some(&store),
+            &out_dir,
+        );
+        assert_eq!(got.blocks_done, 2);
+        assert_eq!(got.missing, 0, "block 1 spends block 0's output, so none missing");
+        assert!(got.sink_wall > 0);
+        assert!(out_dir.join("spends").join("part-00000.parquet").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn print_trial_prints_lookups_and_cache_hits_when_nonzero() {
+        // Nonzero db/pending lookups and cache hits must take the reporting
+        // branches; a `utxo_apply` stage makes the `% of apply` share nonzero.
+        let t = TrialReport {
+            trial: 0,
+            mode: BenchMode::Utxo,
+            blocks: 10,
+            blocks_per_sec: 1.0,
+            blocks_per_sec_ex_header: 0.9,
+            user_cpu_secs: 0.1,
+            peak_rss_mb: 8.0,
+            missing_utxos: 0,
+            db_lookups: 3,
+            db_nanos: 500,
+            pending_hits: 1,
+            cache_hits: 5,
+            stages: vec![StageReport {
+                name: "utxo_apply",
+                wall_secs: 0.5,
                 cpu_util: 0.5,
                 peak_rss_mb: 8.0,
             }],

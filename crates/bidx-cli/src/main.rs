@@ -119,6 +119,13 @@ enum Cmd {
         /// `<parent-of-utxo>/bidx-disk-checkpoints.txt`.
         #[arg(long)]
         checkpoint_file: Option<PathBuf>,
+
+        /// Also capture raw witness stack elements into an optional
+        /// `witnesses` Parquet table (and, when loaded, ClickHouse table).
+        /// Off by default: the payload roughly doubles on-disk size and no hot
+        /// table needs it.
+        #[arg(long)]
+        capture_witness: bool,
     },
 
     /// Create ClickHouse schema (idempotent).
@@ -193,6 +200,26 @@ enum Cmd {
         /// Override the disk-check checkpoint file path.
         #[arg(long)]
         checkpoint_file: Option<PathBuf>,
+        /// Also append raw witness stack elements to the optional
+        /// `witnesses` Parquet table (requires `--out`). Off by default.
+        #[arg(long)]
+        capture_witness: bool,
+
+        /// Insert each applied block directly into ClickHouse over the client's
+        /// stdin, bypassing Parquet, so the tip is queryable within the block's
+        /// own apply time. Mutually exclusive with `--out`.
+        #[arg(long)]
+        ch_live: bool,
+        #[arg(long, default_value = "localhost")]
+        ch_host: String,
+        #[arg(long, default_value_t = 9000)]
+        ch_port: u16,
+        #[arg(long, default_value = "default")]
+        ch_user: String,
+        #[arg(long)]
+        ch_password: Option<String>,
+        #[arg(long, default_value = "bitcoin")]
+        ch_database: String,
     },
 
     /// Parse a single block at a height and print it as JSON (debug).
@@ -207,6 +234,19 @@ enum Cmd {
     Index {
         #[command(subcommand)]
         action: IndexAction,
+    },
+
+    /// Print the ClickHouse config fragment that registers the `bidx-udf`
+    /// executable UDFs (`bidxAddress` / `bidxParseAddress`) for rendering
+    /// addresses from ad-hoc SQL. Drop the output into the server's
+    /// `config.d/`.
+    UdfConfig {
+        /// Path to an installed `bidx-udf` binary.
+        #[arg(long, default_value = "bidx-udf")]
+        udf_bin: String,
+        /// Chain network the UDFs should render for.
+        #[arg(long, value_enum, default_value = "mainnet")]
+        network: NetworkArg,
     },
 
     /// Serve the query API: Esplora-compatible REST, Electrum JSON-RPC, and
@@ -341,6 +381,7 @@ fn run(cli: Cli) -> Result<()> {
             skip_disk_check,
             network,
             checkpoint_file,
+            capture_witness,
         } => {
             pipeline::run_parse(pipeline::ParseConfig {
                 blocks_dir,
@@ -357,6 +398,7 @@ fn run(cli: Cli) -> Result<()> {
                 checkpoint_file,
                 orphan_blocks: None,
                 rpc_transport: None,
+                capture_witness,
             })?;
         }
 
@@ -439,6 +481,11 @@ fn run(cli: Cli) -> Result<()> {
 
         Cmd::Bench(cfg) => run_bench(cfg)?,
 
+        Cmd::UdfConfig { udf_bin, network } => {
+            let net: Network = network.into();
+            print!("{}", bidx_loader::schema::udf_config_xml(&udf_bin, net));
+        }
+
         Cmd::Serve { config } => serve::run_serve(serve::ServeArgs { config })?,
 
         Cmd::Verify {
@@ -500,6 +547,13 @@ fn run(cli: Cli) -> Result<()> {
             network,
             skip_disk_check,
             checkpoint_file,
+            capture_witness,
+            ch_live,
+            ch_host,
+            ch_port,
+            ch_user,
+            ch_password,
+            ch_database,
         } => {
             live::run_live(live::LiveConfig {
                 rpc_url,
@@ -514,6 +568,15 @@ fn run(cli: Cli) -> Result<()> {
                 network: network.map(Into::into),
                 skip_disk_check,
                 checkpoint_file,
+                capture_witness,
+                ch_live,
+                ch: bidx_loader::ChConfig {
+                    host: ch_host,
+                    port: ch_port,
+                    user: ch_user,
+                    password: ch_password,
+                    database: ch_database,
+                },
             })?;
         }
     }
@@ -585,6 +648,11 @@ mod tests {
         // Migrate.
         let c = Cli::try_parse_from(["bidx", "migrate", "--database", "btc"]);
         assert!(c.is_ok(), "{:?}", c.err());
+        // UdfConfig (minimal and with args).
+        let c = Cli::try_parse_from(["bidx", "udf-config"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        let c = Cli::try_parse_from(["bidx", "udf-config", "--network", "signet"]);
+        assert!(c.is_ok(), "{:?}", c.err());
         // Reject unknown
         assert!(Cli::try_parse_from(["bidx", "bogus-command"]).is_err());
     }
@@ -637,6 +705,13 @@ mod tests {
     fn run_index_list_prints_the_catalogue() {
         // Pure: prints every catalogue entry, no I/O.
         let c = cli(&["bidx", "index", "list"]);
+        assert!(run(c).is_ok());
+    }
+
+    #[test]
+    fn run_udf_config_prints_the_fragment_for_the_network() {
+        // Pure: prints the XML fragment; no ClickHouse or child process.
+        let c = cli(&["bidx", "udf-config", "--udf-bin", "/opt/bidx-udf", "--network", "regtest"]);
         assert!(run(c).is_ok());
     }
 

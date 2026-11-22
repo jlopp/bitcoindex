@@ -74,6 +74,7 @@ bidx parse \
 | `--skip-disk-check` | off | Skip the disk-space startup check entirely. |
 | `--network <NET>` | auto-detected | `mainnet`, `testnet3`, `testnet4`, `signet`, `regtest`. |
 | `--checkpoint-file <PATH>` | `<parent-of-utxo>/bidx-disk-checkpoints.txt` | Override the disk-check checkpoint path. |
+| `--capture-witness` | off | Also write raw witness stack elements to the optional `witnesses` Parquet table. Kept out of the hot tables by default. |
 
 Notes:
 
@@ -108,19 +109,31 @@ bidx live \
 | `--rpc-password <PASS>` | *(none)* | Explicit RPC password. |
 | `--zmq <ENDPOINT>` | *(none)* | ZMQ `hashblock` endpoint, e.g. `tcp://127.0.0.1:28332`. Without it, polls every 2s. |
 | `--utxo <PATH>` | *(required)* | RocksDB UTXO store path (must match the one `parse` used). |
-| `--out <PATH>` | *(none)* | Optional Parquet output dir; live blocks append to rolling part files (1,000 blocks/part). |
+| `--out <PATH>` | *(none)* | Optional Parquet output dir; live blocks are buffered for the open part and written to rolling part files (1,000 blocks/part). |
 | `--max-reorg-depth <N>` | `100` | Max reorg depth to auto-handle before aborting. |
 | `--blocks-dir <PATH>` | mainnet | Used only to auto-detect the network for the checkpoint section. |
 | `--network <NET>` | auto-detected | Chain network override. |
 | `--skip-disk-check` | off | Skip the disk-space startup check. |
 | `--checkpoint-file <PATH>` | `<parent-of-utxo>/bidx-disk-checkpoints.txt` | Override the checkpoint path. |
+| `--capture-witness` | off | Also append raw witness stack elements to the optional `witnesses` Parquet table (requires `--out`) and the `witnesses` ClickHouse table. |
+| `--ch-live` | off | Insert each applied block **directly** into ClickHouse, bypassing Parquet, for sub-minute tip freshness. |
+| `--ch-host <HOST>` | `localhost` | ClickHouse host for `--ch-live`. |
+| `--ch-port <PORT>` | `9000` | ClickHouse native port for `--ch-live`. |
+| `--ch-user <USER>` | `default` | ClickHouse user for `--ch-live`. |
+| `--ch-password <PASS>` | *(none)* | ClickHouse password for `--ch-live`. |
+| `--ch-database <DB>` | `bitcoin` | ClickHouse database for `--ch-live`. |
 
 Notes:
 
 - Enable ZMQ in `bitcoin.conf`: `zmqpubhashblock=tcp://127.0.0.1:28332`.
-- Rows already flushed for a *disconnected* height are not retracted from a
-  closed Parquet part — on load, drop ClickHouse partitions `>=` the reorg
-  floor before reloading the affected range.
+- A **shallow** reorg (disconnected height still in the open part) is retracted
+  exactly from the in-memory buffer. A **deep** reorg below the open part writes
+  the retraction floor to `<out>/.live-reorg-floor` — on load, drop ClickHouse
+  partitions `>=` that floor before reloading the affected range.
+- With `--ch-live`, rows are inserted on apply, so a disconnected height is
+  removed by `height` (`DELETE FROM … WHERE height >= floor`).
+- `--ch-live` and `--out` are independent; supplying both streams to ClickHouse
+  *and* keeps rolling Parquet parts.
 
 ---
 

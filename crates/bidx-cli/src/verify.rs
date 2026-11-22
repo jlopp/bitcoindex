@@ -174,7 +174,7 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
         password: args.password.clone(),
         database: args.database.clone(),
     })?;
-    run_verify_with(&loader, &args)
+    run_verify_with(&loader, &args) // coverage-exempt: needs a working clickhouse-client on PATH; the delegate is covered via run_verify_with, and the no-client path via run_verify_fails_fast_without_clickhouse_client
 }
 
 /// The query + evaluation half of [`run_verify`], split out so it can be

@@ -6,4 +6,4 @@ pub mod tx;
 
 pub use blkfile::{BlkFile, BlkRecord};
 pub use chain::{build_chain_index, ChainBuildStats};
-pub use tx::{parse_block_full, FullBlock};
+pub use tx::{parse_block_full, parse_block_full_opts, FullBlock, ParseOptions};

@@ -13,6 +13,8 @@
 //! [`ChLoader::rebuild_index`]; `address_prefix` needs a Rust-side base58/bech32
 //! renderer and is refreshed by [`ChLoader::rebuild_address_prefix`].
 
+pub mod live_insert;
+pub mod rowbinary;
 pub mod schema;
 
 use std::path::{Path, PathBuf};
@@ -67,6 +69,13 @@ impl ChLoader {
     /// on it being on `PATH`.
     pub fn with_client(cfg: ChConfig, client: PathBuf) -> Self {
         ChLoader { cfg, client }
+    }
+
+    /// The resolved `clickhouse-client` binary path. Exposed so the live
+    /// direct-insert path can open its own `RowBinary` pipes without resolving
+    /// `PATH` a second time.
+    pub fn client_path(&self) -> PathBuf {
+        self.client.clone()
     }
 
     fn base_args(&self) -> Vec<String> {
@@ -137,6 +146,48 @@ impl ChLoader {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
+    /// Retract every base-table row at `height` and above, so a live reorg can
+    /// be repaired by reloading the canonical range. Live mode appends each
+    /// applied block straight to ClickHouse, so a disconnected height leaves
+    /// rows behind; this is the inverse operation.
+    ///
+    /// The base tables are partitioned by `intDiv(height, 10000)`, so the
+    /// affected partition is dropped when `height` sits exactly on a 10,000
+    /// boundary and row-deleted otherwise. A `DELETE` is used rather than
+    /// `ALTER ... DROP PARTITION` for a mid-partition height because dropping
+    /// would discard canonical rows below `height` too. `DELETE` is a mutation,
+    /// so it is heavier than a partition drop — acceptable at the tip, where a
+    /// reorg touches only the newest blocks.
+    pub fn retract_from(&self, height: u32) -> Result<(), LoadError> {
+        let db = &self.cfg.database;
+        for table in schema::ENTITIES {
+            if height % 10_000 == 0 {
+                // Partition-aligned: drop the whole (>= height) partition range
+                // cheaply. `PARTITION` takes the partition id (height / 10000).
+                let part = height / 10_000;
+                self.run_query(&format!(
+                    "ALTER TABLE {db}.{table} DROP PARTITION {part}"
+                ))?;
+            } else {
+                self.run_query(&format!(
+                    "DELETE FROM {db}.{table} WHERE height >= {height}"
+                ))?;
+            }
+        }
+        // The witness payload table is optional; retract it too when present.
+        if self
+            .query_scalar(&schema::table_exists(db, schema::WITNESS_ENTITY))?
+            .trim()
+            == "1"
+        {
+            self.run_query(&format!(
+                "DELETE FROM {db}.{} WHERE height >= {height}",
+                schema::WITNESS_ENTITY
+            ))?;
+        }
+        Ok(())
+    }
+
     /// The highest applied schema version (0 when the table is absent).
     pub fn schema_version(&self) -> Result<u32, LoadError> {
         let out = self.query_scalar(&schema::read_schema_version(&self.cfg.database))?;
@@ -185,10 +236,18 @@ impl ChLoader {
         self.run_query(&sql)
     }
 
-    pub fn load_all(&self, parquet_dir: &Path) -> Result<(), LoadError> {
-        for entity in schema::ENTITIES {
+    pub fn load_all(&self, parquet_dir: &Path) -> Result<(), LoadError> {        for entity in schema::ENTITIES {
             tracing::info!(entity, "loading into ClickHouse");
             self.load_entity(entity, parquet_dir)?;
+        }
+        // The witness payload table is optional: a normal `parse` does not
+        // produce it, so only load it when the directory is present.
+        let wit_dir = parquet_dir.join(schema::WITNESS_ENTITY);
+        if wit_dir.is_dir() {
+            tracing::info!(entity = schema::WITNESS_ENTITY, "loading optional witness payload table");
+            self.load_entity(schema::WITNESS_ENTITY, parquet_dir)?;
+        } else {
+            tracing::info!("no witness payload output present; skipping witnesses table");
         }
         Ok(())
     }
@@ -503,7 +562,7 @@ mod tests {
     /// the overlap.
     static FORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
         FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -512,6 +571,96 @@ mod tests {
         let p = PathBuf::from("/opt/bidx/clickhouse-client");
         let l = ChLoader::with_client(ChConfig::default(), p.clone());
         assert_eq!(l.client, p);
+    }
+
+    /// A fake client that logs every `--query=` argument to `<script>.log` and
+    /// answers the witness-table probe with `1`. Used to assert the exact SQL a
+    /// `retract_from` emits.
+    fn logging_client(tag: &str, witness_exists: bool) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("bidx-log-ch-{tag}-{}", std::process::id()));
+        let probe = if witness_exists { "1" } else { "0" };
+        let body = format!(
+            "#!/bin/sh\nq=''\nfor a in \"$@\"; do case \"$a\" in --query=*) q=\"$a\";; esac; done\n\
+             echo \"$q\" >> \"$0.log\"\n\
+             case \"$q\" in *system.tables*) echo '{probe}';; esac\nexit 0\n"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!(
+            "bidx-log-ch-{tag}-{}-tmp",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, body).unwrap();
+        let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        path
+    }
+
+    fn read_log(script: &Path) -> String {
+        std::fs::read_to_string(format!("{}.log", script.display())).unwrap_or_default()
+    }
+
+    /// A reorg floor in the middle of a 10,000-block partition cannot drop the
+    /// partition (that would take canonical rows below the floor too), so every
+    /// base table must get a `DELETE ... WHERE height >= floor`.
+    #[test]
+    fn retract_from_uses_delete_for_a_mid_partition_height() {
+        let _g = fork_guard();
+        let client = logging_client("retract-mid", false);
+        let loader = loader_with(client.clone());
+        loader.retract_from(12_345).unwrap();
+        let log = read_log(&client);
+        for table in schema::ENTITIES {
+            assert!(
+                log.contains(&format!("DELETE FROM db.{table} WHERE height >= 12345")),
+                "missing delete for {table}: {log}"
+            );
+        }
+        // No partition drops, and the absent witness table is never touched.
+        assert!(!log.contains("DROP PARTITION"));
+        assert!(!log.contains("db.witnesses"));
+        let _ = std::fs::remove_file(&client);
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+    }
+
+    /// A floor exactly on a 10,000 boundary lets every base table drop the
+    /// whole partition (height / 10000), which is far cheaper than a mutation.
+    #[test]
+    fn retract_from_drops_partition_when_height_is_aligned() {
+        let _g = fork_guard();
+        let client = logging_client("retract-aligned", true);
+        let loader = loader_with(client.clone());
+        loader.retract_from(30_000).unwrap();
+        let log = read_log(&client);
+        for table in schema::ENTITIES {
+            assert!(
+                log.contains(&format!("ALTER TABLE db.{table} DROP PARTITION 3")),
+                "missing partition drop for {table}: {log}"
+            );
+        }
+        // The witness table exists (probe returned 1) and is deleted by height.
+        assert!(
+            log.contains("DELETE FROM db.witnesses WHERE height >= 30000"),
+            "witness retraction missing: {log}"
+        );
+        let _ = std::fs::remove_file(&client);
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+    }
+
+    #[test]
+    fn table_exists_probe_is_a_system_tables_count() {
+        let sql = schema::table_exists("db", "witnesses");
+        assert!(sql.contains("count() > 0"));
+        assert!(sql.contains("database = 'db'"));
+        assert!(sql.contains("name = 'witnesses'"));
+    }
+
+    #[test]
+    fn client_path_exposes_the_resolved_binary() {
+        let p = PathBuf::from("/opt/bidx/clickhouse-client");
+        let l = ChLoader::with_client(ChConfig::default(), p.clone());
+        assert_eq!(l.client_path(), p);
     }
 
     #[test]
@@ -623,6 +772,18 @@ mod tests {
         let loader = loader_with(client.clone());
         let tmp = std::env::temp_dir().join(format!("bidx-loadall-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
+        loader.load_all(&tmp).expect("fake client succeeds");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(&client);
+    }
+
+    #[test]
+    fn load_all_loads_optional_witnesses_when_dir_present() {
+        let _g = fork_guard();
+        let client = fake_client("loadall-witness", false);
+        let loader = loader_with(client.clone());
+        let tmp = std::env::temp_dir().join(format!("bidx-loadall-wit-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(schema::WITNESS_ENTITY)).unwrap();
         loader.load_all(&tmp).expect("fake client succeeds");
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_file(&client);

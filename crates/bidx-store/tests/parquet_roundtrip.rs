@@ -15,7 +15,7 @@ fn outdir(tag: &str) -> PathBuf {
 #[test]
 fn parquet_roundtrip_genesis() {
     let dir = outdir("genesis");
-    let mut sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 1000 }).unwrap();
+    let mut sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 1000, ..Default::default() }).unwrap();
 
     let block_hash = Hash32::from_hex(
         "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",

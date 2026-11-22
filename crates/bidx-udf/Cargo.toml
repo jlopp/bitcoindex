@@ -1,0 +1,16 @@
+[package]
+name = "bidx-udf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ClickHouse executable UDFs for the bitcoindex schema (address rendering)"
+
+[[bin]]
+name = "bidx-udf"
+path = "src/main.rs"
+
+[dependencies]
+bidx-core = { path = "../bidx-core" }
+bidx-serve = { path = "../bidx-serve" }
+clap.workspace = true
+thiserror.workspace = true

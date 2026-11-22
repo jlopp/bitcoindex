@@ -6,12 +6,12 @@
 //! size. Hashes are written as FixedSizeBinary(32) in wire order.
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Int32Builder, UInt8Builder, UInt32Builder,
-    UInt64Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Int32Builder, UInt8Builder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use bidx_core::{BlockRow, InputRow, OutputRow, SpendRow, TxRow};
+use bidx_core::{BlockRow, InputRow, OutputRow, SpendRow, TxRow, WitnessRow};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -34,12 +34,16 @@ pub enum SinkError {
 pub struct SinkConfig {
     /// Rows per Arrow record batch / Parquet row group.
     pub batch_size: usize,
+    /// Write the optional witness payload table. Off by default: the payload
+    /// roughly doubles on-disk size and no hot table needs it.
+    pub capture_witness: bool,
 }
 
 impl Default for SinkConfig {
     fn default() -> Self {
         SinkConfig {
             batch_size: 250_000,
+            capture_witness: false,
         }
     }
 }
@@ -65,6 +69,8 @@ enum Col {
     U8(UInt8Builder),
     Bool(BooleanBuilder),
     Bin32(FixedSizeBinaryBuilder),
+    /// Variable-length binary (witness stack elements).
+    Blob(BinaryBuilder),
 }
 
 impl Col {
@@ -76,6 +82,7 @@ impl Col {
             Col::U8(b) => Arc::new(b.finish()),
             Col::Bool(b) => Arc::new(b.finish()),
             Col::Bin32(b) => Arc::new(b.finish()),
+            Col::Blob(b) => Arc::new(b.finish()),
         }
     }
 }
@@ -93,6 +100,15 @@ macro_rules! push_bin {
     ($cols:expr, $i:expr, $v:expr) => {{
         match &mut $cols[$i] {
             Col::Bin32(b) => b.append_value($v)?,
+            _ => unreachable!("column type mismatch"),
+        }
+    }};
+}
+
+macro_rules! push_blob {
+    ($cols:expr, $i:expr, $v:expr) => {{
+        match &mut $cols[$i] {
+            Col::Blob(b) => b.append_value($v),
             _ => unreachable!("column type mismatch"),
         }
     }};
@@ -178,6 +194,20 @@ pub fn spends_schema() -> SchemaRef {
     ]))
 }
 
+/// Optional witness payload table: one row per witness stack element. Only
+/// written when parse was run with witness capture enabled, so this file is
+/// absent from a normal `parse` output directory.
+pub fn witnesses_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("height", DataType::UInt32, false),
+        Field::new("tx_index", DataType::UInt32, false),
+        Field::new("input_index", DataType::UInt32, false),
+        Field::new("item_index", DataType::UInt32, false),
+        Field::new("item_len", DataType::UInt32, false),
+        Field::new("item_bytes", DataType::Binary, false),
+    ]))
+}
+
 // ---- entity table definition: schema + a `push` that appends one row ----
 
 struct EntityTable {
@@ -198,6 +228,7 @@ impl EntityTable {
                 DataType::UInt8 => Col::U8(UInt8Builder::new()),
                 DataType::Boolean => Col::Bool(BooleanBuilder::new()),
                 DataType::FixedSizeBinary(w) => Col::Bin32(FixedSizeBinaryBuilder::new(*w)),
+                DataType::Binary => Col::Blob(BinaryBuilder::new()),
                 other => panic!("unsupported column type {other:?}"),
             })
             .collect();
@@ -226,12 +257,15 @@ pub struct ParquetSink {
     inputs_w: ArrowWriter<File>,
     outputs_w: ArrowWriter<File>,
     spends_w: ArrowWriter<File>,
+    /// Only present when `cfg.capture_witness` is set.
+    witnesses_w: Option<ArrowWriter<File>>,
 
     blocks: EntityTable,
     txs: EntityTable,
     inputs: EntityTable,
     outputs: EntityTable,
     spends: EntityTable,
+    witnesses: EntityTable,
 }
 
 fn create_writer(dir: &Path, entity: &str, part: u32, schema: SchemaRef) -> Result<ArrowWriter<File>, SinkError> {
@@ -243,6 +277,11 @@ fn create_writer(dir: &Path, entity: &str, part: u32, schema: SchemaRef) -> Resu
 
 impl ParquetSink {
     pub fn create(dir: &Path, part: u32, cfg: SinkConfig) -> Result<Self, SinkError> {
+        let witnesses_w = if cfg.capture_witness {
+            Some(create_writer(dir, "witnesses", part, witnesses_schema())?)
+        } else {
+            None
+        };
         Ok(ParquetSink {
             cfg,
             part,
@@ -251,11 +290,13 @@ impl ParquetSink {
             inputs_w: create_writer(dir, "inputs", part, inputs_schema())?,
             outputs_w: create_writer(dir, "outputs", part, outputs_schema())?,
             spends_w: create_writer(dir, "spends", part, spends_schema())?,
+            witnesses_w,
             blocks: EntityTable::new(blocks_schema()),
             txs: EntityTable::new(transactions_schema()),
             inputs: EntityTable::new(inputs_schema()),
             outputs: EntityTable::new(outputs_schema()),
             spends: EntityTable::new(spends_schema()),
+            witnesses: EntityTable::new(witnesses_schema()),
         })
     }
 
@@ -362,7 +403,31 @@ impl ParquetSink {
         Ok(())
     }
 
-    /// Flush any partial batches and close all five files.
+    /// Append one witness payload row. A no-op unless the sink was created
+    /// with `capture_witness`, so callers can push unconditionally.
+    pub fn push_witness(&mut self, r: &WitnessRow) -> Result<(), SinkError> {
+        if self.witnesses_w.is_none() {
+            return Ok(());
+        }
+        let c = &mut self.witnesses.cols;
+        push!(c, 0, U32, r.height);
+        push!(c, 1, U32, r.tx_index);
+        push!(c, 2, U32, r.input_index);
+        push!(c, 3, U32, r.item_index);
+        push!(c, 4, U32, r.item_len);
+        push_blob!(c, 5, &r.item_bytes);
+        self.witnesses.buffered += 1;
+        if self.witnesses.buffered >= self.cfg.batch_size {
+            let b = self.witnesses.take_batch()?;
+            self.witnesses_w
+                .as_mut()
+                .expect("writer present when capture_witness")
+                .write(&b)?;
+        }
+        Ok(())
+    }
+
+    /// Flush any partial batches and close all entity files.
     pub fn finish(mut self) -> Result<(), SinkError> {
         if self.blocks.buffered > 0 {
             let b = self.blocks.take_batch()?;
@@ -384,11 +449,20 @@ impl ParquetSink {
             let b = self.spends.take_batch()?;
             self.spends_w.write(&b)?;
         }
+        if self.witnesses.buffered > 0 {
+            let b = self.witnesses.take_batch()?;
+            if let Some(w) = self.witnesses_w.as_mut() {
+                w.write(&b)?;
+            }
+        }
         self.blocks_w.close()?;
         self.txs_w.close()?;
         self.inputs_w.close()?;
         self.outputs_w.close()?;
         self.spends_w.close()?;
+        if let Some(w) = self.witnesses_w.take() {
+            w.close()?;
+        }
         Ok(())
     }
 }
@@ -500,7 +574,7 @@ mod tests {
         // "buffered >= batch_size" flush path for every entity, including the
         // spend path. The remaining `finish()` branches see an empty buffer.
         let dir = tmp_dir("flush");
-        let mut sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 2 }).unwrap();
+        let mut sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 2, ..Default::default() }).unwrap();
         for h in 0..2u32 {
             sink.push_block(&block_row(h)).unwrap();
             sink.push_tx(&tx_row(h, 0)).unwrap();
@@ -558,7 +632,7 @@ mod tests {
         // batch_size larger than the row counts, so no push triggers a flush and
         // `finish()` must flush all five partial buffers.
         let dir = tmp_dir("partial");
-        let mut sink = ParquetSink::create(&dir, 7, SinkConfig { batch_size: 100 }).unwrap();
+        let mut sink = ParquetSink::create(&dir, 7, SinkConfig { batch_size: 100, ..Default::default() }).unwrap();
         sink.push_block(&block_row(3)).unwrap();
         sink.push_tx(&tx_row(3, 0)).unwrap();
         sink.push_input(&input_row(3, 0)).unwrap();
@@ -580,7 +654,7 @@ mod tests {
         // with zero row groups (an empty file has no record batch to read, but
         // its metadata must be present).
         let dir = tmp_dir("empty");
-        let sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 100 }).unwrap();
+        let sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 100, ..Default::default() }).unwrap();
         sink.finish().unwrap();
         let path = dir.join("blocks/part-00000.parquet");
         assert!(path.exists(), "empty sink must still create the file");
@@ -630,6 +704,7 @@ mod tests {
             ("inputs", inputs_schema()),
             ("outputs", outputs_schema()),
             ("spends", spends_schema()),
+            ("witnesses", witnesses_schema()),
         ] {
             assert!(!schema.fields().is_empty(), "{name} schema is empty");
             // Every hash column must be FixedSizeBinary(32), never a string.
@@ -644,5 +719,120 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn witnesses_schema_uses_variable_length_binary_payload() {
+        let s = witnesses_schema();
+        let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["height", "tx_index", "input_index", "item_index", "item_len", "item_bytes"]
+        );
+        let item = s.field_with_name("item_bytes").unwrap();
+        // The payload is raw stack bytes, not a fixed-size hash.
+        assert_eq!(*item.data_type(), DataType::Binary);
+        assert_eq!(*s.field_with_name("item_len").unwrap().data_type(), DataType::UInt32);
+    }
+
+    #[test]
+    fn witness_table_is_absent_unless_capture_is_enabled() {
+        // Default sink: push_witness is a no-op and no witnesses/ dir is made.
+        let dir = tmp_dir("no-witness");
+        let mut sink = ParquetSink::create(&dir, 0, SinkConfig::default()).unwrap();
+        let row = WitnessRow {
+            height: 1,
+            tx_index: 0,
+            input_index: 0,
+            item_index: 0,
+            item_len: 2,
+            item_bytes: vec![0xAA, 0xBB],
+        };
+        sink.push_witness(&row).unwrap();
+        sink.finish().unwrap();
+        assert!(
+            !dir.join("witnesses").exists(),
+            "witnesses dir must not exist when capture is off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn witness_capture_roundtrips_payload_bytes_through_parquet() {
+        // batch_size=1 forces the in-loop flush path for the witness writer,
+        // then a second row exercises finish()'s partial flush.
+        let dir = tmp_dir("witness");
+        let mut sink = ParquetSink::create(
+            &dir,
+            3,
+            SinkConfig { batch_size: 1, capture_witness: true },
+        )
+        .unwrap();
+        sink.push_witness(&WitnessRow {
+            height: 5,
+            tx_index: 0,
+            input_index: 0,
+            item_index: 0,
+            item_len: 3,
+            item_bytes: vec![0xDE, 0xAD, 0xBE],
+        })
+        .unwrap();
+        sink.push_witness(&WitnessRow {
+            height: 5,
+            tx_index: 1,
+            input_index: 2,
+            item_index: 1,
+            item_len: 0,
+            item_bytes: Vec::new(),
+        })
+        .unwrap();
+        sink.finish().unwrap();
+
+        let batch = read_first_batch(dir.join("witnesses/part-00003.parquet"));
+        assert_eq!(batch.num_rows(), 2);
+        let item = batch
+            .column_by_name("item_bytes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        assert_eq!(item.value(0), &[0xDE, 0xAD, 0xBE]);
+        assert_eq!(item.value(1), b"");
+        let idx = batch
+            .column_by_name("input_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(idx.value(1), 2);
+        let item_len = batch
+            .column_by_name("item_len")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(item_len.value(0), 3);
+        assert_eq!(item_len.value(1), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn witness_sink_with_capture_and_no_rows_still_writes_empty_file() {
+        // capture_witness=true but no rows pushed: the finish() witness branch
+        // takes the buffered == 0 side and the file is still created/closed.
+        let dir = tmp_dir("witness-empty");
+        let sink = ParquetSink::create(
+            &dir,
+            0,
+            SinkConfig { batch_size: 10, capture_witness: true },
+        )
+        .unwrap();
+        sink.finish().unwrap();
+        let path = dir.join("witnesses/part-00000.parquet");
+        assert!(path.exists());
+        let f = File::open(&path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

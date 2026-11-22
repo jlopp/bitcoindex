@@ -7,6 +7,7 @@ members = [
     "crates/bidx-loader",
     "crates/bidx-serve",
     "crates/bidx-live",
+    "crates/bidx-udf",
     "crates/bidx-cli",
 ]
 

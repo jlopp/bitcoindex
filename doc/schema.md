@@ -17,6 +17,7 @@ wins — see [Keeping this document honest](#keeping-this-document-honest).
   - [`inputs`](#inputs)
   - [`outputs`](#outputs)
   - [`spends`](#spends)
+  - [`witnesses` (optional)](#witnesses-optional)
 - [Index tables](#index-tables)
   - [`transactions_by_txid`](#transactions_by_txid)
   - [`inputs_by_prev_output`](#inputs_by_prev_output)
@@ -188,6 +189,28 @@ otherwise need to look up in `outputs` by outpoint is already here.
   `ORDER BY (height, spending_tx_index, spending_input_index)`.
 - Projection: `spends_by_spent_height` (order by `(spent_height, height)`) —
   serves output-lifespan / coin-days-destroyed queries.
+
+### `witnesses` (optional)
+
+One row per witness stack element, written **only** when `--capture-witness` is
+passed to `bidx parse` or `bidx live`. Keeping raw witness payloads out of the
+hot `inputs`/`transactions` tables by default is deliberate: witnesses are the
+largest and least-queried part of a transaction, and the vast majority of
+queries never need the payload, only its size (`inputs.witness_bytes`). The
+table is probed before use, so a database loaded without `--capture-witness`
+still works.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `height` | `UInt32` | Block height. |
+| `tx_index` | `UInt32` | Position of the transaction in its block. |
+| `input_index` | `UInt32` | Position of the input within the transaction. |
+| `item_index` | `UInt32` | Position of this element in the witness stack. |
+| `item_len` | `UInt32` | Element length in bytes. |
+| `item_bytes` | `String` | Raw witness element bytes. |
+
+- Engine: `MergeTree`, `PARTITION BY intDiv(height, 10000)`,
+  `ORDER BY (height, tx_index, input_index, item_index)`.
 
 ## Index tables
 
@@ -535,6 +558,35 @@ ORDER BY height DESC;
 > **Note:** `hex()` returns the raw byte order. Wrap it in `reverse()` to get
 > the conventional display hex. The serving layer's `hex(reverse(...))`
 > convention is `reverse_hex` in `bidx-serve/src/store.rs`.
+
+### Rendering addresses in SQL (optional UDF)
+
+By default addresses are never stored as strings, only as `(script_type,
+address_hash)`. For ad-hoc queries that want a human-readable address, install
+the optional `bidx-udf` executable UDF. Print the config fragment:
+
+```bash
+bidx udf-config --udf-bin /usr/local/bin/bidx-udf --network mainnet
+```
+
+Add the fragment to `clickhouse-server`'s `config.d/` (the `--network` must
+match the chain) and restart the server, then register the view:
+
+```sql
+CREATE OR REPLACE VIEW bitcoin.addresses AS
+SELECT address, script_type, address_hash FROM bitcoin.address_prefix;
+```
+
+Two functions become available:
+
+- `bidxAddress(script_type, hash_hex)` → address string (empty for a type the
+  network cannot render).
+- `bidxParseAddress(address)` → `script_type\thash_hex` (TabSeparated, for the
+  reverse direction).
+
+Neither the UDF nor the view is part of the core DDL — they are opt-in, so a
+plain `bidx init-db` stays portable across ClickHouse builds without the UDF
+feature.
 
 ## Keeping this document honest
 

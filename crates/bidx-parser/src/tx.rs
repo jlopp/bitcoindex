@@ -31,6 +31,21 @@ pub struct FullBlock {
     pub txs: Vec<TxRow>,
     pub inputs: Vec<InputRow>,
     pub outputs: Vec<OutputRow>,
+    /// Witness payload rows, one per witness stack item. Empty unless the
+    /// caller enabled capture (see [`ParseOptions`]).
+    pub witnesses: Vec<bidx_core::WitnessRow>,
+}
+
+/// Toggles for the full-parse stage.
+///
+/// Witness capture is opt-in because the payload roughly doubles the size of a
+/// modern block on disk, and none of the hot tables need it — they already
+/// carry per-input `witness_items`/`witness_bytes` counts. An operator who
+/// wants the payload table sets this at parse time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParseOptions {
+    /// Capture raw witness stack elements into `FullBlock::witnesses`.
+    pub capture_witness: bool,
 }
 
 /// Parse a block payload (bytes beginning at the 80-byte header) at a known
@@ -44,6 +59,18 @@ pub fn parse_block_full(
     block_hash: Hash32,
     header: &bidx_core::BlockHeader,
 ) -> Result<FullBlock, TxParseError> {
+    parse_block_full_opts(payload, height, block_hash, header, ParseOptions::default())
+}
+
+/// As [`parse_block_full`], but with explicit [`ParseOptions`] (witness
+/// capture).
+pub fn parse_block_full_opts(
+    payload: &[u8],
+    height: u32,
+    block_hash: Hash32,
+    header: &bidx_core::BlockHeader,
+    opts: ParseOptions,
+) -> Result<FullBlock, TxParseError> {
     let mut c = Cursor::new(payload);
     c.skip(80)?;
 
@@ -51,22 +78,25 @@ pub fn parse_block_full(
     let mut txs = Vec::with_capacity((tx_count as usize).min(100_000));
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
+    let mut witnesses = Vec::new();
     let mut coinbase_value = 0u64;
     let mut tx_weight_sum = 0u64;
 
     for tx_index in 0..tx_count as u32 {
-        let (tx, tx_inputs, tx_outputs) = parse_tx(&mut c, payload, height, tx_index)?;
+        let (tx, tx_inputs, tx_outputs, tx_witnesses) =
+            parse_tx(&mut c, payload, height, tx_index, opts)?;
         if tx_index == 0 {
             coinbase_value = tx_outputs.iter().map(|o| o.value_sat).sum();
         }
         tx_weight_sum += tx.weight as u64;
         inputs.extend(tx_inputs);
         outputs.extend(tx_outputs);
+        witnesses.extend(tx_witnesses);
         txs.push(tx);
     }
 
-    // coverage-exempt: 76-80 — unreachable by construction: the loop above runs
-    // exactly `tx_count` times and pushes exactly one tx per iteration, so
+    // coverage-exempt: 107-109 — unreachable by construction: the loop above
+    // runs exactly `tx_count` times and pushes exactly one tx per iteration, so
     // `txs.len() == tx_count` always holds (`read_count` also bounds `tx_count`
     // to `MAX_ITEMS`, well within `u32`). Kept as a defensive check so a future
     // change to the loop (e.g. a `continue` on a skipped tx) cannot silently
@@ -103,16 +133,23 @@ pub fn parse_block_full(
         txs,
         inputs,
         outputs,
+        witnesses,
     })
 }
 
-type ParsedTx = (TxRow, Vec<InputRow>, Vec<OutputRow>);
+type ParsedTx = (
+    TxRow,
+    Vec<InputRow>,
+    Vec<OutputRow>,
+    Vec<bidx_core::WitnessRow>,
+);
 
 fn parse_tx<'a>(
     c: &mut Cursor<'a>,
     block: &'a [u8],
     height: u32,
     tx_index: u32,
+    opts: ParseOptions,
 ) -> Result<ParsedTx, TxParseError> {
     let abs_start = c.pos();
     let version = c.read_i32()?;
@@ -193,13 +230,26 @@ fn parse_tx<'a>(
     // Position right after outputs = end of the stripped prefix.
     let stripped_prefix_end = c.pos();
 
+    let mut witnesses: Vec<bidx_core::WitnessRow> = Vec::new();
     if has_witness {
         for inp in inputs.iter_mut() {
             let item_count = c.read_count()?;
             inp.witness_items = item_count as u32;
-            for _ in 0..item_count {
+            for item_index in 0..item_count as u32 {
                 let item_len = c.read_count()?;
-                c.skip(item_len as usize)?;
+                if opts.capture_witness {
+                    let bytes = c.read_bytes(item_len as usize)?;
+                    witnesses.push(bidx_core::WitnessRow {
+                        height,
+                        tx_index,
+                        input_index: inp.input_index,
+                        item_index,
+                        item_len: item_len as u32,
+                        item_bytes: bytes.to_vec(),
+                    });
+                } else {
+                    c.skip(item_len as usize)?;
+                }
                 inp.witness_bytes += item_len as u32;
             }
         }
@@ -263,7 +313,7 @@ fn parse_tx<'a>(
         output_count: output_count as u32,
         has_witness,
     };
-    Ok((tx, inputs, outputs))
+    Ok((tx, inputs, outputs, witnesses))
 }
 
 #[cfg(test)]
@@ -552,6 +602,88 @@ mod tests {
         let total = tx.len() as u32;
         assert_eq!(block.txs[0].size, total);
         assert_eq!(block.txs[0].weight, stripped * 3 + total);
+    }
+
+    #[test]
+    fn witness_capture_records_stack_elements_with_offsets() {
+        // Same two-input segwit shape as the metric test, but parsed with
+        // `capture_witness` on: input 0 has no items, input 1 has two items
+        // of length 1 and 3, so exactly two WitnessRow entries must appear
+        // with the right (input_index, item_index, item_len, bytes).
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0x00);
+        tx.push(0x01);
+        tx.push(2u8); // two inputs
+        for _ in 0..2 {
+            tx.extend_from_slice(&[0xEEu8; 32]);
+            tx.extend_from_slice(&0u32.to_le_bytes());
+            tx.push(0u8);
+            tx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        tx.push(1u8); // one output
+        tx.extend_from_slice(&1_000u64.to_le_bytes());
+        tx.push(0u8);
+        tx.push(0u8); // input 0: 0 items
+        tx.push(2u8); // input 1: 2 items
+        tx.push(1u8);
+        tx.push(0xAA);
+        tx.push(3u8);
+        tx.extend_from_slice(&[0xBB, 0xCC, 0xDD]);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+        let block = parse_block_full_opts(
+            &payload,
+            8,
+            hash,
+            &header_for(1),
+            ParseOptions {
+                capture_witness: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(block.witnesses.len(), 2);
+        let w0 = &block.witnesses[0];
+        assert_eq!((w0.height, w0.tx_index, w0.input_index, w0.item_index), (8, 0, 1, 0));
+        assert_eq!(w0.item_len, 1);
+        assert_eq!(w0.item_bytes, vec![0xAA]);
+        let w1 = &block.witnesses[1];
+        assert_eq!((w1.input_index, w1.item_index), (1, 1));
+        assert_eq!(w1.item_len, 3);
+        assert_eq!(w1.item_bytes, vec![0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn witness_capture_off_leaves_witnesses_empty() {
+        // A segwit block parsed with default options must not allocate any
+        // WitnessRow, even though the per-input counts are still recorded.
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0x00);
+        tx.push(0x01);
+        tx.push(1u8);
+        tx.extend_from_slice(&[0xCDu8; 32]);
+        tx.extend_from_slice(&7u32.to_le_bytes());
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(1u8);
+        tx.extend_from_slice(&10_000u64.to_le_bytes());
+        tx.push(0u8);
+        tx.push(1u8);
+        tx.push(2u8);
+        tx.push(0xAA);
+        tx.push(0xBB);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+        let block = parse_block_full(&payload, 9, hash, &header_for(1)).unwrap();
+        assert!(block.witnesses.is_empty());
+        assert_eq!(block.inputs[0].witness_items, 1);
+        assert_eq!(block.inputs[0].witness_bytes, 2);
     }
 
     #[test]

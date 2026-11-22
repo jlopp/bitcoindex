@@ -123,14 +123,28 @@ A single thread (`consume_ordered`) is the only sequential stage. It:
 2. Drains contiguous heights starting at `next`.
 3. Applies UTXO changes via `UtxoStore::apply_block`.
 4. Enriches transactions with fees and sets the block's `total_fee`.
-5. Pushes everything into the Parquet sink, rotating part files every
-   `blocks_per_part` blocks.
+5. Hands the enriched block to a dedicated **sink thread** over a bounded
+   channel; the sink thread pushes rows into the Parquet sink and rotates part
+   files every `blocks_per_part` blocks.
 
-Why one thread? Because the UTXO set must be mutated in strict height order,
-and the RocksDB `WriteBatch` per block is the natural unit. Parallelising
+Why one consumer thread? Because the UTXO set must be mutated in strict height
+order, and the RocksDB `WriteBatch` per block is the natural unit. Parallelising
 apply would require partitioning the UTXO set, which is not worth the
 complexity for a stage that is I/O-and-CPU bound per key rather than
 bandwidth-bound.
+
+### Sink overlap
+
+The consumer's per-block work is the RocksDB commit (a WAL-synced `WriteBatch`
+in live mode), and the sink's is Parquet column encoding plus file I/O. These
+are independent, so the consumer hands each enriched block to a **sink thread**
+(`sink_thread_main`) over a bounded `crossbeam_channel` (`SinkMsg::Block`) and
+immediately proceeds to the next block. The two stages therefore run
+concurrently: the sink compresses and writes one block while the consumer
+commits the next. A `SinkMsg::Finish` sentinel flushes the last part and the
+sink thread is joined, so a sink failure is still reported even on a complete
+range. The bound on the channel keeps a slow sink from letting the consumer's
+memory grow without limit.
 
 ### Fee enrichment
 
@@ -261,12 +275,26 @@ duplicate, or stale-branch notifications, and cheap in the common case (one
 
 ### Live Parquet
 
-With `--out`, each applied block plus its spend rows is appended to rolling part
-files (`out-live/<entity>/part-NNNNN.parquet`, 1,000 blocks/part). **Caveat:**
-rows already flushed for a *disconnected* height are not retracted from a
-closed part. On load, drop ClickHouse partitions `>=` the reorg floor before
-reloading the affected range. Direct live inserts into ClickHouse (bypassing
-Parquet) are on the roadmap.
+With `--out`, each applied block plus its spend rows is buffered in memory for
+the open part and written to rolling part files
+(`out-live/<entity>/part-NNNNN.parquet`, 1,000 blocks/part) when the part
+rotates or on shutdown. Because the open part is held in memory, a **shallow**
+reorg (a disconnected height still in the open part) is retracted *exactly*:
+those rows are dropped from the buffer before any file is written. A **deep**
+reorg below the open part cannot rewrite a closed file, so the retraction floor
+is recorded to `out-live/.live-reorg-floor`; on load, drop ClickHouse
+partitions `>=` that floor before reloading the affected range.
+
+### Direct ClickHouse live inserts
+
+`bidx live --ch-live` bypasses Parquet entirely and streams each applied block
+straight into ClickHouse for sub-minute tip freshness. One `clickhouse-client`
+process is kept open per table (`INSERT INTO … FORMAT RowBinary` reading from
+stdin), so a block costs a single buffered write per table instead of a process
+spawn. Materialized views fire exactly as they do for a bulk load, so the
+derived indexes stay in sync. A disconnected height is deleted by `height`
+(`DELETE FROM … WHERE height >= floor`), since those rows were inserted on
+apply. Witness payloads are inserted only when `--capture-witness` is set.
 
 ## Disk-space guard
 
@@ -367,7 +395,9 @@ From the bench harness (testnet4, 24,820 blocks):
   dropping effective throughput from ~280k to ~46k blocks/s. Together they set
   the end-to-end ceiling.
 - Optimizations that matter are therefore on the sequential side: batching UTXO
-  writes, larger Parquet row groups, or overlapping sink I/O with UTXO apply.
+  writes, larger Parquet row groups, or overlapping sink I/O with UTXO apply
+  (now implemented via the dedicated sink thread — see
+  [Stage 3: ordered consumer](#stage-3-ordered-consumer)).
 
 See [PERF.md](../PERF.md) for the full measurements and
 [cli.md](cli.md#bench) for how to reproduce them.

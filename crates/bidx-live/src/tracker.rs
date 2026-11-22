@@ -4,7 +4,7 @@
 use crate::node::{NodeClient, RpcError};
 use crate::zmqsub::ZmqSubscriber;
 use bidx_core::{BlockHeader, Hash32};
-use bidx_parser::parse_block_full;
+use bidx_parser::{parse_block_full_opts, ParseOptions};
 use bidx_store::{TipState, UtxoStore};
 use std::sync::Arc;
 use thiserror::Error;
@@ -30,11 +30,17 @@ pub struct TrackerConfig {
     /// beyond this require a rescan (they essentially never happen on
     /// mainnet beyond depth 1-2).
     pub max_reorg_depth: u32,
+    /// Capture raw witness stack elements into `FullBlock::witnesses` so the
+    /// live Parquet sink can append them to the optional `witnesses` table.
+    pub capture_witness: bool,
 }
 
 impl Default for TrackerConfig {
     fn default() -> Self {
-        TrackerConfig { max_reorg_depth: 100 }
+        TrackerConfig {
+            max_reorg_depth: 100,
+            capture_witness: false,
+        }
     }
 }
 
@@ -85,8 +91,8 @@ impl LiveTracker {
     /// `on_event` is called after each applied/disconnected block so the
     /// caller can persist rows to the Parquet/ClickHouse sink.
     ///
-    /// coverage-exempt: 96-97 — `run` is a thin wrapper whose `catch_up` half is
-    /// fully covered; the `live_loop` half is an infinite loop by design and
+    /// coverage-exempt: 102-103 — `run` is a thin wrapper whose `catch_up` half
+    /// is fully covered; the `live_loop` half is an infinite loop by design and
     /// cannot return under test (see `live_loop`).
     pub fn run<F>(&self, mut on_event: F) -> Result<(), TrackerError>
     where
@@ -187,7 +193,15 @@ impl LiveTracker {
             let (header, hdr_raw) = parse_header(&raw)?;
             let computed = bidx_core::dsha256(&hdr_raw);
             debug_assert_eq!(computed, hash);
-            let mut block = parse_block_full(&raw, next_height, hash, &header)?;
+            let mut block = parse_block_full_opts(
+                &raw,
+                next_height,
+                hash,
+                &header,
+                ParseOptions {
+                    capture_witness: self.cfg.capture_witness,
+                },
+            )?;
 
             let res = self
                 .utxo
@@ -465,6 +479,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&utxo_dir);
     }
 
+    /// A segwit block payload at `height` with one 2-byte witness item on its
+    /// single coinbase input. Used to prove the tracker threads
+    /// `capture_witness` through to the parsed `FullBlock`.
+    fn synth_segwit_block(height: u32, prev_hash: Hash32, out_sat: u64) -> (Vec<u8>, Hash32) {
+        let mut hdr = [0u8; 80];
+        hdr[0] = 1;
+        hdr[4..36].copy_from_slice(prev_hash.as_bytes());
+        for j in 0..32 {
+            hdr[36 + j] = ((height >> 3) as u8).wrapping_add(j as u8);
+        }
+        hdr[68..72].copy_from_slice(&1231006505u32.to_le_bytes());
+        hdr[72..76].copy_from_slice(&0x1d00ffffu32.to_le_bytes());
+        hdr[76..80].copy_from_slice(&height.to_le_bytes());
+
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0x00); // marker
+        tx.push(0x01); // flag
+        tx.push(1u8); // input_count
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        tx.push(0u8); // scriptsig len
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(1u8); // output_count
+        tx.extend_from_slice(&out_sat.to_le_bytes());
+        tx.push(0u8); // spk_len
+        tx.push(1u8); // 1 witness item
+        tx.push(2u8); // 2 bytes
+        tx.push(0xAA);
+        tx.push(0xBB);
+        tx.extend_from_slice(&0u32.to_le_bytes()); // locktime
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&hdr);
+        raw.push(1u8); // tx_count
+        raw.extend_from_slice(&tx);
+        let block_hash = bidx_core::dsha256(&raw[..80]);
+        (raw, block_hash)
+    }
+
+    /// With `capture_witness` set, the `Applied` event's block must carry the
+    /// witness payload rows; with it unset, the same block yields none.
+    #[test]
+    fn catch_up_captures_witness_only_when_configured() {
+        for capture in [false, true] {
+            let (raw_g, h_g) = synth_segwit_block(0, Hash32::ZERO, 50_0000_0000);
+            let (raw_1, h_1) = synth_segwit_block(1, h_g, 50_0000_0000);
+            let node = FakeNode::new();
+            node.add(0, raw_g.clone(), h_g);
+            node.add(1, raw_1.clone(), h_1);
+
+            let utxo_dir = tmp_utxo(if capture { "wit-on" } else { "wit-off" });
+            let utxo = Arc::new(UtxoStore::open_live(&utxo_dir).unwrap());
+            utxo.set_tip(&TipState { height: 0, hash: h_g }).unwrap();
+
+            let client = NodeClient::with_transport(Box::new(node));
+            let tracker = LiveTracker::new(
+                client,
+                None,
+                utxo.clone(),
+                TrackerConfig {
+                    max_reorg_depth: 100,
+                    capture_witness: capture,
+                },
+            );
+            let mut witness_rows = Vec::new();
+            tracker
+                .catch_up(&mut |e, b| {
+                    if let (TrackerEvent::Applied { .. }, Some(b)) = (&e, b) {
+                        witness_rows.push(b.witnesses.len());
+                    }
+                })
+                .unwrap();
+
+            assert_eq!(witness_rows, vec![if capture { 1 } else { 0 }]);
+            let _ = std::fs::remove_dir_all(&utxo_dir);
+        }
+    }
+
     /// Emulate a reorg: replace height-1 block with a different one (different
     /// prev window -> different hash). The tracker must detect the mismatch
     /// on its stored tip, walk back one disconnect, then apply the new block.
@@ -541,7 +634,7 @@ mod tests {
         // We have to actually apply two blocks for disconnect_block to find
         // an undo record. Easier: lower max_reorg_depth to 0 so we hit
         // ReorgTooDeep on the first disconnect check.
-        let cfg = TrackerConfig { max_reorg_depth: 0 };
+        let cfg = TrackerConfig { max_reorg_depth: 0, ..Default::default() };
         let node = FakeNode::new();
         node.add(0, raw_g.clone(), h_g);
         let client = NodeClient::with_transport(Box::new(node));
@@ -731,7 +824,7 @@ mod tests {
             client,
             None,
             utxo.clone(),
-            TrackerConfig { max_reorg_depth: 0 },
+            TrackerConfig { max_reorg_depth: 0, ..Default::default() },
         );
         // The initial catch_up returns ReorgTooDeep immediately (no undo record
         // needed because the budget check fires before disconnect_block).

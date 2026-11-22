@@ -41,8 +41,22 @@
 //!
 //! The pre-existing `inputs_by_prev_output` table is also kept and now
 //! auto-maintained by an MV.
+//!
+//! ## Rendering addresses from SQL
+//!
+//! ClickHouse cannot encode base58/bech32, so two helpers expose the
+//! `bidx-udf` codec to ad-hoc SQL (see [`udf_config_xml`] and
+//! [`address_view`]). Neither is part of [`all_ddl`]: the UDF is registered
+//! through a ClickHouse config file, so an operator opts in by installing it.
+
+use bidx_core::Network;
 
 pub const ENTITIES: [&str; 5] = ["blocks", "transactions", "inputs", "outputs", "spends"];
+
+/// Optional witness payload table. Not part of [`ENTITIES`] (a normal `parse`
+/// does not produce it), so `load` treats it separately and tolerates its
+/// absence.
+pub const WITNESS_ENTITY: &str = "witnesses";
 
 /// Script type code for `OP_RETURN` (unspendable data carrier). Excluded from
 /// every address-keyed index because its `address_hash` is all zeros and it
@@ -93,6 +107,7 @@ pub fn all_ddl(db: &str) -> Vec<String> {
         inputs(db),
         outputs(db),
         spends(db),
+        witnesses(db),
         // --- indexes added in place on base tables (projections, skip
         //     indexes, materialized column) ---
         proj_blocks_by_hash(db),             // 1
@@ -142,6 +157,7 @@ pub fn all_table_names() -> Vec<&'static str> {
         "inputs",
         "outputs",
         "spends",
+        "witnesses",
         "transactions_by_txid",
         "inputs_by_prev_output",
         "outputs_by_address",
@@ -274,6 +290,14 @@ pub fn read_schema_version(db: &str) -> String {
     format!("SELECT ifNull(max(version), 0) AS version FROM {db}.meta_schema")
 }
 
+/// Query returning `1` when `table` exists in the database, else `0`. Used to
+/// probe for the optional `witnesses` table before touching it.
+pub fn table_exists(db: &str, table: &str) -> String {
+    format!(
+        "SELECT count() > 0 FROM system.tables WHERE database = '{db}' AND name = '{table}'"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Base tables
 // ---------------------------------------------------------------------------
@@ -337,6 +361,22 @@ fn spends(db: &str) -> String {
          ENGINE = MergeTree \
          PARTITION BY intDiv(height, 10000) \
          ORDER BY (height, spending_tx_index, spending_input_index)"
+    )
+}
+
+/// Optional witness payload table: one row per witness stack element. Only
+/// populated when the Parquet output was produced with witness capture
+/// enabled. `item_bytes` is `String` (ClickHouse's name for a byte blob),
+/// matching the Parquet `Binary` column; it is the *only* variable-length
+/// column in the base schema besides `address_prefix.address`.
+fn witnesses(db: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {db}.witnesses \
+         (height UInt32, tx_index UInt32, input_index UInt32, item_index UInt32, \
+          item_len UInt32, item_bytes String) \
+         ENGINE = MergeTree \
+         PARTITION BY intDiv(height, 10000) \
+         ORDER BY (height, tx_index, input_index, item_index)"
     )
 }
 
@@ -787,6 +827,65 @@ pub fn backfill_scripthash_map(db: &str) -> Vec<String> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Executable-UDF helpers (address rendering from SQL)
+// ---------------------------------------------------------------------------
+
+/// ClickHouse config fragment registering the `bidx-udf` executable UDFs.
+///
+/// ClickHouse has no base58/bech32 encoder, so `bidx index rebuild
+/// address_prefix` is the supported bulk path. For *ad-hoc* SQL rendering
+/// (spot-checking an address, a small `SELECT`), an executable UDF is more
+/// convenient — this fragment registers two:
+///
+/// * `bidxAddress(script_type, hash_hex)` → address string (empty for a type
+///   with no address form);
+/// * `bidxParseAddress(address)` → `script_type\thash_hex`.
+///
+/// The returned XML is a `<clickhouse><functions>` block to be dropped into a
+/// `*.xml` file under the server's `config.d/` directory. The
+/// `<command>` must point at an installed `bidx-udf` binary; `--network`
+/// selects the chain (so an operator registers one fragment per chain they
+/// serve). See `bidx_udf` for the streaming contract.
+pub fn udf_config_xml(udf_bin: &str, network: Network) -> String {
+    // XML-escape the binary path so an unusual install location cannot break
+    // out of the element.
+    let bin = udf_bin
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    let net = network.name();
+    format!(
+        "<clickhouse>\n  <functions>\n    \
+         <function>\n      <type>executable</type>\n      <name>bidxAddress</name>\n      \
+         <return_type>String</return_type>\n      <argument>\n        <type>UInt8</type>\n      \
+         </argument>\n      <argument>\n        <type>String</type>\n      </argument>\n      \
+         <format>TabSeparated</format>\n      \
+         <command>{bin} address --network {net}</command>\n    </function>\n    \
+         <function>\n      <type>executable</type>\n      <name>bidxParseAddress</name>\n      \
+         <return_type>String</return_type>\n      <argument>\n        <type>String</type>\n      \
+         </argument>\n      <format>TabSeparated</format>\n      \
+         <command>{bin} parse --network {net}</command>\n    </function>\n  \
+         </functions>\n</clickhouse>\n"
+    )
+}
+
+/// A view that adds a rendered `address` column to the `address_prefix` map.
+///
+/// `address_prefix` is populated in Rust (see
+/// [`crate::ChLoader::rebuild_address_prefix`]) and already stores the encoded
+/// string, so this view is a thin convenience: it joins nothing and merely
+/// projects the table under a stable name for downstream SQL. It is `CREATE
+/// OR REPLACE` so re-running is idempotent, and it is *not* in [`all_ddl`]
+/// because the table must be backfilled first.
+pub fn address_view(db: &str) -> String {
+    format!(
+        "CREATE OR REPLACE VIEW {db}.addresses AS \
+         SELECT address, script_type, address_hash FROM {db}.address_prefix"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1114,5 +1213,42 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn udf_config_xml_registers_both_functions_for_the_network() {
+        let xml = udf_config_xml("/usr/local/bin/bidx-udf", Network::Testnet3);
+        // Both functions are declared with the executable type and the
+        // TabSeparated wire format.
+        assert!(xml.contains("<name>bidxAddress</name>"));
+        assert!(xml.contains("<name>bidxParseAddress</name>"));
+        assert_eq!(xml.matches("<type>executable</type>").count(), 2);
+        assert_eq!(xml.matches("<format>TabSeparated</format>").count(), 2);
+        // The command carries the binary and the network.
+        assert!(xml.contains("<command>/usr/local/bin/bidx-udf address --network testnet3</command>"));
+        assert!(xml.contains("<command>/usr/local/bin/bidx-udf parse --network testnet3</command>"));
+        // Argument types: UInt8+String for render, String for parse.
+        assert!(xml.contains("<type>UInt8</type>"));
+        assert!(xml.contains("<type>String</type>"));
+        assert!(xml.contains("<return_type>String</return_type>"));
+    }
+
+    #[test]
+    fn udf_config_xml_escapes_the_binary_path() {
+        let xml = udf_config_xml("/opt/a&b/<udf>", Network::Mainnet);
+        assert!(!xml.contains("/opt/a&b"), "raw path leaked: {xml}");
+        assert!(xml.contains("/opt/a&amp;b/&lt;udf&gt;"));
+        // A well-formed fragment still closes its root element.
+        assert!(xml.trim_end().ends_with("</clickhouse>"));
+    }
+
+    #[test]
+    fn address_view_is_create_or_replace_and_projects_the_prefix_table() {
+        let sql = address_view("db");
+        assert!(sql.starts_with("CREATE OR REPLACE VIEW db.addresses AS"));
+        assert!(sql.contains("FROM db.address_prefix"));
+        for col in ["address", "script_type", "address_hash"] {
+            assert!(sql.contains(col), "missing column {col}");
+        }
     }
 }

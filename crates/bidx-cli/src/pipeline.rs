@@ -14,7 +14,7 @@
 
 use crate::diskguard::{DiskGuardConfig, DiskRecorder, DEFAULT_CHECKPOINT_FILE_NAME};
 use anyhow::{Context, Result};
-use bidx_parser::{parse_block_full, BlkFile, FullBlock};
+use bidx_parser::{parse_block_full, parse_block_full_opts, BlkFile, FullBlock};
 use bidx_store::{ParquetSink, SinkConfig, UtxoStore};
 use crossbeam_channel::{bounded, Receiver};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -69,6 +69,12 @@ pub const REORDER_HIGH: usize = 32;
 /// channel is a memory leak under backpressure.
 pub const CHANNEL_DEPTH: usize = 512;
 
+/// Consumer -> sink channel depth. The sink thread overlaps Parquet I/O with
+/// the UTXO apply, so a small bound is enough to keep both busy while capping
+/// the number of fully-materialized blocks in flight (each holds all of a
+/// block's rows, ~a few MB at the tip).
+pub const SINK_CHANNEL_DEPTH: usize = 8;
+
 /// Configuration for a parse run.
 ///
 /// Deliberately not `Clone`/`Debug`: it holds a boxed `dyn RpcTransport` (see
@@ -103,6 +109,8 @@ pub struct ParseConfig {
     /// pre-flight (projection, orphan filtering, and their log branches)
     /// without a live node.
     pub rpc_transport: Option<Box<dyn bidx_live::RpcTransport>>,
+    /// Capture raw witness stack elements into the optional witnesses table.
+    pub capture_witness: bool,
 }
 
 /// A parse-stage message: either a fully-parsed block, or a "skipped"
@@ -244,6 +252,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // Spawn the ordered consumer on its own thread.
     let out_dir = cfg.out.clone();
     let blocks_per_part = cfg.blocks_per_part;
+    let capture_witness = cfg.capture_witness;
     let recorder = Arc::new(DiskRecorder::new(disk_cfg.clone()));
     // The watchdog must exist before the consumer is spawned so the consumer
     // can poll it. `Arc` because the consumer thread needs its own handle;
@@ -270,6 +279,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 &reorder_depth,
                 &next_height,
                 Some(watchdog.as_ref()),
+                capture_witness,
             )
         }
     });
@@ -283,6 +293,9 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     let reorder_depth_w = Arc::clone(&reorder_depth);
     let next_height_w = Arc::clone(&next_height);
     let file_cache = ThreadFileCache::new(&blocks_dir);
+    let parse_opts = bidx_parser::ParseOptions {
+        capture_witness: cfg.capture_witness,
+    };
     // Workers need the watchdog too: when it trips, the consumer returns and
     // drops `rx`, so every worker's next `send` fails. Reporting that as
     // "consumer dropped" would hide the actual cause, so the send-failure path
@@ -311,11 +324,11 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // holding the height the consumer is waiting for must run, or
                 // no block ever arrives to let the consumer drain.
                 //
-                // coverage-exempt: 320, 322-323, 325 — the spin body only runs
+                // coverage-exempt: 333, 335-336, 338 — the spin body only runs
                 // when the consumer is >REORDER_HIGH blocks behind *and* the
                 // worker's height is not the one being awaited, i.e. under real
-                // memory pressure the unit fixtures never create. The condition
-                // itself (line 319) is exercised.
+                // memory pressure the unit fixtures never create. The first
+                // clause of the condition (line 332) is exercised.
                 while reorder.load(Ordering::Relaxed) > REORDER_HIGH
                     && next_h.load(Ordering::Relaxed) != height
                 {
@@ -337,7 +350,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // A send failure means the consumer is gone. That is either a
                 // real bug or the RSS watchdog having aborted it; report the
                 // actual cause rather than a generic "consumer dropped".
-                // coverage-exempt: 345-348 — only runs when a send to the
+                // coverage-exempt: 358-359, 361 — only runs when a send to the
                 // consumer fails, which needs the consumer thread to have
                 // aborted mid-run (RSS watchdog); not reachable in the unit
                 // fixtures. The closure's construction is covered.
@@ -360,7 +373,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                         return Ok(());
                     }
                 }
-                let block = parse_block_full(&bytes, height, hash, &header)?;
+                let block = parse_block_full_opts(&bytes, height, hash, &header, parse_opts)?;
                 tx.send(WorkItem::Block { height, block })
                     .map_err(|_| send_failed(watchdog))?;
                 Ok(())
@@ -483,7 +496,12 @@ impl ThreadFileCache {
 }
 
 /// Receives out-of-order parsed blocks, buffers until the next expected
-/// height arrives, applies UTXO changes in order, and writes to Parquet.
+/// height arrives, applies UTXO changes in order, and hands each enriched block
+/// to a dedicated sink thread that writes Parquet.
+///
+/// The sink runs on its own thread so its file I/O (and zstd compression)
+/// overlaps the RocksDB apply on this thread — they are the two halves of the
+/// consumer's cost and neither depends on the other's result.
 #[allow(clippy::too_many_arguments)]
 fn consume_ordered(
     rx: Receiver<WorkItem>,
@@ -502,16 +520,29 @@ fn consume_ordered(
     // parks, so nothing ever arrives to unblock the consumer.
     next_height: &AtomicU32,
     watchdog: Option<&crate::bench::OomWatchdog>,
+    capture_witness: bool,
 ) -> Result<()> {
     let mut buffer: BTreeMap<u32, FullBlock> = BTreeMap::new();
     let mut skipped_queue: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut next = start;
     next_height.store(next, Ordering::Relaxed);
 
-    let mut part_id = start / blocks_per_part;
-    let mut sink = ParquetSink::create(out_dir, part_id, SinkConfig::default())?;
+    let sink_cfg = SinkConfig {
+        capture_witness,
+        ..SinkConfig::default()
+    };
+    let start_part = start / blocks_per_part;
 
-    while let Ok(item) = rx.recv() {
+    // Dedicated sink thread. Bounded so a slow sink backpressures the consumer
+    // instead of buffering unboundedly; the consumer simply blocks on `send`,
+    // which stops it draining the reorder buffer, which stops the workers.
+    let (sink_tx, sink_rx) = bounded::<SinkMsg>(SINK_CHANNEL_DEPTH);
+    let sink_out = out_dir.to_path_buf();
+    let sink_handle = std::thread::spawn(move || -> Result<()> {
+        sink_thread_main(sink_rx, &sink_out, blocks_per_part, start_part, sink_cfg)
+    });
+
+    'consume: while let Ok(item) = rx.recv() {
         match item {
             WorkItem::Block { height, block } => {
                 buffer.insert(height, block);
@@ -532,15 +563,14 @@ fn consume_ordered(
             next += 1;
             next_height.store(next, Ordering::Relaxed);
             if next >= end {
-                sink.finish()?;
-                return Ok(());
+                break 'consume;
             }
         }
 
         while let Some(block) = buffer.remove(&next) {
             // Poll the RSS watchdog once per block. It is a relaxed atomic
             // load, so the cost is nil next to apply_block.
-            // coverage-exempt: 549 — returns only when the watchdog has already
+            // coverage-exempt: 579 — returns only when the watchdog has already
             // tripped (process RSS over the computed ceiling), which the unit
             // fixtures do not reach; the `Some(w)`/`is_tripped` checks are
             // exercised on the non-tripped path.
@@ -552,13 +582,6 @@ fn consume_ordered(
             // Drained one from reorder buffer — signal workers that there
             // is space for more.
             reorder_depth.fetch_sub(1, Ordering::Relaxed);
-            // Rotate part file at boundaries.
-            let wanted_part = next / blocks_per_part;
-            if wanted_part != part_id {
-                sink.finish()?;
-                part_id = wanted_part;
-                sink = ParquetSink::create(out_dir, part_id, SinkConfig::default())?;
-            }
 
             let mut block = block;
             let res = utxo.apply_block(next, &block.txs, &block.inputs, &block.outputs)?;
@@ -589,18 +612,17 @@ fn consume_ordered(
             }
             block.block_row.total_fee = total_fee;
 
-            sink.push_block(&block.block_row)?;
-            for tx in &block.txs {
-                sink.push_tx(tx)?;
-            }
-            for inp in &block.inputs {
-                sink.push_input(inp)?;
-            }
-            for out in &block.outputs {
-                sink.push_output(out)?;
-            }
-            for sp in &res.spends {
-                sink.push_spend(sp)?;
+            // Hand the fully-enriched block to the sink thread. A send error
+            // means the sink already failed; surface its error, not a generic
+            // "channel closed".
+            // coverage-exempt: 622-625 — only runs when the sink thread has
+            // already died (a Parquet write error mid-run), which the fixtures
+            // do not provoke; the normal send is covered.
+            if sink_tx.send(SinkMsg::Block { block, spends: res.spends }).is_err() {
+                let e = sink_handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
+                return Err(e.unwrap_err().context("parquet sink thread failed"));
             }
 
             progress.inc(1);
@@ -608,22 +630,87 @@ fn consume_ordered(
             next += 1;
             next_height.store(next, Ordering::Relaxed);
             if next >= end {
-                sink.finish()?;
-                return Ok(());
+                break 'consume;
             }
         }
     }
 
-    // Channel closed before we saw every height: that's an error.
-    // coverage-exempt: 623-627 — reached only when the producer's channel closes
-    // before every height was delivered (a parse/worker abort). The fixtures
-    // always complete the range and return via the early `next >= end` exit, so
-    // this defensive tail is not exercised; it exists so a truncated run fails
-    // loudly instead of silently writing a partial index.
-    sink.finish()?;
+    // Ask the sink to flush its last part and close, then reap it. Join before
+    // the early-exit/truncation check so a sink failure is reported even on a
+    // complete range.
+    let _ = sink_tx.send(SinkMsg::Finish);
+    drop(sink_tx);
+    let sink_res = sink_handle
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
+
     if next < end {
+        // Channel closed before we saw every height: that's an error.
+        // coverage-exempt: 655-656 — reached only when the producer's channel
+        // closes before every height was delivered (a parse/worker abort). The
+        // fixtures always complete the range and return via the `break
+        // 'consume` exit, so this defensive tail is not exercised; it exists so
+        // a truncated run fails loudly instead of silently writing a partial
+        // index. The sink is still reaped above so its part file is closed.
+        sink_res?;
         anyhow::bail!("channel closed early: stopped at height {next}, expected {end}");
     }
+    sink_res
+}
+
+/// A message from the ordered consumer to the sink thread.
+enum SinkMsg {
+    /// An enriched block (fees filled, total_fee set) plus its spend rows.
+    Block {
+        block: FullBlock,
+        spends: Vec<bidx_core::SpendRow>,
+    },
+    /// Flush the open part and stop.
+    Finish,
+}
+
+/// The sink thread body: owns the `ParquetSink`, rotates part files by height,
+/// and writes every row kind for each block it receives.
+fn sink_thread_main(
+    rx: Receiver<SinkMsg>,
+    out_dir: &Path,
+    blocks_per_part: u32,
+    start_part: u32,
+    sink_cfg: SinkConfig,
+) -> Result<()> {
+    let mut part_id = start_part;
+    let mut sink = ParquetSink::create(out_dir, part_id, sink_cfg)?;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            SinkMsg::Block { block, spends } => {
+                // Rotate part file at boundaries.
+                let wanted_part = block.block_row.height / blocks_per_part;
+                if wanted_part != part_id {
+                    sink.finish()?;
+                    part_id = wanted_part;
+                    sink = ParquetSink::create(out_dir, part_id, sink_cfg)?;
+                }
+                sink.push_block(&block.block_row)?;
+                for tx in &block.txs {
+                    sink.push_tx(tx)?;
+                }
+                for inp in &block.inputs {
+                    sink.push_input(inp)?;
+                }
+                for out in &block.outputs {
+                    sink.push_output(out)?;
+                }
+                for sp in &spends {
+                    sink.push_spend(sp)?;
+                }
+                for w in &block.witnesses {
+                    sink.push_witness(w)?;
+                }
+            }
+            SinkMsg::Finish => break,
+        }
+    }
+    sink.finish()?;
     Ok(())
 }
 
@@ -752,6 +839,64 @@ mod tests {
         tx
     }
 
+    /// A segwit coinbase-shaped tx: marker/flag set and one witness item of
+    /// two bytes on its single input, so `capture_witness` has a payload to
+    /// record. Non-zero locktime keeps the synthetic record from being
+    /// trimmed.
+    fn synth_segwit_coinbase(value: u64) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes()); // version
+        tx.push(0x00); // segwit marker
+        tx.push(0x01); // segwit flag
+        tx.push(1u8); // 1 input
+        tx.extend_from_slice(&[0u8; 32]); // prev_txid = zero (coinbase)
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prev_vout = max
+        tx.push(0u8); // script_sig_len
+        tx.extend_from_slice(&0u32.to_le_bytes()); // sequence
+        tx.push(1u8); // 1 output
+        tx.extend_from_slice(&value.to_le_bytes());
+        tx.push(0u8); // spk len 0
+        // witness for the single input: 1 item, 2 bytes.
+        tx.push(1u8);
+        tx.push(2u8);
+        tx.push(0xAA);
+        tx.push(0xBB);
+        tx.extend_from_slice(&0x1122_3344u32.to_le_bytes()); // non-zero locktime
+        tx
+    }
+
+    /// Single-block chain whose coinbase is a segwit tx with a 2-byte witness
+    /// item, for exercising witness capture through the whole pipeline.
+    fn make_witness_chain() -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "bidx-wit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let blk_path = tmp.join("blk00000.dat");
+
+        let tx = synth_segwit_coinbase(100);
+        let mut hdr = [0u8; BLOCK_HEADER_LEN];
+        hdr[0] = 1;
+        hdr[68..72].copy_from_slice(&1000u32.to_le_bytes());
+        hdr[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes());
+        hdr[79] = 0x01; // non-zero tail so the record survives the trim
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&((BLOCK_HEADER_LEN + 1 + tx.len()) as u32).to_le_bytes());
+        data.extend_from_slice(&hdr);
+        data.push(1u8); // tx_count
+        data.extend_from_slice(&tx);
+        fs::write(&blk_path, &data).unwrap();
+        tmp
+    }
+
     /// Two blocks: block 0 is a coinbase paying 100 sat; block 1 spends that
     /// coinbase output and pays 60, so block 1 carries a 40-sat fee. Returns
     /// (dir, [hash0, hash1]).
@@ -860,6 +1005,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: None,
         })
         .expect("run_parse");
@@ -886,6 +1032,94 @@ mod tests {
     }
 
     #[test]
+    fn run_parse_capture_witness_writes_payload_table() {
+        let blocks_dir = make_witness_chain();
+        let out = std::env::temp_dir().join(format!(
+            "bidx-pipe-wit-out-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let utxo = std::env::temp_dir().join(format!(
+            "bidx-pipe-wit-utxo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&utxo).unwrap();
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(1),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            capture_witness: true,
+            rpc_transport: None,
+        })
+        .expect("run_parse with witness capture");
+
+        // The optional witnesses table must be written and carry the 2-byte
+        // item from the segwit coinbase.
+        let part = out.join("witnesses/part-00000.parquet");
+        assert!(part.exists(), "witnesses part must exist: {:?}", part);
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let f = std::fs::File::open(&part).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let mut rows = 0usize;
+        for batch in reader {
+            let batch = batch.unwrap();
+            rows += batch.num_rows();
+            let col = batch
+                .column_by_name("item_bytes")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+                .unwrap();
+            assert_eq!(col.value(0), &[0xAA, 0xBB]);
+        }
+        assert_eq!(rows, 1, "one witness stack item expected");
+
+        // And with capture off, no witnesses table is produced.
+        let out2 = out.with_extension("no-wit");
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out2.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(1),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts2.txt")),
+            orphan_blocks: None,
+            capture_witness: false,
+            rpc_transport: None,
+        })
+        .expect("run_parse without witness capture");
+        assert!(!out2.join("witnesses").exists());
+
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&out2);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
     fn run_parse_rejects_empty_range() {
         let (blocks_dir, _) = make_chain(3);
         let out = std::env::temp_dir().join(format!("bo-{}", std::process::id()));
@@ -907,6 +1141,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("c")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: None,
         })
         .err()
@@ -915,6 +1150,151 @@ mod tests {
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&utxo);
+    }
+
+    /// Drive the sink thread directly: it must write every row kind for each
+    /// block, rotate part files at the boundary, and stop on `Finish`.
+    #[test]
+    fn sink_thread_writes_rows_and_rotates_on_boundary() {
+        use crossbeam_channel::bounded;
+        let out = std::env::temp_dir().join(format!(
+            "bidx-sink-thread-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (tx, rx) = bounded::<SinkMsg>(4);
+        let out_for_thread = out.clone();
+        let handle = std::thread::spawn(move || {
+            sink_thread_main(rx, &out_for_thread, 2, 0, SinkConfig::default())
+        });
+
+        // Height 0 and 1 -> part 0; height 2 -> part 1 (boundary at 2/2=1).
+        for h in 0..3u32 {
+            let mut block = synthetic_full_block(h);
+            // Add a second tx + input + output + witness so every push path runs.
+            block.txs.push(bidx_core::TxRow {
+                height: h,
+                tx_index: 1,
+                txid: [0x22; 32],
+                version: 1,
+                locktime: 0,
+                size: 0,
+                weight: 0,
+                fee: 0,
+                input_count: 1,
+                output_count: 1,
+                has_witness: false,
+            });
+            block.inputs.push(bidx_core::InputRow {
+                height: h,
+                tx_index: 1,
+                input_index: 0,
+                txid: [0x22; 32],
+                prev_txid: [0xEE; 32],
+                prev_vout: 0,
+                script_sig_len: 0,
+                sequence: 0,
+                witness_items: 0,
+                witness_bytes: 0,
+                is_coinbase: false,
+            });
+            block.outputs.push(bidx_core::OutputRow {
+                height: h,
+                tx_index: 1,
+                output_index: 0,
+                txid: [0x22; 32],
+                value_sat: 10,
+                script_pubkey_len: 0,
+                script_type: 1,
+                address_hash: [0xBB; 32],
+            });
+            let spends = vec![bidx_core::SpendRow {
+                height: h,
+                spending_tx_index: 1,
+                spending_input_index: 0,
+                spending_txid: [0x22; 32],
+                spent_txid: [0xEE; 32],
+                spent_vout: 0,
+                spent_value_sat: 5,
+                spent_script_type: 1,
+                spent_address_hash: [0xCC; 32],
+                spent_height: 0,
+            }];
+            tx.send(SinkMsg::Block { block, spends }).unwrap();
+        }
+        tx.send(SinkMsg::Finish).unwrap();
+        drop(tx);
+        handle.join().unwrap().unwrap();
+
+        for part in ["part-00000.parquet", "part-00001.parquet"] {
+            for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+                let p = out.join(entity).join(part);
+                assert!(p.exists(), "missing {:?}", p);
+            }
+        }
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// A small in-memory `FullBlock` with one coinbase tx/input/output.
+    fn synthetic_full_block(height: u32) -> FullBlock {
+        let txid = [0x11u8; 32];
+        FullBlock {
+            block_row: bidx_core::BlockRow {
+                height,
+                hash: [0xAA; 32],
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0,
+                nonce: 0,
+                version: 1,
+                tx_count: 1,
+                size: 0,
+                weight: 0,
+                total_fee: 0,
+                coinbase_value: 100,
+            },
+            txs: vec![bidx_core::TxRow {
+                height,
+                tx_index: 0,
+                txid,
+                version: 1,
+                locktime: 0,
+                size: 0,
+                weight: 0,
+                fee: 0,
+                input_count: 1,
+                output_count: 1,
+                has_witness: false,
+            }],
+            inputs: vec![bidx_core::InputRow {
+                height,
+                tx_index: 0,
+                input_index: 0,
+                txid,
+                prev_txid: [0u8; 32],
+                prev_vout: 0xFFFF_FFFF,
+                script_sig_len: 0,
+                sequence: 0,
+                witness_items: 0,
+                witness_bytes: 0,
+                is_coinbase: true,
+            }],
+            outputs: vec![bidx_core::OutputRow {
+                height,
+                tx_index: 0,
+                output_index: 0,
+                txid,
+                value_sat: 100,
+                script_pubkey_len: 0,
+                script_type: 0,
+                address_hash: [0u8; 32],
+            }],
+            witnesses: vec![],
+        }
     }
 
     #[test]
@@ -1114,6 +1494,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: Some(Box::new(transport)),
         })
         .expect("run_parse with orphan skip");
@@ -1168,6 +1549,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: None,
         })
         .expect("run_parse without rpc");
@@ -1202,6 +1584,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: None,
         })
         .err()
@@ -1257,6 +1640,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: Some(Box::new(TipsFailRpc { node_tip: 1 })),
         })
         .expect("orphan fetch failure must be non-fatal");
@@ -1297,6 +1681,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: Some(Box::new(transport)),
         })
         .expect("orphan at final height must finish cleanly");
@@ -1375,6 +1760,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: Some(Box::new(NoOrphanRpc { node_tip: 2 })),
         })
         .expect("run_parse with no orphans");
@@ -1429,6 +1815,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            capture_witness: false,
             rpc_transport: None,
         })
         .expect("run_parse with a spend");
