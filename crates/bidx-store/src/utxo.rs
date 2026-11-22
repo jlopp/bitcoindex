@@ -182,9 +182,12 @@ impl RecentUtxoCache {
                 Some(k) => {
                     self.map.remove(&k);
                 }
-                // Order exhausted but still over budget: cannot happen while
-                // every resident key was pushed to `order`, but stop rather
-                // than spin if it ever did.
+                // coverage-exempt: unreachable — `insert` pushes every key to
+                // `order`, and keys leave `order` only here (where they are
+                // removed from `map` in the same step), so `map.len() <=
+                // order.len()` always holds and the queue cannot run dry while
+                // the map is non-empty. Kept so the loop terminates rather than
+                // spins if that invariant ever changes.
                 None => break,
             }
         }
@@ -852,6 +855,12 @@ impl UtxoStore {
     /// because RocksDB only populates these counters when statistics are on.
     /// An empty result therefore means "not measured", never "zero stalls".
     pub fn stall_report(&self) -> Vec<String> {
+        // Statistics off means the property is absent or meaningless, so the
+        // documented "empty unless statistics were enabled" contract is
+        // enforced here rather than relying on RocksDB's property behavior.
+        if !self.statistics {
+            return Vec::new();
+        }
         self.db
             .property_value(rocksdb::properties::STATS)
             .ok()
@@ -1633,5 +1642,110 @@ mod tests {
         db.set_tip(&b).unwrap();
         assert_eq!(db.tip().unwrap().unwrap(), b);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recent_cache_insert_refresh_does_not_requeue() {
+        // The caller only inserts an outpoint once, but the contract says a
+        // re-insert refreshes the value without pushing a second recency entry.
+        // Assert both the refresh and the single queue entry.
+        let mut c = RecentUtxoCache::new(10 * CACHE_ENTRY_COST);
+        let k = [0x11u8; 36];
+        let v1 = UtxoValue { value_sat: 1, script_type: 1, height: 1, address_hash: [0; 32] };
+        let v2 = UtxoValue { value_sat: 2, script_type: 2, height: 2, address_hash: [0; 32] };
+        c.insert(k, v1);
+        assert_eq!(c.order.len(), 1);
+        c.insert(k, v2); // same key: refresh, no requeue
+        assert_eq!(c.order.len(), 1, "refresh must not requeue");
+        assert_eq!(c.map[&k].value_sat, 2, "value must be refreshed");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.bytes(), CACHE_ENTRY_COST);
+    }
+
+    #[test]
+    fn recent_cache_evict_stops_cleanly_when_budget_below_one_entry() {
+        // A budget smaller than a single entry forces the eviction loop to run
+        // against an empty map. It must terminate (order exhausted → break)
+        // rather than spin, leaving the cache empty.
+        let mut c = RecentUtxoCache::new(0);
+        c.evict_to_budget();
+        assert_eq!(c.len(), 0);
+        // With an entry present but a zero budget, eviction empties it and stops.
+        c.insert([0x22u8; 36], UtxoValue { value_sat: 1, script_type: 0, height: 0, address_hash: [0; 32] });
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn block_undo_decode_rejects_truncated_spent_and_created_sections() {
+        // Truncated in the middle of a `created` key (36-byte) section.
+        let mut enc = Vec::new();
+        put_varint(&mut enc, 0); // no spent
+        put_varint(&mut enc, 1); // one created
+        enc.extend_from_slice(&[0xABu8; 10]); // only 10 of 36 bytes
+        assert!(BlockUndo::decode(&enc).is_none());
+
+        // A spent record whose value bytes are too short to decode.
+        let mut enc2 = Vec::new();
+        put_varint(&mut enc2, 1); // one spent
+        enc2.extend_from_slice(&[0u8; 36]); // key
+        enc2.extend_from_slice(&[0u8; 10]); // value shorter than 45
+        assert!(BlockUndo::decode(&enc2).is_none());
+    }
+
+    #[test]
+    fn open_cached_statistics_enables_cache_and_statistics() {
+        let dir = tmp_path("cachedstats");
+        let db = UtxoStore::open_cached_statistics(&dir, 8 * CACHE_ENTRY_COST).unwrap();
+        assert!(db.statistics_enabled(), "statistics flag must be on");
+        assert!(db.cache_stats().is_some(), "recent cache must be enabled");
+        // A normal store has neither.
+        let dir2 = tmp_path("plainstats");
+        let db2 = UtxoStore::open(&dir2).unwrap();
+        assert!(!db2.statistics_enabled());
+        assert!(db2.cache_stats().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn db_lookup_of_a_corrupt_utxo_value_counts_as_missing() {
+        // A spend whose key is present in RocksDB but whose stored value is the
+        // wrong length cannot be decoded; it must be counted as missing, not
+        // panic or produce a bogus spend.
+        let dir = tmp_path("corrupt");
+        let db = UtxoStore::open_live(&dir).unwrap();
+        let prev_txid = [0x77u8; 32];
+        // Write a 10-byte value (valid values are 45 bytes).
+        db.db.put(make_key(&prev_txid, 0), [0u8; 10]).unwrap();
+        let inputs = vec![inp_row(0, 0, 0, [0x88u8; 32], prev_txid, 0, false)];
+        let r = db
+            .apply_block(0, &[tx_row(0, 0, [0x88u8; 32])], &inputs, &[])
+            .unwrap();
+        assert_eq!(r.missing, 1);
+        assert!(r.spends.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stall_report_reads_stats_when_enabled_and_is_empty_otherwise() {
+        // With statistics on, the `rocksdb.stats` property is populated and the
+        // stall filter runs (returning zero or more matching lines). With
+        // statistics off, the property is absent and the report is empty —
+        // "not measured", never a misleading "zero stalls".
+        let dir = tmp_path("stall");
+        let db = UtxoStore::open_cached_statistics(&dir, 4 * CACHE_ENTRY_COST).unwrap();
+        assert!(db.statistics_enabled());
+        let with_stats = db.stall_report();
+        // Every returned line must actually mention a stall.
+        assert!(with_stats
+            .iter()
+            .all(|l| l.contains("stall") || l.contains("Stall")));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir2 = tmp_path("stalloff");
+        let db2 = UtxoStore::open(&dir2).unwrap();
+        assert!(!db2.statistics_enabled());
+        assert!(db2.stall_report().is_empty());
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

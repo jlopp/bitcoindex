@@ -392,3 +392,257 @@ impl ParquetSink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{FixedSizeBinaryArray, UInt32Array, UInt64Array};
+    use arrow::datatypes::DataType;
+    use bidx_core::{BlockRow, InputRow, OutputRow, SpendRow, TxRow};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::path::PathBuf;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("bidx-parquet-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn block_row(h: u32) -> BlockRow {
+        BlockRow {
+            height: h,
+            hash: [h as u8; 32],
+            prev_hash: [0u8; 32],
+            merkle_root: [0xCDu8; 32],
+            time: 1_600_000_000 + h,
+            bits: 0x1d00ffff,
+            nonce: h,
+            version: 1,
+            tx_count: 1,
+            size: 100,
+            weight: 400,
+            total_fee: 0,
+            coinbase_value: 50 * h as u64,
+        }
+    }
+
+    fn tx_row(h: u32, i: u32) -> TxRow {
+        TxRow {
+            height: h,
+            tx_index: i,
+            txid: [i as u8; 32],
+            version: 1,
+            locktime: 0,
+            size: 10,
+            weight: 40,
+            fee: 0,
+            input_count: 1,
+            output_count: 1,
+            has_witness: false,
+        }
+    }
+
+    fn input_row(h: u32, i: u32) -> InputRow {
+        InputRow {
+            height: h,
+            tx_index: i,
+            input_index: 0,
+            txid: [i as u8; 32],
+            prev_txid: [0xEEu8; 32],
+            prev_vout: 0,
+            script_sig_len: 0,
+            sequence: 0xffff_ffff,
+            witness_items: 0,
+            witness_bytes: 0,
+            is_coinbase: false,
+        }
+    }
+
+    fn output_row(h: u32, i: u32) -> OutputRow {
+        OutputRow {
+            height: h,
+            tx_index: i,
+            output_index: 0,
+            txid: [i as u8; 32],
+            value_sat: 100 + h as u64,
+            script_pubkey_len: 25,
+            script_type: 1,
+            address_hash: [0xABu8; 32],
+        }
+    }
+
+    fn spend_row(h: u32, i: u32) -> SpendRow {
+        SpendRow {
+            height: h,
+            spending_tx_index: i,
+            spending_input_index: 0,
+            spending_txid: [i as u8; 32],
+            spent_txid: [0xEEu8; 32],
+            spent_vout: 0,
+            spent_value_sat: 5_000,
+            spent_script_type: 1,
+            spent_address_hash: [0xCDu8; 32],
+            spent_height: h,
+        }
+    }
+
+    fn read_first_batch(path: PathBuf) -> arrow::record_batch::RecordBatch {
+        let f = File::open(&path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
+        let mut reader = builder.build().unwrap();
+        reader.next().unwrap().unwrap()
+    }
+
+    #[test]
+    fn sink_flushes_full_batches_and_roundtrips_through_parquet() {
+        // batch_size = 2 so pushing two of each entity exercises the
+        // "buffered >= batch_size" flush path for every entity, including the
+        // spend path. The remaining `finish()` branches see an empty buffer.
+        let dir = tmp_dir("flush");
+        let mut sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 2 }).unwrap();
+        for h in 0..2u32 {
+            sink.push_block(&block_row(h)).unwrap();
+            sink.push_tx(&tx_row(h, 0)).unwrap();
+            sink.push_input(&input_row(h, 0)).unwrap();
+            sink.push_output(&output_row(h, 0)).unwrap();
+            sink.push_spend(&spend_row(h, 0)).unwrap();
+        }
+        sink.finish().unwrap();
+
+        // Read the spends table back and assert the values survived the
+        // columnar write → zstd → read round-trip.
+        let batch = read_first_batch(dir.join("spends/part-00000.parquet"));
+        assert_eq!(batch.num_rows(), 2);
+        let height = batch
+            .column_by_name("height")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(height.value(0), 0);
+        assert_eq!(height.value(1), 1);
+        let spent_value = batch
+            .column_by_name("spent_value_sat")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(spent_value.value(0), 5_000);
+        let spent_txid = batch
+            .column_by_name("spent_txid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        assert_eq!(spent_txid.value(0), &[0xEEu8; 32]);
+
+        // Outputs table too, to confirm the second entity's flush path wrote a
+        // correct value.
+        let obatch = read_first_batch(dir.join("outputs/part-00000.parquet"));
+        assert_eq!(obatch.num_rows(), 2);
+        let value = obatch
+            .column_by_name("value_sat")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(value.value(0), 100);
+        assert_eq!(value.value(1), 101);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sink_finish_flushes_partial_batches_for_all_entities() {
+        // batch_size larger than the row counts, so no push triggers a flush and
+        // `finish()` must flush all five partial buffers.
+        let dir = tmp_dir("partial");
+        let mut sink = ParquetSink::create(&dir, 7, SinkConfig { batch_size: 100 }).unwrap();
+        sink.push_block(&block_row(3)).unwrap();
+        sink.push_tx(&tx_row(3, 0)).unwrap();
+        sink.push_input(&input_row(3, 0)).unwrap();
+        sink.push_output(&output_row(3, 0)).unwrap();
+        sink.push_spend(&spend_row(3, 0)).unwrap();
+        sink.finish().unwrap();
+
+        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+            let batch = read_first_batch(dir.join(format!("{entity}/part-00007.parquet")));
+            assert_eq!(batch.num_rows(), 1, "{entity} should have one row");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sink_finish_with_no_rows_writes_empty_files() {
+        // No rows at all: every `finish()` branch takes the "buffered == 0" side
+        // and the writers still close cleanly, producing a readable Parquet file
+        // with zero row groups (an empty file has no record batch to read, but
+        // its metadata must be present).
+        let dir = tmp_dir("empty");
+        let sink = ParquetSink::create(&dir, 0, SinkConfig { batch_size: 100 }).unwrap();
+        sink.finish().unwrap();
+        let path = dir.join("blocks/part-00000.parquet");
+        assert!(path.exists(), "empty sink must still create the file");
+        let f = File::open(&path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entity_table_new_panics_on_unsupported_column_type() {
+        // `EntityTable::new` supports a fixed set of Arrow types; anything else
+        // (here Utf8) is a programming error and must panic rather than silently
+        // building a table it cannot push into.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let res = std::panic::catch_unwind(move || {
+            let _ = EntityTable::new(schema);
+        });
+        assert!(res.is_err(), "expected a panic for an unsupported column type");
+    }
+
+    #[test]
+    fn writer_props_use_zstd_and_row_group_targets() {
+        // Pin the Parquet tuning so a change to compression or row-group size is
+        // caught here rather than only showing up as a size/throughput shift.
+        use parquet::schema::types::ColumnPath;
+        let props = writer_props();
+        assert!(matches!(
+            props.compression(&ColumnPath::from("height")),
+            Compression::ZSTD(_)
+        ));
+        assert_eq!(props.max_row_group_size(), 1_000_000);
+    }
+
+    #[test]
+    fn sink_config_default_batch_size_is_250k() {
+        // The default row-group target is part of the on-disk contract (it
+        // drives row-group sizes and therefore compression); pin it.
+        assert_eq!(SinkConfig::default().batch_size, 250_000);
+    }
+
+    #[test]
+    fn all_schemas_are_non_empty_and_named() {
+        for (name, schema) in [
+            ("blocks", blocks_schema()),
+            ("transactions", transactions_schema()),
+            ("inputs", inputs_schema()),
+            ("outputs", outputs_schema()),
+            ("spends", spends_schema()),
+        ] {
+            assert!(!schema.fields().is_empty(), "{name} schema is empty");
+            // Every hash column must be FixedSizeBinary(32), never a string.
+            for f in schema.fields() {
+                if f.name().contains("hash") || f.name().contains("txid") || f.name() == "merkle_root" {
+                    assert_eq!(
+                        *f.data_type(),
+                        DataType::FixedSizeBinary(32),
+                        "{name}.{} must be FixedSizeBinary(32)",
+                        f.name()
+                    );
+                }
+            }
+        }
+    }
+}

@@ -240,4 +240,100 @@ mod tests {
         // hash160 of the genesis pubkey
         assert_eq!(&h[..20], &hex::decode("62e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap()[..]);
     }
+
+    #[test]
+    fn every_script_type_has_a_stable_string_name() {
+        // The `as_str` names are written to Parquet/ClickHouse and compared in
+        // the query layer, so a silent rename would be a data-compat break.
+        assert_eq!(ScriptType::Unknown.as_str(), "unknown");
+        assert_eq!(ScriptType::P2PK.as_str(), "p2pk");
+        assert_eq!(ScriptType::P2PKH.as_str(), "p2pkh");
+        assert_eq!(ScriptType::P2SH.as_str(), "p2sh");
+        assert_eq!(ScriptType::P2WPKH.as_str(), "p2wpkh");
+        assert_eq!(ScriptType::P2WSH.as_str(), "p2wsh");
+        assert_eq!(ScriptType::P2TR.as_str(), "p2tr");
+        assert_eq!(ScriptType::OpReturn.as_str(), "op_return");
+        assert_eq!(ScriptType::BareMultisig.as_str(), "bare_multisig");
+        assert_eq!(ScriptType::WitnessUnknown.as_str(), "witness_unknown");
+    }
+
+    #[test]
+    fn witness_v0_program_of_other_length_is_unknown_witness() {
+        // OP_0 with a 2-byte program is a valid witness v0 script that is
+        // neither P2WPKH (20) nor P2WSH (32): it must classify as
+        // WitnessUnknown and keep the program bytes.
+        let spk = vec![0x00, 0x02, 0xab, 0xcd];
+        let (t, h) = classify_script(&spk);
+        assert_eq!(t, ScriptType::WitnessUnknown);
+        assert_eq!(&h[..2], &[0xab, 0xcd]);
+    }
+
+    #[test]
+    fn witness_v1_program_of_other_length_is_unknown_witness() {
+        // OP_2 (0x52) with a 32-byte program is a future witness version, not
+        // taproot (which is OP_1).
+        let mut spk = vec![0x52, 0x20];
+        spk.extend_from_slice(&[0x44; 32]);
+        let (t, h) = classify_script(&spk);
+        assert_eq!(t, ScriptType::WitnessUnknown);
+        assert_eq!(&h[..32], &[0x44; 32]);
+    }
+
+    #[test]
+    fn bare_multisig_rejects_malformed_scripts() {
+        // Helper: a script that reaches the multisig walker but is not a valid
+        // m-of-n. Each case exercises one guard in `is_bare_multisig`.
+        let not_multisig = |spk: &[u8]| {
+            assert_ne!(
+                classify_script(spk).0,
+                ScriptType::BareMultisig,
+                "expected non-multisig for {spk:?}"
+            );
+        };
+
+        // m/n outside OP_1..OP_16 (here m = 0x50, which is not an OP_n).
+        not_multisig(&[0x50, 0x51, 0xae]);
+        // Too short to be multisig at all (len < 3).
+        not_multisig(&[0x51, 0xae]);
+        // m > n (2-of-1).
+        not_multisig(&[0x52, 0x51, 0xae]);
+        // A push opcode that is neither 33 nor 65 bytes.
+        not_multisig(&[0x51, 0x20, 0x51, 0xae]);
+        // A 33-byte push that runs past the OP_n OP_CHECKMULTISIG suffix.
+        not_multisig(&[0x51, 0x21, 0x51, 0xae]);
+        // Ending without OP_CHECKMULTISIG.
+        not_multisig(&[0x51, 0x21, 0x02, 0x51, 0x00]);
+    }
+
+    #[test]
+    fn unknown_script_falls_through_to_unknown() {
+        // A short, unrecognised script.
+        let (t, h) = classify_script(&[0x01, 0x02, 0x03]);
+        assert_eq!(t, ScriptType::Unknown);
+        assert_eq!(h, [0u8; 32]);
+        // Empty script is also Unknown with a zeroed hash.
+        let (t, h) = classify_script(&[]);
+        assert_eq!(t, ScriptType::Unknown);
+        assert_eq!(h, [0u8; 32]);
+    }
+
+    #[test]
+    fn p2pk_with_nonstandard_pubkey_prefix_is_not_p2pk() {
+        // Correct 33-byte framing (0x21 ... 0xac) but the first key byte is
+        // 0x01, which is not a valid compressed/uncompressed prefix (02..04),
+        // so this must not be classified as P2PK.
+        let mut spk = vec![0x21];
+        spk.extend_from_slice(&[0x01; 33]);
+        spk.push(0xac);
+        assert_eq!(classify_script(&spk).0, ScriptType::Unknown);
+    }
+
+    #[test]
+    fn multisig_push_overruns_the_suffix_is_rejected() {
+        // 1-of-1 with a 65-byte push whose declared length runs past the end.
+        let mut spk = vec![0x51, 0x41];
+        spk.extend_from_slice(&[0x02; 10]); // only 10 bytes, not 65
+        spk.extend_from_slice(&[0x51, 0xae]);
+        assert_ne!(classify_script(&spk).0, ScriptType::BareMultisig);
+    }
 }

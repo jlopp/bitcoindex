@@ -229,7 +229,17 @@ fn linreg(pts: &[DiskCheckpoint]) -> (f64, f64) {
         return (0.0, 0.0);
     }
     if pts.len() == 1 {
-        return (0.0, pts[0].total_bytes as f64);
+        // A single checkpoint still yields the documented "coarse single-segment
+        // slope": treat it as a line through the origin, slope = bytes/height.
+        // The slope slot must be divided by the height — returning the raw
+        // total_bytes there (as this once did) multiplies the size by the target
+        // height and makes the startup guard refuse to start on any disk.
+        let p = pts[0];
+        if p.height == 0 {
+            return (p.total_bytes as f64, 0.0);
+        }
+        let b = p.total_bytes as f64 / p.height as f64;
+        return (0.0, b);
     }
     let n = pts.len() as f64;
     let mut sx = 0.0f64;
@@ -246,7 +256,11 @@ fn linreg(pts: &[DiskCheckpoint]) -> (f64, f64) {
     }
     let denom = n * sxx - sx * sx;
     if denom.abs() < f64::EPSILON {
-        return (0.0, sy / n);
+        // All points share one height (or there is no x-variance): no growth
+        // rate is derivable, so project flat at the mean size. As above, the
+        // mean belongs in the intercept — a slope here would multiply the size
+        // by the target height.
+        return (sy / n, 0.0);
     }
     let b = (n * sxy - sx * sy) / denom;
     let a = (sy - b * sx) / n;
@@ -263,7 +277,6 @@ pub fn projected_total_bytes(pts: &[DiskCheckpoint], target_height: u32) -> u64 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn network_detection_mainnet() {
@@ -314,5 +327,107 @@ mod tests {
         let proj = projected_total_bytes(&v, 300_000);
         assert_eq!(proj, 3_000);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn every_network_has_a_stable_name() {
+        // `name()` is written into the checkpoint file and matched when reading
+        // it back, so every variant must round-trip through its own string.
+        for (net, want) in [
+            (Network::Mainnet, "mainnet"),
+            (Network::Testnet3, "testnet3"),
+            (Network::Testnet4, "testnet4"),
+            (Network::Signet, "signet"),
+            (Network::Regtest, "regtest"),
+        ] {
+            assert_eq!(net.name(), want);
+            // And the name maps back to the same magic-derived network.
+            assert_eq!(Network::from_magic(match net {
+                Network::Mainnet => BLOCK_MAGIC,
+                Network::Testnet3 => BLOCK_MAGIC_TESTNET3,
+                Network::Testnet4 => BLOCK_MAGIC_TESTNET4,
+                Network::Signet => BLOCK_MAGIC_SIGNET,
+                Network::Regtest => BLOCK_MAGIC_REGTEST,
+            }), Some(net));
+        }
+    }
+
+    #[test]
+    fn detect_from_blocks_dir_ignores_non_blk_files() {
+        // The directory walk filters out anything that is not blk*.dat; make
+        // sure a present-but-irrelevant file is skipped rather than parsed.
+        let tmp = std::env::temp_dir().join(format!("bidx-detect-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A non-blk file with a valid-looking magic must be ignored.
+        let mut v = vec![0u8; 16];
+        v[..4].copy_from_slice(&BLOCK_MAGIC.to_le_bytes());
+        std::fs::write(tmp.join("not-a-block.dat"), &v).unwrap();
+        assert_eq!(Network::detect_from_blocks_dir(&tmp), None);
+        // Adding a real blk file makes detection succeed despite the decoy.
+        std::fs::write(tmp.join("blk00000.dat"), &v).unwrap();
+        assert_eq!(Network::detect_from_blocks_dir(&tmp), Some(Network::Mainnet));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dir_size_bytes_of_missing_path_is_zero() {
+        let missing = std::env::temp_dir().join(format!("bidx-nope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(dir_size_bytes(&missing), 0);
+    }
+
+    #[test]
+    fn dir_size_bytes_sums_files_and_recurses_skipping_symlinks() {
+        let tmp = std::env::temp_dir().join(format!("bidx-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.bin"), [0u8; 10]).unwrap();
+        std::fs::write(tmp.join("sub/b.bin"), [0u8; 25]).unwrap();
+        // A symlink must not be followed (it would double-count or loop).
+        let _ = std::os::unix::fs::symlink(tmp.join("sub"), tmp.join("link"));
+        assert_eq!(dir_size_bytes(&tmp), 35);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn free_space_walks_up_to_an_existing_parent() {
+        // A path whose parents do not exist still resolves by walking up to the
+        // nearest existing directory; the result must be a real, positive size.
+        let deep = std::env::temp_dir()
+            .join(format!("bidx-free-{}", std::process::id()))
+            .join("does/not/exist");
+        let free = free_space_bytes(&deep).expect("walk-up should find a mount");
+        assert!(free > 0);
+    }
+
+    #[test]
+    fn free_space_returns_none_when_no_ancestor_exists() {
+        // The empty path has no parent at all, so the walk terminates with no
+        // successful statfs and the function reports None rather than panicking.
+        assert_eq!(free_space_bytes(Path::new("")), None);
+    }
+
+    #[test]
+    fn projection_handles_degenerate_checkpoint_sets() {
+        // No checkpoints → zero projection.
+        assert_eq!(projected_total_bytes(&[], 500_000), 0);
+        // One checkpoint → coarse slope through the origin: slope = bytes/height,
+        // so the projection at a target height scales linearly from zero.
+        // Regression guard: the slope must be bytes/height, NOT the raw byte
+        // count, or the disk guard refuses to start on any disk.
+        let one = [DiskCheckpoint { height: 100_000, total_bytes: 4_242 }];
+        assert_eq!(projected_total_bytes(&one, 200_000), 8_484);
+        assert_eq!(projected_total_bytes(&one, 0), 0);
+        // A single checkpoint at height 0 has no derivable slope: project flat.
+        let at_zero = [DiskCheckpoint { height: 0, total_bytes: 4_242 }];
+        assert_eq!(projected_total_bytes(&at_zero, 999_999), 4_242);
+        // Two points at the same height make the regression denominator zero;
+        // it must fall back to the mean instead of dividing by zero.
+        let flat = [
+            DiskCheckpoint { height: 50_000, total_bytes: 100 },
+            DiskCheckpoint { height: 50_000, total_bytes: 300 },
+        ];
+        assert_eq!(projected_total_bytes(&flat, 50_000), 200);
     }
 }

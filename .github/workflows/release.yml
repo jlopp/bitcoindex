@@ -1,0 +1,115 @@
+name: Release
+
+# Build prebuilt `bidx` binaries for the common Linux targets, attach them to
+# a GitHub release, and emit an SBOM + SHA256SUMS so operators can verify what
+# they download. Triggered by a `v*` tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native build on the runner: has the full system toolchain, so no
+          # container indirection is needed.
+          - target: x86_64-unknown-linux-gnu
+            archive: bidx-x86_64-unknown-linux-gnu
+            use_cross: false
+          # Cross targets go through `cross`, which runs the build inside a
+          # per-target container and installs the C/C++ toolchain + libclang +
+          # libzmq the native deps need (see Cross.toml). A plain
+          # musl-tools/gcc-aarch64 install cannot build RocksDB or libzmq.
+          - target: x86_64-unknown-linux-musl
+            archive: bidx-x86_64-unknown-linux-musl
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            archive: bidx-aarch64-unknown-linux-gnu
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build dependencies
+        # Only needed for the native target; `cross` installs its own deps in
+        # the target container.
+        if: matrix.use_cross == false
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev
+
+      - name: Install Rust toolchain + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@cross
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The two workarounds the repo documents for GCC 15 / bindgen. Passed
+      # through into the `cross` container by Cross.toml's [build.env].
+      - name: Build release binary
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS: "-I${{ github.workspace }}/.build-shim/include"
+          CXXFLAGS: "-include cstdint"
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --locked -p bidx-cli --target ${{ matrix.target }}
+          else
+            cargo build --release --locked -p bidx-cli --target ${{ matrix.target }}
+          fi
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/bidx dist/
+          cd dist && tar czf ../${{ matrix.archive }}.tar.gz bidx
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked || true
+          cargo cyclonedx --format json --output-cdx || true
+          cp *.cdx.json dist/ 2>/dev/null || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}.tar.gz
+            dist/*.cdx.json
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+            artifacts/*.cdx.json
+          generate_release_notes: true

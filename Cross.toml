@@ -1,0 +1,31 @@
+# Cross-compilation configuration for `cross` (used by the release workflow).
+#
+# The binary links two heavy native deps:
+#   * RocksDB (librocksdb-sys) — C++, built from source, needs clang/bindgen.
+#   * libzmq (zmq-sys)        — C++, built from source with libsodium.
+#
+# A bare `musl-tools`/`gcc-aarch64-linux-gnu` install is not enough: those ship
+# a C compiler only, and neither the musl nor the aarch64 sysroot has libzmq or
+# libclang. `cross` runs the build inside a container per target, so we install
+# exactly what the native build needs (the same package set as the test
+# workflow) into that container. `libzmq3-dev` is required because zmq-sys's
+# build script probes for a system libzmq before vendoring; clang/libclang-dev
+# is required because bindgen dlopens libclang at build time.
+
+[build.env]
+passthrough = [
+    "BINDGEN_EXTRA_CLANG_ARGS",
+    "CXXFLAGS",
+]
+
+[target.x86_64-unknown-linux-musl]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev",
+]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev",
+]

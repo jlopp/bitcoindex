@@ -1,0 +1,37 @@
+# cargo-tarpaulin configuration.
+#
+# Coverage policy lives in `.cursor/rules/test-coverage.mdc`: any file you
+# change must be at 100%. This file pins the engine and flags so a local run and
+# the CI gate in `.github/workflows/coverage.yml` measure the same thing.
+#
+# Tarpaulin reads the top-level `[config]` table; `--config <file>` overrides
+# any other options set on the command line.
+#
+# There is deliberately no `fail_under` here: the *workspace* is not at 100%
+# (the long-running `bidx-live` / pipeline paths are not), and the policy is
+# per-changed-file, not per-workspace. `scripts/coverage/check-changed.sh`
+# enforces the per-file rule, so a file is only in scope when a change touches
+# it.
+#
+# Coverage runs in debug (see the script) — the debug profile is what makes the
+# run affordable; `force_clean = false` keeps the instrumented artifacts between
+# runs. The rule only requires that a changed file be *fully* covered, not that
+# the measurement be in release.
+#
+# `engine = "Llvm"` is the default on Linux but is stated explicitly: the ptrace
+# engine mis-handles the forked `clickhouse-client` children the loader tests
+# spawn and silently under-reports lines as covered.
+
+[config]
+engine = "Llvm"
+
+# Report to the console by default; CI overrides with `--out Json`.
+out = ["Stdout"]
+
+# Product code only. Integration tests under `tests/` are the signal, not the
+# thing being measured.
+exclude_files = ["tests/*"]
+
+# Keep the instrumented build between runs so a re-run re-links instead of
+# recompiling the world (the workspace builds RocksDB + Arrow/Parquet).
+force_clean = false

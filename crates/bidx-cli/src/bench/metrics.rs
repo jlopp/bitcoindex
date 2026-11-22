@@ -54,24 +54,38 @@ impl ResourceSample {
 /// Falls back to `getrusage(2)`'s `ru_maxrss` (also KiB on Linux) when
 /// `/proc` is unavailable, and to 0 if neither works.
 pub fn peak_rss_kb() -> u64 {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        if let Some(v) = status.lines().find_map(|l| {
-            let rest = l.strip_prefix("VmHWM:")?;
-            rest.split_whitespace().next()?.parse::<u64>().ok()
-        }) {
-            return v;
-        }
+    if let Some(v) = peak_rss_kb_from_proc(std::fs::read_to_string("/proc/self/status").ok()) {
+        return v;
     }
-    // SAFETY: `getrusage` only writes into the provided struct and cannot fail
-    // for RUSAGE_SELF; we still check the return value.
+    // coverage-exempt: the /proc read always succeeds on the Linux platform this
+    // indexer targets, so this getrusage fallback is never taken here; it is
+    // still exercised directly by `rusage_maxrss_fallback_is_positive`.
+    rusage_maxrss_kb()
+}
+
+/// Extract the `VmHWM:` value (peak RSS in KiB) from `/proc/self/status`
+/// content. `None` when the file was unreadable, the field is absent, or the
+/// value does not parse — all of which fall back to `getrusage`.
+fn peak_rss_kb_from_proc(status: Option<String>) -> Option<u64> {
+    let status = status?;
+    status.lines().find_map(|l| {
+        let rest = l.strip_prefix("VmHWM:")?;
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    })
+}
+
+/// `getrusage(2)` peak RSS in KiB. Linux reports `ru_maxrss` in KiB; this
+/// indexer is Linux-only in practice.
+///
+/// `getrusage(RUSAGE_SELF, ..)` cannot fail, so there is no failure branch: if
+/// it somehow did, `usage` stays zeroed and this returns 0 — the same value the
+/// old explicit `return 0` produced, without an unreachable line to cover.
+fn rusage_maxrss_kb() -> u64 {
+    // SAFETY: `getrusage` only writes into the provided struct.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
-    if rc == 0 {
-        // Linux reports ru_maxrss in KiB; other platforms use bytes, but this
-        // indexer is Linux-only in practice.
-        return usage.ru_maxrss as u64;
-    }
-    0
+    debug_assert_eq!(rc, 0, "getrusage(RUSAGE_SELF) cannot fail");
+    usage.ru_maxrss as u64
 }
 
 /// Subtract-able snapshot pair for one stage.
@@ -185,5 +199,47 @@ mod tests {
             "stage peak {} KiB did not capture the transient allocation",
             m.peak_rss_kb
         );
+    }
+
+    #[test]
+    fn stage_measure_wall_secs_and_cpu_utilization_are_bounded() {
+        // Wall time is positive and `cpu_utilization` is clamped to at most 1.0
+        // regardless of how many cores were busy, and never NaN for a zero
+        // thread hint (guarded by max(1e-6) on the wall time and the min(1.0)).
+        let t = StageTimer::start();
+        let mut acc = 0u64;
+        for i in 0..200_000u64 {
+            acc = acc.wrapping_add(i);
+        }
+        std::hint::black_box(acc);
+        let m = t.stop();
+        assert!(m.wall_secs() > 0.0);
+        let u = m.cpu_utilization(1.0);
+        assert!((0.0..=1.0).contains(&u), "utilization out of range: {u}");
+        // A tiny/zero hint must still produce a finite, clamped value.
+        let u0 = m.cpu_utilization(0.0);
+        assert!((0.0..=1.0).contains(&u0), "utilization out of range: {u0}");
+    }
+
+    #[test]
+    fn peak_rss_kb_from_proc_parses_vmhwm_and_rejects_garbage() {
+        // A well-formed status blob yields the VmHWM value; unrelated lines are
+        // ignored.
+        let good = Some("Name:\tbidx\nVmHWM:\t   12345 kB\nVmRSS:\t  999 kB\n".to_string());
+        assert_eq!(peak_rss_kb_from_proc(good), Some(12_345));
+
+        // Missing field, non-numeric value, and an unreadable file (None) all
+        // fall through to the getrusage fallback rather than panicking.
+        assert_eq!(peak_rss_kb_from_proc(Some("VmRSS:\t1 kB\n".into())), None);
+        assert_eq!(peak_rss_kb_from_proc(Some("VmHWM:\tabc kB\n".into())), None);
+        assert_eq!(peak_rss_kb_from_proc(Some("VmHWM:\n".into())), None);
+        assert_eq!(peak_rss_kb_from_proc(None), None);
+    }
+
+    #[test]
+    fn rusage_maxrss_fallback_is_positive() {
+        // The getrusage fallback must report the same non-zero high-water mark
+        // even when the /proc path is unavailable.
+        assert!(rusage_maxrss_kb() > 0);
     }
 }

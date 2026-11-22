@@ -5,6 +5,7 @@ members = [
     "crates/bidx-parser",
     "crates/bidx-store",
     "crates/bidx-loader",
+    "crates/bidx-serve",
     "crates/bidx-live",
     "crates/bidx-cli",
 ]
@@ -33,6 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 indicatif = { version = "0.17", features = ["rayon"] }
 parking_lot = "0.12"
 rustc-hash = "2"

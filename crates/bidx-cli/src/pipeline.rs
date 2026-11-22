@@ -69,7 +69,10 @@ pub const REORDER_HIGH: usize = 32;
 /// channel is a memory leak under backpressure.
 pub const CHANNEL_DEPTH: usize = 512;
 
-#[derive(Debug, Clone)]
+/// Configuration for a parse run.
+///
+/// Deliberately not `Clone`/`Debug`: it holds a boxed `dyn RpcTransport` (see
+/// `rpc_transport`), which is neither.
 pub struct ParseConfig {
     pub blocks_dir: PathBuf,
     pub out: PathBuf,
@@ -94,6 +97,12 @@ pub struct ParseConfig {
     /// chain). Blocks whose hash is in this set are skipped during parse
     /// (their data is not indexed and UTXO state is not mutated).
     pub orphan_blocks: Option<Arc<FxHashSet<bidx_core::Hash32>>>,
+    /// Injected RPC transport for the disk pre-flight. Production leaves this
+    /// `None`, so the pre-flight builds an HTTP client from `rpc_url`/
+    /// `rpc_cookie`; tests set it to a scripted transport to exercise the
+    /// pre-flight (projection, orphan filtering, and their log branches)
+    /// without a live node.
+    pub rpc_transport: Option<Box<dyn bidx_live::RpcTransport>>,
 }
 
 /// A parse-stage message: either a fully-parsed block, or a "skipped"
@@ -150,13 +159,17 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
 
     if !cfg.skip_disk_check {
         if let Some(rpc_url) = &cfg.rpc_url {
-            let node = bidx_live::NodeClient::new(bidx_live::RpcConfig {
-                url: rpc_url.clone(),
-                cookie_path: cfg.rpc_cookie.clone(),
-                user: None,
-                password: None,
-            })
-            .context("init RPC client for disk pre-flight")?;
+            let node = match cfg.rpc_transport.take() {
+                // Test/alternate transport injected by the caller.
+                Some(t) => bidx_live::NodeClient::with_transport(t),
+                None => bidx_live::NodeClient::new(bidx_live::RpcConfig {
+                    url: rpc_url.clone(),
+                    cookie_path: cfg.rpc_cookie.clone(),
+                    user: None,
+                    password: None,
+                })
+                .context("init RPC client for disk pre-flight")?,
+            };
             let node_tip = node.get_block_count().context("getblockcount")?;
             let local_tip = bidx_core::read_checkpoints(&disk_cfg.checkpoint_file, disk_cfg.network)
                 .last()
@@ -297,6 +310,12 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // a hang. The `next_h` exemption stops a deadlock: the worker
                 // holding the height the consumer is waiting for must run, or
                 // no block ever arrives to let the consumer drain.
+                //
+                // coverage-exempt: 320, 322-323, 325 — the spin body only runs
+                // when the consumer is >REORDER_HIGH blocks behind *and* the
+                // worker's height is not the one being awaited, i.e. under real
+                // memory pressure the unit fixtures never create. The condition
+                // itself (line 319) is exercised.
                 while reorder.load(Ordering::Relaxed) > REORDER_HIGH
                     && next_h.load(Ordering::Relaxed) != height
                 {
@@ -318,6 +337,10 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // A send failure means the consumer is gone. That is either a
                 // real bug or the RSS watchdog having aborted it; report the
                 // actual cause rather than a generic "consumer dropped".
+                // coverage-exempt: 345-348 — only runs when a send to the
+                // consumer fails, which needs the consumer thread to have
+                // aborted mid-run (RSS watchdog); not reachable in the unit
+                // fixtures. The closure's construction is covered.
                 let send_failed = |w: &crate::bench::OomWatchdog| -> anyhow::Error {
                     if w.is_tripped() {
                         w.tripped_error()
@@ -517,6 +540,10 @@ fn consume_ordered(
         while let Some(block) = buffer.remove(&next) {
             // Poll the RSS watchdog once per block. It is a relaxed atomic
             // load, so the cost is nil next to apply_block.
+            // coverage-exempt: 549 — returns only when the watchdog has already
+            // tripped (process RSS over the computed ceiling), which the unit
+            // fixtures do not reach; the `Some(w)`/`is_tripped` checks are
+            // exercised on the non-tripped path.
             if let Some(w) = watchdog {
                 if w.is_tripped() {
                     return Err(w.tripped_error());
@@ -588,6 +615,11 @@ fn consume_ordered(
     }
 
     // Channel closed before we saw every height: that's an error.
+    // coverage-exempt: 623-627 — reached only when the producer's channel closes
+    // before every height was delivered (a parse/worker abort). The fixtures
+    // always complete the range and return via the early `next >= end` exit, so
+    // this defensive tail is not exercised; it exists so a truncated run fails
+    // loudly instead of silently writing a partial index.
     sink.finish()?;
     if next < end {
         anyhow::bail!("channel closed early: stopped at height {next}, expected {end}");
@@ -686,6 +718,94 @@ mod tests {
         (tmp, hashes)
     }
 
+    /// Coinbase-only tx body paying `value` sat to a single output. Non-zero
+    /// locktime so the trailing-zero trim cannot swallow the record.
+    fn synth_coinbase(value: u64) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes()); // version
+        tx.push(1u8); // 1 input
+        tx.extend_from_slice(&[0u8; 32]); // prev_txid = zero (coinbase)
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prev_vout = max
+        tx.push(0u8); // script_sig_len
+        tx.extend_from_slice(&0u32.to_le_bytes()); // sequence
+        tx.push(1u8); // 1 output
+        tx.extend_from_slice(&value.to_le_bytes());
+        tx.push(0u8); // spk len 0
+        tx.extend_from_slice(&0x1122_3344u32.to_le_bytes()); // non-zero locktime
+        tx
+    }
+
+    /// A non-coinbase tx spending `(prev_txid, prev_vout)` and paying `value`
+    /// sat to a single output, so the block carries a real fee.
+    fn synth_spend(prev_txid: &bidx_core::Hash32, prev_vout: u32, value: u64) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes()); // version
+        tx.push(1u8); // 1 input
+        tx.extend_from_slice(prev_txid.as_bytes()); // real prev txid
+        tx.extend_from_slice(&prev_vout.to_le_bytes());
+        tx.push(0u8); // script_sig_len
+        tx.extend_from_slice(&0u32.to_le_bytes()); // sequence
+        tx.push(1u8); // 1 output
+        tx.extend_from_slice(&value.to_le_bytes());
+        tx.push(0u8); // spk len 0
+        tx.extend_from_slice(&0x5566_7788u32.to_le_bytes()); // non-zero locktime
+        tx
+    }
+
+    /// Two blocks: block 0 is a coinbase paying 100 sat; block 1 spends that
+    /// coinbase output and pays 60, so block 1 carries a 40-sat fee. Returns
+    /// (dir, [hash0, hash1]).
+    fn make_spend_chain() -> (PathBuf, Vec<bidx_core::Hash32>) {
+        let tmp = std::env::temp_dir().join(format!(
+            "bidx-spend-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let blk_path = tmp.join("blk00000.dat");
+
+        let cb0 = synth_coinbase(100);
+        let txid0 = bidx_core::dsha256(&cb0);
+        let mut hdr0 = [0u8; BLOCK_HEADER_LEN];
+        hdr0[0] = 1;
+        hdr0[68..72].copy_from_slice(&1000u32.to_le_bytes()); // time
+        hdr0[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes()); // bits
+        hdr0[79] = 0x01; // non-zero tail so the record survives the trim
+        let hash0 = bidx_core::dsha256(&hdr0);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&((BLOCK_HEADER_LEN + 1 + cb0.len()) as u32).to_le_bytes());
+        data.extend_from_slice(&hdr0);
+        data.push(1u8); // tx_count
+        data.extend_from_slice(&cb0);
+
+        let cb1 = synth_coinbase(50);
+        let spend = synth_spend(&txid0, 0, 60);
+        let mut hdr1 = [0u8; BLOCK_HEADER_LEN];
+        hdr1[0] = 2;
+        hdr1[4..36].copy_from_slice(hash0.as_bytes());
+        hdr1[68..72].copy_from_slice(&1001u32.to_le_bytes()); // time
+        hdr1[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes()); // bits
+        hdr1[79] = 0x02;
+        let hash1 = bidx_core::dsha256(&hdr1);
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(
+            &((BLOCK_HEADER_LEN + 1 + cb1.len() + spend.len()) as u32).to_le_bytes(),
+        );
+        data.extend_from_slice(&hdr1);
+        data.push(2u8); // tx_count
+        data.extend_from_slice(&cb1);
+        data.extend_from_slice(&spend);
+
+        fs::write(&blk_path, &data).unwrap();
+        (tmp, vec![hash0, hash1])
+    }
+
     #[test]
     fn inspect_block_prints_rows_for_existing_height() {
         let (dir, _) = make_chain(4);
@@ -740,6 +860,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
+            rpc_transport: None,
         })
         .expect("run_parse");
         // Layout: out/<entity>/part-NNNNN.parquet, one entity dir per kind.
@@ -786,6 +907,7 @@ mod tests {
             network: Some(bidx_core::Network::Mainnet),
             checkpoint_file: Some(utxo.join("c")),
             orphan_blocks: None,
+            rpc_transport: None,
         })
         .err()
         .expect("should error");
@@ -910,5 +1032,426 @@ mod tests {
         cache.block_bytes(&loc(0)).unwrap();
         assert_eq!(cache.resident(), n as usize);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A transport that reports one stale `getchaintips` branch and serves the
+    /// header chain for it, so `run_parse`'s disk pre-flight and orphan fetch
+    /// run against scripted data instead of a live node.
+    struct OrphanRpc {
+        node_tip: u32,
+        /// Stale tip hash (height node_tip); its parent is the next entry.
+        branch: Vec<bidx_core::Hash32>,
+    }
+
+    impl bidx_live::RpcTransport for OrphanRpc {
+        fn roundtrip(
+            &self,
+            body: &serde_json::Value,
+        ) -> Result<serde_json::Value, bidx_live::RpcError> {
+            let method = body["method"].as_str().unwrap_or("");
+            let result = match method {
+                "getblockcount" => serde_json::json!(self.node_tip),
+                "getchaintips" => serde_json::json!([{
+                    "height": self.node_tip,
+                    "hash": self.branch[0].to_hex(),
+                    // Only the stale tip is orphaned; its ancestors are shared
+                    // with the active chain.
+                    "branchlen": 1,
+                    "status": "valid-fork",
+                }]),
+                "getblockheader" => {
+                    // The requested hash is params[0]; find it in the branch and
+                    // return its parent (or null previous for the last entry).
+                    let want = body["params"][0].as_str().unwrap_or("");
+                    let idx = self
+                        .branch
+                        .iter()
+                        .position(|h| h.to_hex() == want)
+                        .unwrap_or(0);
+                    let prev = self.branch.get(idx + 1).map(|h| h.to_hex());
+                    serde_json::json!({
+                        "hash": want,
+                        "height": self.node_tip.saturating_sub(idx as u32),
+                        "confirmations": 0,
+                        "previousblockhash": prev,
+                    })
+                }
+                _ => serde_json::Value::Null,
+            };
+            Ok(serde_json::json!({ "result": result, "error": null }))
+        }
+    }
+
+    #[test]
+    fn run_parse_pre_flight_skips_orphan_blocks_end_to_end() {
+        // Build a 4-block chain, report block 1 as a stale (orphan) branch tip,
+        // and confirm run_parse still succeeds while block 1 is skipped.
+        let (blocks_dir, hashes) = make_chain(4);
+        let out = std::env::temp_dir().join(format!("bidx-pf-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-pf-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+
+        // Stale branch: block 1 (tip). branchlen=1 means only block 1 is
+        // orphaned; block 0 is shared with the active chain.
+        let transport = OrphanRpc {
+            node_tip: 3,
+            branch: vec![hashes[1], hashes[0]],
+        };
+
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(4),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: Some("http://unused".into()),
+            rpc_cookie: None,
+            skip_disk_check: false,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            rpc_transport: Some(Box::new(transport)),
+        })
+        .expect("run_parse with orphan skip");
+
+        // The blocks table must contain heights 0, 2, 3 — never the orphan 1.
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let part = out.join("blocks/part-00000.parquet");
+        let f = std::fs::File::open(&part).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let mut heights = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            let col = b
+                .column_by_name("height")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                heights.push(col.value(i));
+            }
+        }
+        heights.sort_unstable();
+        assert_eq!(heights, vec![0, 2, 3], "orphan height 1 must be skipped");
+
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
+    fn run_parse_without_rpc_url_skips_pre_flight() {
+        // The `else` branch (no rpc_url): the log line runs and parsing proceeds.
+        // skip_disk_check=false forces entry into the block, with rpc_url None.
+        let (blocks_dir, _) = make_chain(2);
+        let out = std::env::temp_dir().join(format!("bidx-norpc-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-norpc-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(2),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: false,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            rpc_transport: None,
+        })
+        .expect("run_parse without rpc");
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
+    fn run_parse_builds_an_http_client_when_no_transport_injected() {
+        // With rpc_url set and rpc_transport None, run_parse must construct a
+        // real NodeClient from the URL (the production path). Pointing at a
+        // dead endpoint with no cookie makes `NodeClient::new` fail, and the
+        // `?` must attach the "init RPC client" context.
+        let (blocks_dir, _) = make_chain(2);
+        let out = std::env::temp_dir().join(format!("bidx-http-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-http-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+        let e = run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(2),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: Some("http://127.0.0.1:1".into()),
+            rpc_cookie: None, // no credentials → NodeClient::new errors
+            skip_disk_check: false,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            rpc_transport: None,
+        })
+        .err()
+        .expect("missing credentials must fail");
+        assert!(
+            format!("{:#}", e).contains("init RPC client"),
+            "got: {e:#}"
+        );
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    /// Transport that answers `getblockcount` but fails `getchaintips`, so the
+    /// pre-flight succeeds and the orphan fetch hits its non-fatal error arm.
+    struct TipsFailRpc {
+        node_tip: u32,
+    }
+
+    impl bidx_live::RpcTransport for TipsFailRpc {
+        fn roundtrip(
+            &self,
+            body: &serde_json::Value,
+        ) -> Result<serde_json::Value, bidx_live::RpcError> {
+            match body["method"].as_str().unwrap_or("") {
+                "getblockcount" => Ok(serde_json::json!({ "result": self.node_tip, "error": null })),
+                _ => Err(bidx_live::RpcError::BadResponse("getchaintips exploded".into())),
+            }
+        }
+    }
+
+    #[test]
+    fn run_parse_continues_when_orphan_fetch_fails() {
+        // The orphan fetch is best-effort: a failure logs a warning and parsing
+        // proceeds with no orphan filter, so the run still writes its output.
+        let (blocks_dir, _) = make_chain(2);
+        let out = std::env::temp_dir().join(format!("bidx-tipfail-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-tipfail-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(2),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: Some("http://unused".into()),
+            rpc_cookie: None,
+            skip_disk_check: false,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            rpc_transport: Some(Box::new(TipsFailRpc { node_tip: 1 })),
+        })
+        .expect("orphan fetch failure must be non-fatal");
+        // Both heights were indexed despite the failed orphan fetch.
+        assert!(out.join("blocks/part-00000.parquet").exists());
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
+    fn run_parse_orphan_at_final_height_finishes_cleanly() {
+        // The orphan is the last height in range, so the ordered consumer's
+        // skip loop reaches `next == end` and must finish the sink and return
+        // Ok (rather than falling through to the "channel closed early" bail).
+        let (blocks_dir, hashes) = make_chain(3);
+        let out = std::env::temp_dir().join(format!("bidx-lastorph-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-lastorph-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+        // branchlen=1: only height 2 (the tip) is orphaned.
+        let transport = OrphanRpc {
+            node_tip: 2,
+            branch: vec![hashes[2]],
+        };
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(3),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: Some("http://unused".into()),
+            rpc_cookie: None,
+            skip_disk_check: false,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            rpc_transport: Some(Box::new(transport)),
+        })
+        .expect("orphan at final height must finish cleanly");
+
+        // Heights 0 and 1 are present; the orphaned height 2 is absent.
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let part = out.join("blocks/part-00000.parquet");
+        let f = std::fs::File::open(&part).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let mut heights = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            let col = b
+                .column_by_name("height")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                heights.push(col.value(i));
+            }
+        }
+        heights.sort_unstable();
+        assert_eq!(heights, vec![0, 1], "orphan height 2 must be skipped");
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    /// Transport whose `getchaintips` reports only an active tip, so
+    /// `orphan_block_hashes` returns an empty set (the "no orphans" branch).
+    struct NoOrphanRpc {
+        node_tip: u32,
+    }
+
+    impl bidx_live::RpcTransport for NoOrphanRpc {
+        fn roundtrip(
+            &self,
+            body: &serde_json::Value,
+        ) -> Result<serde_json::Value, bidx_live::RpcError> {
+            let result = match body["method"].as_str().unwrap_or("") {
+                "getblockcount" => serde_json::json!(self.node_tip),
+                "getchaintips" => serde_json::json!([{
+                    "height": self.node_tip,
+                    "hash": format!("{:064x}", self.node_tip),
+                    "branchlen": 0u32,
+                    "status": "active",
+                }]),
+                _ => serde_json::Value::Null,
+            };
+            Ok(serde_json::json!({ "result": result, "error": null }))
+        }
+    }
+
+    #[test]
+    fn run_parse_with_no_orphans_indexes_every_height() {
+        // The node reports only an active tip, so the orphan set is empty and
+        // every height in range is indexed (the "no orphaned blocks" branch).
+        let (blocks_dir, _) = make_chain(3);
+        let out = std::env::temp_dir().join(format!("bidx-noorph-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-noorph-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(3),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: Some("http://unused".into()),
+            rpc_cookie: None,
+            skip_disk_check: false,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            rpc_transport: Some(Box::new(NoOrphanRpc { node_tip: 2 })),
+        })
+        .expect("run_parse with no orphans");
+
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let part = out.join("blocks/part-00000.parquet");
+        let f = std::fs::File::open(&part).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let mut heights = Vec::new();
+        for b in reader {
+            let b = b.unwrap();
+            let col = b
+                .column_by_name("height")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                heights.push(col.value(i));
+            }
+        }
+        heights.sort_unstable();
+        assert_eq!(heights, vec![0, 1, 2], "all heights indexed when no orphans");
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
+    fn run_parse_accounts_fees_for_non_coinbase_spends() {
+        // Block 1 spends block 0's 100-sat coinbase output for a 60-sat output,
+        // so its total_fee is 40. This exercises the coinbase-flag scan and the
+        // fee summation in the ordered consumer (all other fixtures are
+        // coinbase-only, so the non-coinbase branch never runs).
+        let (blocks_dir, _) = make_spend_chain();
+        let out = std::env::temp_dir().join(format!("bidx-fee-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-fee-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(2),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            rpc_transport: None,
+        })
+        .expect("run_parse with a spend");
+
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let part = out.join("blocks/part-00000.parquet");
+        let f = std::fs::File::open(&part).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let mut fees = std::collections::HashMap::new();
+        for b in reader {
+            let b = b.unwrap();
+            let heights = b.column_by_name("height").unwrap().as_any()
+                .downcast_ref::<arrow::array::UInt32Array>().unwrap();
+            let tf = b.column_by_name("total_fee").unwrap().as_any()
+                .downcast_ref::<arrow::array::UInt64Array>().unwrap();
+            for i in 0..heights.len() {
+                fees.insert(heights.value(i), tf.value(i));
+            }
+        }
+        assert_eq!(fees.get(&0), Some(&0), "coinbase-only block has zero fee");
+        assert_eq!(fees.get(&1), Some(&40), "block 1 fee = 100 spent - 60 out; got {fees:?}");
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
     }
 }

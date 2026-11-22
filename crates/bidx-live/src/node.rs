@@ -339,4 +339,237 @@ mod tests {
         let e = c.get_block_count().err().unwrap();
         assert!(matches!(e, RpcError::Json(_)), "{:?}", e);
     }
+
+    /// Transport that answers `getchaintips` with a fixed list and serves
+    /// `getblockheader` by looking the requested hash up in a parent map.
+    struct TipTransport {
+        tips: serde_json::Value,
+        /// hash(hex) -> previous hash(hex) or None
+        parents: std::collections::HashMap<String, Option<String>>,
+    }
+
+    impl RpcTransport for TipTransport {
+        fn roundtrip(&self, body: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+            let method = body["method"].as_str().unwrap_or("");
+            let result = match method {
+                "getchaintips" => self.tips.clone(),
+                "getblockheader" => {
+                    let want = body["params"][0].as_str().unwrap_or("").to_string();
+                    let prev = self.parents.get(&want).cloned().flatten();
+                    serde_json::json!({
+                        "hash": want,
+                        "height": 1,
+                        "confirmations": 0,
+                        "previousblockhash": prev,
+                    })
+                }
+                _ => serde_json::Value::Null,
+            };
+            Ok(serde_json::json!({ "result": result, "error": null }))
+        }
+    }
+
+    #[test]
+    fn chain_tips_deserializes_branchlen() {
+        let tips = serde_json::json!([{
+            "height": 800_000u32,
+            "hash": "aa",
+            "branchlen": 3u32,
+            "status": "valid-fork",
+        }]);
+        let c = NodeClient::with_transport(Box::new(TipTransport {
+            tips,
+            parents: Default::default(),
+        }));
+        let got = c.chain_tips().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].height, 800_000);
+        assert_eq!(got[0].branch_len, 3);
+        assert_eq!(got[0].status, "valid-fork");
+    }
+
+    #[test]
+    fn orphan_block_hashes_skips_active_and_headers_only_and_walks_branches() {
+        // Active and headers-only tips are ignored; a valid-fork tip is walked
+        // back `branchlen` steps via getblockheader.
+        let h1 = format!("{:064x}", 0x1111u64);
+        let h0 = format!("{:064x}", 0x2222u64);
+        let tips = serde_json::json!([
+            { "height": 10u32, "hash": format!("{:064x}", 1u64), "branchlen": 0u32, "status": "active" },
+            { "height": 9u32,  "hash": format!("{:064x}", 2u64), "branchlen": 0u32, "status": "headers-only" },
+            { "height": 8u32,  "hash": h1, "branchlen": 2u32, "status": "valid-fork" },
+        ]);
+        let mut parents = std::collections::HashMap::new();
+        parents.insert(h1.clone(), Some(h0.clone()));
+        parents.insert(h0.clone(), None);
+        let c = NodeClient::with_transport(Box::new(TipTransport { tips, parents }));
+        let set = c.orphan_block_hashes().unwrap();
+        // Both H1 and H0 must be present.
+        let h1b = Hash32::from_hex(&h1).unwrap();
+        let h0b = Hash32::from_hex(&h0).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&h1b));
+        assert!(set.contains(&h0b));
+    }
+
+    #[test]
+    fn orphan_block_hashes_rejects_a_bad_tip_hash() {
+        let tips = serde_json::json!([
+            { "height": 8u32, "hash": "zz-not-hex", "branchlen": 1u32, "status": "valid-fork" },
+        ]);
+        let c = NodeClient::with_transport(Box::new(TipTransport {
+            tips,
+            parents: Default::default(),
+        }));
+        assert!(matches!(c.orphan_block_hashes(), Err(RpcError::BadResponse(_))));
+    }
+
+    #[test]
+    fn orphan_block_hashes_breaks_at_genesis_with_no_parent() {
+        // A branch whose walk runs off the start of the chain: `getblockheader`
+        // reports no `previousblockhash`, so the `None => break` arm fires
+        // before `branchlen` is exhausted. The hash walked so far is still
+        // recorded, and the call returns Ok rather than erroring.
+        let tip = format!("{:064x}", 0x4444u64);
+        let tips = serde_json::json!([
+            { "height": 5u32, "hash": tip, "branchlen": 3u32, "status": "valid-fork" },
+        ]);
+        // No parents registered → TipTransport reports `previousblockhash: null`.
+        let c = NodeClient::with_transport(Box::new(TipTransport {
+            tips,
+            parents: Default::default(),
+        }));
+        let set = c.orphan_block_hashes().unwrap();
+        assert_eq!(set.len(), 1, "only the tip is recorded before the break");
+        assert!(set.contains(&Hash32::from_hex(&tip).unwrap()));
+    }
+
+    #[test]
+    fn node_client_new_requires_credentials_and_accepts_both_forms() {
+        // No credentials at all → BadResponse before any network use.
+        let e = NodeClient::new(RpcConfig {
+            url: "http://127.0.0.1:1".into(),
+            cookie_path: None,
+            user: None,
+            password: None,
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(e, RpcError::BadResponse(_)), "{e:?}");
+
+        // user/password form → Ok (no request is made at construction).
+        let c = NodeClient::new(RpcConfig {
+            url: "http://127.0.0.1:1".into(),
+            cookie_path: None,
+            user: Some("u".into()),
+            password: Some("p".into()),
+        });
+        assert!(c.is_ok());
+
+        // cookie-file form → Ok, and a missing cookie file is an Io error.
+        let cookie = std::env::temp_dir().join(format!("bidx-cookie-{}", std::process::id()));
+        std::fs::write(&cookie, b"__cookie__:secret\n").unwrap();
+        let c = NodeClient::new(RpcConfig {
+            url: "http://127.0.0.1:1".into(),
+            cookie_path: Some(cookie.clone()),
+            user: None,
+            password: None,
+        });
+        assert!(c.is_ok());
+        let _ = std::fs::remove_file(&cookie);
+
+        let e = NodeClient::new(RpcConfig {
+            url: "http://127.0.0.1:1".into(),
+            cookie_path: Some(std::env::temp_dir().join("definitely-missing-cookie")),
+            user: None,
+            password: None,
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(e, RpcError::Io(_)), "{e:?}");
+    }
+
+    #[test]
+    fn orphan_block_hashes_rejects_a_bad_parent_hash() {
+        // The tip hash is valid but `getblockheader` reports a non-hex
+        // `previousblockhash`; the walk must surface a BadResponse rather than
+        // panic or silently truncate the branch.
+        let tip = format!("{:064x}", 0x3333u64);
+        struct BadParent(String);
+        impl RpcTransport for BadParent {
+            fn roundtrip(&self, body: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+                let method = body["method"].as_str().unwrap_or("");
+                let result = match method {
+                    "getchaintips" => serde_json::json!([{
+                        "height": 8u32, "hash": self.0, "branchlen": 2u32, "status": "valid-fork",
+                    }]),
+                    "getblockheader" => serde_json::json!({
+                        "hash": self.0,
+                        "height": 7,
+                        "confirmations": 0,
+                        "previousblockhash": "not-hex-either",
+                    }),
+                    _ => serde_json::Value::Null,
+                };
+                Ok(serde_json::json!({ "result": result, "error": null }))
+            }
+        }
+        let c = NodeClient::with_transport(Box::new(BadParent(tip)));
+        assert!(matches!(c.orphan_block_hashes(), Err(RpcError::BadResponse(_))));
+    }
+
+    /// A one-shot HTTP server that answers a single request with a fixed body,
+    /// so `HttpTransport::roundtrip` can be exercised end to end (header,
+    /// serialization, send, and JSON parse) without a real bitcoind.
+    fn one_shot_server(body: String) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn http_transport_roundtrips_over_a_real_socket() {
+        // Serve a valid JSON-RPC reply; `get_block_count` must parse it via the
+        // real HttpTransport (auth header + serde round trip).
+        let (url, h) = one_shot_server(r#"{"result":123,"error":null}"#.to_string());
+        let c = NodeClient::new(RpcConfig {
+            url,
+            cookie_path: None,
+            user: Some("u".into()),
+            password: Some("p".into()),
+        })
+        .unwrap();
+        assert_eq!(c.get_block_count().unwrap(), 123);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_surfaces_a_transport_error() {
+        // Nothing is listening on this port: the reqwest send must surface as
+        // RpcError::Http rather than panicking.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // free the port so the connect is refused
+        let c = NodeClient::new(RpcConfig {
+            url: format!("http://{addr}"),
+            cookie_path: None,
+            user: Some("u".into()),
+            password: Some("p".into()),
+        })
+        .unwrap();
+        assert!(matches!(c.get_block_count(), Err(RpcError::Http(_))));
+    }
 }

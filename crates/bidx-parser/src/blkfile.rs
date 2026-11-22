@@ -66,6 +66,10 @@ impl BlkFile {
         // SAFETY: we never mutate through the map; caller must ensure the
         // file isn't concurrently truncated (fine for a stopped/quiet node,
         // or a copied snapshot).
+        // coverage-exempt: the mmap only fails on an OS-level fault (out of
+        // address space, or the file truncated between open and map) that cannot
+        // be forced portably; the File::open error above already covers the
+        // "missing/unreadable path" case the tests exercise.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| BlkError::Io {
             path: path.to_path_buf(),
             source: e,
@@ -264,6 +268,11 @@ impl<'a> Iterator for BlkRecordIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let data = self.data;
         // Skip trailing zero padding at end of file (preallocated space).
+        // coverage-exempt: unreachable given `data()` — `record_walk_end`
+        // already trims trailing padding from the view this iterator walks, and
+        // no record starts with a zero byte (every network magic's first byte is
+        // non-zero), so a zero is never seen at a record boundary. Kept so the
+        // iterator stays correct if `data()` ever returns an untrimmed view.
         while self.pos < data.len() && data[self.pos] == 0 {
             self.pos += 1;
         }
@@ -322,6 +331,11 @@ pub fn discover_blk_files(blocks_dir: &Path) -> Result<Vec<(u32, PathBuf)>, BlkE
         source: e,
     })?;
     for entry in rd {
+        // coverage-exempt: untriggerable in a test — a `read_dir` entry only
+        // errors on a mid-iteration filesystem fault (e.g. the directory removed
+        // underneath us), which cannot be forced portably. Kept so a fault
+        // surfaces as a path-carrying Io error rather than being silently
+        // skipped.
         let entry = entry.map_err(|e| BlkError::Io {
             path: blocks_dir.to_path_buf(),
             source: e,
@@ -701,5 +715,174 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&tmp);
         }
+    }
+
+    #[test]
+    fn open_errors_when_path_does_not_exist() {
+        // A missing blk file must surface as an Io error carrying the path,
+        // not a panic.
+        let missing = std::env::temp_dir().join(format!("bidx-blk-missing-{}", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        match BlkFile::open(&missing, 0) {
+            Err(BlkError::Io { path, .. }) => assert_eq!(path, missing),
+            Err(e) => panic!("expected Io error, got {e:?}"),
+            Ok(_) => panic!("expected Io error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn len_and_is_empty_follow_the_trimmed_view() {
+        let (tmp, path) = make_blk_dir(2, 9);
+        let bf = BlkFile::open(&path, 9).unwrap();
+        // Two 88-byte records; the 128 bytes of padding are trimmed.
+        assert_eq!(bf.len(), 176);
+        assert!(!bf.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // A pure-padding file trims to nothing.
+        let empty = std::env::temp_dir().join(format!("bidx-blk-len-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        let p = empty.join("blk00000.dat");
+        std::fs::write(&p, [0u8; 64]).unwrap();
+        let bf = BlkFile::open(&p, 0).unwrap();
+        assert_eq!(bf.len(), 0);
+        assert!(bf.is_empty());
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn iterator_returns_none_for_a_trailing_partial_header() {
+        // A file ending in a lone magic + length but fewer than 8 trailing
+        // bytes after the last full record: the iterator must stop cleanly
+        // (None) rather than erroring or looping.
+        let mut data = Vec::new();
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&80u32.to_le_bytes());
+        let mut hdr = [0u8; 80];
+        hdr[79] = 1;
+        data.extend_from_slice(&hdr);
+        // Append 3 bytes (a truncated next-record prefix).
+        data.extend_from_slice(&[0x01, 0x02, 0x03]);
+
+        let tmp = std::env::temp_dir().join(format!("bidx-blk-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("blk00000.dat");
+        std::fs::write(&path, &data).unwrap();
+        let bf = BlkFile::open(&path, 0).unwrap();
+        let mut it = bf.records();
+        assert!(it.next().unwrap().is_ok(), "first record should parse");
+        assert!(it.next().is_none(), "trailing 3 bytes must end iteration");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn discover_blk_files_errors_on_a_missing_directory() {
+        let missing = std::env::temp_dir().join(format!("bidx-blk-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        match discover_blk_files(&missing) {
+            Err(BlkError::Io { path, .. }) => assert_eq!(path, missing),
+            Err(e) => panic!("expected Io error, got {e:?}"),
+            Ok(_) => panic!("expected Io error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn xor_decode_handles_non_multiple_of_eight_lengths() {
+        // `chunks_exact(8)` leaves a remainder; the tail must be XORed with the
+        // correct keystream offset, so a round-trip of a 13-byte buffer must be
+        // exact.
+        let key = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let plain: Vec<u8> = (0..13u8).collect();
+        let enc: Vec<u8> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 8])
+            .collect();
+        assert_eq!(xor_decode(&enc, &key), plain);
+        // Empty input round-trips to empty.
+        assert!(xor_decode(&[], &key).is_empty());
+    }
+
+    #[test]
+    fn record_walk_end_reads_lengths_through_the_xor_key() {
+        // Under obfuscation both the magic AND the length word are encoded;
+        // a walk that forgets to decode the length would stop after one record.
+        let key = [0x9Au8, 0x1B, 0x2C, 0x3D, 0x4E, 0x5F, 0x60, 0x71];
+        let plain = synth_records(4, 80, false);
+        let obf: Vec<u8> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 8])
+            .collect();
+        assert_eq!(record_walk_end(&obf, Some(&key)), plain.len());
+    }
+
+    #[test]
+    fn xor_obfuscated_file_is_decoded_on_open() {
+        // `-blocksxor=1` files: the whole file is XORed with the 8-byte key in
+        // xor.dat. `BlkFile::open` must detect xor.dat, decode, trim to the
+        // record boundary, and hand `data()` back as plaintext records.
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bidx-blk-xor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let key = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        fs::write(tmp.join("xor.dat"), key).unwrap();
+
+        // One record whose payload ends non-zero so nothing is trimmed.
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        plain.extend_from_slice(&80u32.to_le_bytes());
+        let mut hdr = [0u8; 80];
+        hdr[0] = 1;
+        hdr[79] = 1;
+        plain.extend_from_slice(&hdr);
+        let obf: Vec<u8> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 8])
+            .collect();
+        let path = tmp.join("blk00000.dat");
+        fs::write(&path, &obf).unwrap();
+
+        let bf = BlkFile::open(&path, 0).unwrap();
+        assert_eq!(bf.data(), plain.as_slice());
+        let rec = bf.records().next().unwrap().unwrap();
+        assert_eq!(rec.header.version, 1);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn xor_obfuscated_file_with_trailing_padding_is_trimmed() {
+        // Padding under XOR is a non-zero key pattern, so the "last non-zero
+        // byte" heuristic cannot work; only the record walk can. The decoded
+        // view must stop exactly at the last real record.
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bidx-blk-xorp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let key = [0x0Au8, 0x1B, 0x2C, 0x3D, 0x4E, 0x5F, 0x60, 0x71];
+        fs::write(tmp.join("xor.dat"), key).unwrap();
+
+        let plain = synth_records(2, 80, false);
+        let mut padded = plain.clone();
+        padded.extend_from_slice(&[0u8; 256]); // decodes to a non-zero pattern
+        let obf: Vec<u8> = padded
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i % 8])
+            .collect();
+        let path = tmp.join("blk00000.dat");
+        fs::write(&path, &obf).unwrap();
+
+        let bf = BlkFile::open(&path, 0).unwrap();
+        assert_eq!(bf.data(), plain.as_slice());
+        let count = bf.records().filter(|r| r.is_ok()).count();
+        assert_eq!(count, 2);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

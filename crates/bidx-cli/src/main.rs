@@ -31,6 +31,24 @@ mod bench;
 mod diskguard;
 mod live;
 mod pipeline;
+mod serve;
+mod verify;
+
+/// Test-only helpers shared across this crate's unit tests.
+#[cfg(test)]
+pub mod testlock {
+    /// Tests that spawn a child process (`clickhouse-client`, the fake client,
+    /// the live/bench paths) fork the whole test process. A concurrent thread
+    /// mid-`fs::write` of an executable would have its write fd inherited by
+    /// the child, and `execve` of that inode then fails with ETXTBSY. Holding
+    /// this process-wide guard for the body of any test that spawns (or writes
+    /// an executable script) keeps the fork and the writes from overlapping.
+    static FORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+        FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "bidx", version, about = "Bitcoin blockchain indexer: blk*.dat -> Parquet -> ClickHouse")]
@@ -191,6 +209,55 @@ enum Cmd {
         action: IndexAction,
     },
 
+    /// Serve the query API: Esplora-compatible REST, Electrum JSON-RPC, and
+    /// Prometheus metrics / health endpoints. Configuration comes from a TOML
+    /// file plus `BIDX_*` environment overrides.
+    Serve {
+        /// Path to a TOML config file. Without one, defaults + env are used.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Verify index integrity: structural invariants (unique heights, one
+    /// coinbase per block, spend linking) plus optional agreement with a
+    /// Bitcoin Core node tip. Exits non-zero when any hard check fails.
+    Verify {
+        #[arg(long, default_value = "localhost")]
+        host: String,
+        #[arg(long, default_value_t = 9000)]
+        port: u16,
+        #[arg(long, default_value = "default")]
+        user: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long, default_value = "bitcoin")]
+        database: String,
+        /// Bitcoin Core RPC URL for the node-agreement check.
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// Node `.cookie` file (used when --rpc-user/--rpc-password are absent).
+        #[arg(long)]
+        rpc_cookie: Option<PathBuf>,
+        #[arg(long)]
+        rpc_user: Option<String>,
+        #[arg(long)]
+        rpc_password: Option<String>,
+    },
+
+    /// Apply pending schema migrations and report the schema version.
+    Migrate {
+        #[arg(long, default_value = "localhost")]
+        host: String,
+        #[arg(long, default_value_t = 9000)]
+        port: u16,
+        #[arg(long, default_value = "default")]
+        user: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long, default_value = "bitcoin")]
+        database: String,
+    },
+
     /// Benchmark the ingest pipeline: run bidx against a blocks directory
     /// and report per-stage timing (header pass, parallel parse, sequential
     /// UTXO apply, Parquet sink) plus wall-clock throughput, CPU utilisation,
@@ -202,12 +269,16 @@ enum Cmd {
 enum IndexAction {
     /// List the query-index catalogue (name, mechanism, target table).
     List,
-    /// Rebuild a backfilled index. Only `coinstats_by_height` and
-    /// `address_prefix` are backfills; every other index is maintained
+    /// Rebuild a backfilled index. Only `coinstats_by_height`, `scripthash_map`
+    /// and `address_prefix` are backfills; every other index is maintained
     /// automatically by its materialized view.
     Rebuild {
         /// Index name (see `bidx index list`).
         name: String,
+        /// Chain network, used to render `address_prefix` addresses with the
+        /// right base58/bech32 prefix. Ignored by the SQL-only backfills.
+        #[arg(long, value_enum, default_value = "mainnet")]
+        network: NetworkArg,
         #[arg(long, default_value = "localhost")]
         host: String,
         #[arg(long, default_value_t = 9000)]
@@ -221,13 +292,26 @@ enum IndexAction {
     },
 }
 
+// Untested by design (coverage-exempt): `main` is the process entrypoint. It
+// parses the real argv and installs the global tracing subscriber exactly once,
+// so it cannot run inside a unit-test binary (that would conflict with the test
+// harness's own argv and the already-installed subscriber). All logic it
+// delegates to is in `run`, which is fully covered; the only uncovered lines
+// here are these five glue lines.
+// coverage-exempt
 fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&cli.log))
         .with_target(false)
         .init();
+    run(cli)
+}
 
+/// Dispatch one parsed CLI invocation. Split from `main` so the command arms
+/// are reachable from unit tests (which cannot call `main`, since it parses the
+/// process argv and installs a global tracing subscriber).
+fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Headers { blocks_dir } => {
             let (index, stats) = bidx_parser::build_chain_index(&blocks_dir)
@@ -272,6 +356,7 @@ fn main() -> Result<()> {
                 network: network.map(Into::into),
                 checkpoint_file,
                 orphan_blocks: None,
+                rpc_transport: None,
             })?;
         }
 
@@ -324,6 +409,7 @@ fn main() -> Result<()> {
             }
             IndexAction::Rebuild {
                 name,
+                network,
                 host,
                 port,
                 user,
@@ -337,12 +423,69 @@ fn main() -> Result<()> {
                     password,
                     database,
                 })?;
-                loader.rebuild_index(&name)?;
-                println!("rebuilt index {name}");
+                if name == "address_prefix" {
+                    // Needs base58/bech32 rendering, which the loader can't do.
+                    let net: Network = network.into();
+                    let n = loader.rebuild_address_prefix(|ty, hash| {
+                        bidx_serve::address::render_address(net, ty, hash)
+                    })?;
+                    println!("rebuilt index {name} ({n} addresses)");
+                } else {
+                    loader.rebuild_index(&name)?;
+                    println!("rebuilt index {name}");
+                }
             }
         },
 
         Cmd::Bench(cfg) => run_bench(cfg)?,
+
+        Cmd::Serve { config } => serve::run_serve(serve::ServeArgs { config })?,
+
+        Cmd::Verify {
+            host,
+            port,
+            user,
+            password,
+            database,
+            rpc_url,
+            rpc_cookie,
+            rpc_user,
+            rpc_password,
+        } => {
+            verify::run_verify(verify::VerifyArgs {
+                host,
+                port,
+                user,
+                password,
+                database,
+                rpc_url,
+                rpc_cookie,
+                rpc_user,
+                rpc_password,
+            })?;
+        }
+
+        Cmd::Migrate {
+            host,
+            port,
+            user,
+            password,
+            database,
+        } => {
+            let loader = bidx_loader::ChLoader::new(bidx_loader::ChConfig {
+                host,
+                port,
+                user,
+                password,
+                database,
+            })?;
+            let applied = loader.migrate()?;
+            if applied.is_empty() {
+                println!("schema up to date (version {})", bidx_loader::schema::SCHEMA_VERSION);
+            } else {
+                println!("applied migrations: {applied:?}");
+            }
+        }
 
         Cmd::Live {
             rpc_url,
@@ -428,6 +571,20 @@ mod tests {
             "--mode", "full",
         ]);
         assert!(c.is_ok(), "{:?}", c.err());
+        // Serve with no config (defaults + env).
+        let c = Cli::try_parse_from(["bidx", "serve"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Serve with a config path.
+        let c = Cli::try_parse_from(["bidx", "serve", "--config", "/etc/bidx/bidx.toml"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Verify (minimal and with node RPC).
+        let c = Cli::try_parse_from(["bidx", "verify"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        let c = Cli::try_parse_from(["bidx", "verify", "--rpc-url", "http://127.0.0.1:8332"]);
+        assert!(c.is_ok(), "{:?}", c.err());
+        // Migrate.
+        let c = Cli::try_parse_from(["bidx", "migrate", "--database", "btc"]);
+        assert!(c.is_ok(), "{:?}", c.err());
         // Reject unknown
         assert!(Cli::try_parse_from(["bidx", "bogus-command"]).is_err());
     }
@@ -446,5 +603,252 @@ mod tests {
         ]);
         assert!(c.is_ok());
         assert_eq!(c.unwrap().log, "bidx=debug");
+    }
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap()
+    }
+
+    /// Run `f` with `BIDX_CLICKHOUSE_CLIENT` pointing at a fake client that
+    /// exits 0, so the ClickHouse-backed dispatch arms reach their success
+    /// path. Holds the fork guard so the env mutation and the child spawn don't
+    /// race other tests.
+    fn with_fake_client(tag: &str, f: impl FnOnce()) {
+        let _g = testlock::fork_guard();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bidx-cli-ch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        std::fs::write(&dir, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let saved = std::env::var_os("BIDX_CLICKHOUSE_CLIENT");
+        std::env::set_var("BIDX_CLICKHOUSE_CLIENT", &dir);
+        f();
+        match saved {
+            Some(v) => std::env::set_var("BIDX_CLICKHOUSE_CLIENT", v),
+            None => std::env::remove_var("BIDX_CLICKHOUSE_CLIENT"),
+        }
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn run_index_list_prints_the_catalogue() {
+        // Pure: prints every catalogue entry, no I/O.
+        let c = cli(&["bidx", "index", "list"]);
+        assert!(run(c).is_ok());
+    }
+
+    #[test]
+    fn run_headers_reports_a_missing_blocks_dir() {
+        let c = cli(&["bidx", "headers", "--blocks-dir", "/definitely/not/here"]);
+        let e = run(c).unwrap_err();
+        assert!(e.to_string().contains("header pass failed"), "{e}");
+    }
+
+    #[test]
+    fn run_inspect_fails_on_a_missing_block() {
+        let c = cli(&["bidx", "inspect", "--blocks-dir", "/definitely/not/here", "--height", "0"]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_initdb_and_migrate_fail_without_a_clickhouse_client() {
+        let _g = testlock::fork_guard();
+        // No clickhouse-client on PATH in the sandbox → NoClient error, not a
+        // panic. Exercises the InitDb and Migrate dispatch arms.
+        let c = cli(&["bidx", "init-db", "--host", "localhost"]);
+        assert!(run(c).is_err());
+        let c = cli(&["bidx", "migrate", "--host", "localhost"]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_load_fails_without_a_clickhouse_client() {
+        let _g = testlock::fork_guard();
+        let c = cli(&["bidx", "load", "--input", "/tmp/nope"]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_index_rebuild_fails_without_a_clickhouse_client() {
+        let _g = testlock::fork_guard();
+        let c = cli(&["bidx", "index", "rebuild", "coinstats_by_height"]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_serve_propagates_a_bad_config_path() {
+        let c = cli(&["bidx", "serve", "--config", "/definitely/not/here.toml"]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_verify_fails_without_a_clickhouse_client() {
+        let _g = testlock::fork_guard();
+        let c = cli(&["bidx", "verify", "--host", "localhost"]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_clickhouse_arms_succeed_with_a_fake_client() {
+        // With a fake client on BIDX_CLICKHOUSE_CLIENT every ClickHouse-backed
+        // arm reaches its success println.
+        with_fake_client("ok", || {
+            assert!(run(cli(&["bidx", "init-db"])).is_ok());
+            assert!(run(cli(&["bidx", "load", "--input", "/tmp/nope"])).is_ok());
+            assert!(run(cli(&["bidx", "index", "rebuild", "coinstats_by_height"])).is_ok());
+            // address_prefix routes through the Rust renderer (0 rows here).
+            assert!(run(cli(&["bidx", "index", "rebuild", "address_prefix"])).is_ok());
+            // migrate: schema_version parses "0" → reports up to date.
+            assert!(run(cli(&["bidx", "migrate"])).is_ok());
+        });
+    }
+
+    /// Run `f` with `BIDX_CLICKHOUSE_CLIENT` pointing at a fake client that
+    /// answers the `address_prefix` source query with one P2PKH row and echoes
+    /// any other query, so the CLI's render closure actually runs.
+    fn with_address_prefix_client(tag: &str, f: impl FnOnce()) {
+        let _g = testlock::fork_guard();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bidx-cli-ap-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        // hash160 62e907b1... is the genesis P2PKH address on mainnet.
+        let body = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$a\" in --query=*DISTINCT*script_type*) printf '2\\t{}' ; exit 0;; esac; done\n\
+             for a in \"$@\"; do case \"$a\" in --query=*) echo \"$a\";; esac; done\n\
+             exit 0\n",
+            format!("{}{}", "62e907b15cbf27d5425399ebf6f0fb50ebb88f18", "0".repeat(24))
+        );
+        std::fs::write(&dir, body).unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let saved = std::env::var_os("BIDX_CLICKHOUSE_CLIENT");
+        std::env::set_var("BIDX_CLICKHOUSE_CLIENT", &dir);
+        f();
+        match saved {
+            Some(v) => std::env::set_var("BIDX_CLICKHOUSE_CLIENT", v),
+            None => std::env::remove_var("BIDX_CLICKHOUSE_CLIENT"),
+        }
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn run_index_rebuild_address_prefix_renders_a_mainnet_address() {
+        with_address_prefix_client("mainnet", || {
+            assert!(run(cli(&["bidx", "index", "rebuild", "address_prefix"])).is_ok());
+            // An explicit network arg is accepted too.
+            assert!(run(cli(&[
+                "bidx", "index", "rebuild", "address_prefix", "--network", "testnet3",
+            ]))
+            .is_ok());
+        });
+    }
+
+    /// A fake client that answers the schema-version query with `version` and
+    /// exits 0 for everything else, so `migrate` takes a deterministic branch:
+    /// a version below `SCHEMA_VERSION` applies the pending migrations (the
+    /// "applied" arm), and one at/above it applies nothing (the "up to date"
+    /// arm).
+    fn with_versioned_client(tag: &str, version: u32, f: impl FnOnce()) {
+        let _g = testlock::fork_guard();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bidx-cli-ver-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let body = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$a\" in --query=*max*version*) echo {version}; exit 0;; esac; done\n\
+             exit 0\n"
+        );
+        std::fs::write(&dir, body).unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let saved = std::env::var_os("BIDX_CLICKHOUSE_CLIENT");
+        std::env::set_var("BIDX_CLICKHOUSE_CLIENT", &dir);
+        f();
+        match saved {
+            Some(v) => std::env::set_var("BIDX_CLICKHOUSE_CLIENT", v),
+            None => std::env::remove_var("BIDX_CLICKHOUSE_CLIENT"),
+        }
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn run_migrate_reports_applied_versions_from_the_fake_client() {
+        // A client reporting version 0 has the v2 address_stats rebuild
+        // pending, so `migrate` applies it and prints the "applied" arm.
+        with_versioned_client("applied", 0, || {
+            assert!(run(cli(&["bidx", "migrate", "--database", "btc"])).is_ok());
+        });
+        // A client already at the current version applies nothing and takes
+        // the "schema up to date" arm.
+        with_versioned_client("current", bidx_loader::schema::SCHEMA_VERSION, || {
+            assert!(run(cli(&["bidx", "migrate", "--database", "btc"])).is_ok());
+        });
+    }
+
+    #[test]
+    fn run_headers_succeeds_over_a_synthetic_blk_file() {
+        // A single well-formed record (mainnet magic + 80-byte header) is
+        // enough for the header pass to build a one-block chain index and take
+        // the success println path.
+        let dir = std::env::temp_dir().join(format!("bidx-hdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&80u32.to_le_bytes());
+        let mut hdr = [0u8; 80];
+        hdr[0] = 1; // version
+        hdr[79] = 1; // non-zero tail so trailing-zero padding is not trimmed
+        data.extend_from_slice(&hdr);
+        std::fs::write(dir.join("blk00000.dat"), &data).unwrap();
+
+        let c = cli(&["bidx", "headers", "--blocks-dir", dir.to_str().unwrap()]);
+        assert!(run(c).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_parse_arm_builds_config_then_fails_on_a_missing_dir() {
+        let _g = testlock::fork_guard();
+        let c = cli(&[
+            "bidx", "parse",
+            "--blocks-dir", "/definitely/not/here",
+            "--out", "/tmp/bidx-out",
+            "--utxo", "/tmp/bidx-utxo",
+            "--network", "regtest",
+        ]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_bench_arm_fails_on_a_missing_blocks_dir() {
+        let _g = testlock::fork_guard();
+        let c = cli(&[
+            "bidx", "bench",
+            "--blocks-dir", "/definitely/not/here",
+            "--mode", "headers",
+        ]);
+        assert!(run(c).is_err());
+    }
+
+    #[test]
+    fn run_live_arm_builds_config_then_fails_on_a_bad_utxo_path() {
+        let _g = testlock::fork_guard();
+        // run_live fails fast when the UTXO store path cannot be created.
+        let c = cli(&[
+            "bidx", "live",
+            "--utxo", "/proc/definitely/not/writable",
+            "--skip-disk-check",
+        ]);
+        assert!(run(c).is_err());
     }
 }

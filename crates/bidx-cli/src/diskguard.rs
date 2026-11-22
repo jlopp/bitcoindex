@@ -407,4 +407,81 @@ mod tests {
         assert_eq!(read[1].height, 30);
         std::env::remove_var("BIDX_DISK_CHECKPOINT_STEP");
     }
+
+    /// Install a global tracing subscriber exactly once. The `info!` calls in
+    /// this module build their structured fields as macro arguments; with no
+    /// subscriber those field expressions are never evaluated, so the log
+    /// formatting lines only run when a subscriber is installed.
+    fn init_tracing() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_test_writer()
+                .try_init();
+        });
+    }
+
+    #[test]
+    fn log_paths_evaluate_with_a_subscriber_installed() {
+        init_tracing();
+        let _g = env_lock();
+        std::env::set_var("BIDX_DISK_CHECKPOINT_STEP", "1");
+
+        // 1) No checkpoints: exercises the "no prior checkpoints" log branch.
+        let (cfg, _ck) = tmp_cfg("log-nockpt");
+        let r = cfg.run_pre_flight(900_000, 0, 0).unwrap();
+        assert_eq!(r.checkpoints_used, 0);
+
+        // 2) Checkpoints present and ample free space: exercises the full
+        //    "disk-space projection" log field block and the success log.
+        let (mut cfg2, ck2) = tmp_cfg("log-ok");
+        let tiny = std::env::temp_dir().join(format!("bidx-log-tiny-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tiny);
+        std::fs::create_dir_all(&tiny).unwrap();
+        std::fs::write(tiny.join("only"), [0u8; 32]).unwrap();
+        cfg2.tracked_dirs = vec![tiny.clone()];
+        append_checkpoint(&ck2, Network::Mainnet, DiskCheckpoint { height: 100_000, total_bytes: 1 << 20 }).unwrap();
+        let r2 = cfg2.run_pre_flight(200_000, 100_000, 0).unwrap();
+        assert_eq!(r2.checkpoints_used, 1);
+
+        // 3) Recorder success: exercises the checkpoint append and its log.
+        //    Use a fresh config with no prior checkpoint, since the recorder
+        //    seeds its last-height from the file and would otherwise reject a
+        //    low height as already-recorded.
+        let (cfg3, ck3) = tmp_cfg("log-rec");
+        let rec = DiskRecorder::new(cfg3.clone());
+        assert!(rec.on_block_applied(5).unwrap());
+        assert!(read_checkpoints(&ck3, Network::Mainnet).iter().any(|c| c.height == 5));
+
+        std::env::remove_var("BIDX_DISK_CHECKPOINT_STEP");
+        let _ = std::fs::remove_dir_all(&tiny);
+    }
+
+    #[test]
+    fn recorder_append_failure_is_contextualized() {
+        // Point the checkpoint file under a path whose parent is a regular
+        // file, so `create_dir_all` fails and the append returns an error. The
+        // `with_context` closure must attach the destination path to it.
+        let _g = env_lock();
+        std::env::set_var("BIDX_DISK_CHECKPOINT_STEP", "1");
+        let tmp = std::env::temp_dir().join(format!("bidx-guard-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let blocker = tmp.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let cfg = DiskGuardConfig {
+            checkpoint_file: blocker.join("ckpt.txt"),
+            network: Network::Mainnet,
+            index_root: tmp.clone(),
+            tracked_dirs: vec![tmp.clone()],
+        };
+        let rec = DiskRecorder::new(cfg);
+        let e = rec.on_block_applied(1).unwrap_err();
+        let s = format!("{:#}", e);
+        assert!(s.contains("write checkpoint to"), "got: {s}");
+        std::env::remove_var("BIDX_DISK_CHECKPOINT_STEP");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

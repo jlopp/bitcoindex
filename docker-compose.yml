@@ -1,0 +1,80 @@
+# bitcoindex deployment stack.
+#
+# Brings up ClickHouse (the serving store) and `bidx serve` (the query API +
+# metrics). The ingest side (`bidx parse` / `bidx load`) runs as one-off
+# commands — see the README "Deploy" section.
+#
+# Quick start:
+#   mkdir -p data/{utxo,out,clickhouse,blocks}
+#   # point BLOCKS_DIR at your synced Bitcoin Core blocks directory
+#   docker compose up -d
+#   docker compose run --rm bidx init-db
+#   docker compose run --rm bidx load --input /data/out
+#
+# Then the API is on :8432 and Prometheus metrics on :9101/metrics.
+
+name: bitcoindex
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: bidx-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: bitcoin
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      # Expose only if you need external SQL access; the serving API talks to
+      # ClickHouse over the compose network, so this is optional.
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - ./data/clickhouse:/var/lib/clickhouse
+      # The loader uses ClickHouse's file() table function, which is confined
+      # to user_files. Mount the Parquet output there read-only.
+      - ./data/out:/var/lib/clickhouse/user_files/parquet:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  bidx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bitcoindex/bidx:local
+    container_name: bidx-serve
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    # Serving API + Prometheus metrics.
+    command:
+      - serve
+      - --config
+      - /etc/bidx/bidx.toml
+    environment:
+      # Config values can also come from env (BIDX_*) — the file below is the
+      # canonical source and the env vars override it.
+      BIDX_CLICKHOUSE__HOST: clickhouse
+      BIDX_CLICKHOUSE__PORT: "9000"
+      BIDX_CLICKHOUSE__HTTP_PORT: "8123"
+      BIDX_CLICKHOUSE__DATABASE: bitcoin
+      BIDX_RUST_LOG: info
+    ports:
+      - "8432:8432"   # REST + Electrum JSON-RPC
+      - "9101:9101"   # /metrics, /healthz, /readyz
+    volumes:
+      - ./bidx.toml:/etc/bidx/bidx.toml:ro
+      - ./data/utxo:/data/utxo
+      - ./data/out:/data/out
+      # Mount your synced node's blocks read-only for `bidx parse`/`live`.
+      # Set BIDX_BLOCKS_DIR or edit the bind source below.
+      - ${BLOCKS_DIR:-./data/blocks}:/data/blocks:ro

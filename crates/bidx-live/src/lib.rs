@@ -13,6 +13,6 @@ pub mod node;
 pub mod tracker;
 pub mod zmqsub;
 
-pub use node::{NodeClient, RpcConfig};
+pub use node::{NodeClient, RpcConfig, RpcError, RpcTransport};
 pub use tracker::{LiveTracker, TrackerConfig, TrackerEvent};
 pub use zmqsub::{ZmqConfig, ZmqSubscriber};

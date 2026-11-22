@@ -1,0 +1,8 @@
+target/
+bidx-perf/
+**/*.rs.bk
+.git/
+.github/
+Dockerfile
+docker-compose*.yml
+*.md

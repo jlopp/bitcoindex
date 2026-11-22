@@ -1,0 +1,74 @@
+name: Coverage
+
+# Enforce the per-file coverage policy from `.cursor/rules/test-coverage.mdc`:
+# every Rust file a pull request touches must be at 100% line coverage.
+#
+# This is a *changed-file* gate, not a workspace-wide threshold. The workspace
+# as a whole is not at 100% (the long-running `bidx-live` / pipeline paths are
+# not), and holding every PR to that would either block all work or invite
+# blanket exclusions. Instead each PR is accountable for the files it changes,
+# which is exactly what the rule asks of an agent or author.
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changed-files:
+    name: changed files at 100%
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the base branch to diff against.
+          fetch-depth: 0
+
+      # Same system build deps as the test workflow: bindgen needs libclang,
+      # RocksDB needs cmake, zmq links the system libzmq.
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      # Debug profile: RocksDB + Arrow/Parquet in release with lto=fat is far
+      # too slow for a per-PR gate, and the policy is about lines covered, not
+      # profile. `--engine llvm` and the rest come from `.tarpaulin.toml`.
+      - name: Measure coverage
+        run: |
+          mkdir -p target/coverage
+          cargo tarpaulin --workspace --out Json --output-dir target/coverage
+
+      - name: Enforce 100% on changed files
+        env:
+          # Diff against the PR base branch, not master, so a stacked PR is
+          # judged only on its own changes.
+          COVERAGE_BASE: origin/${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1 || true
+          scripts/coverage/check-changed.sh target/coverage/tarpaulin-report.json "origin/${{ github.event.pull_request.base.ref }}"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/coverage/tarpaulin-report.json
+          if-no-files-found: warn

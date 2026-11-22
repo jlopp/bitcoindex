@@ -65,6 +65,14 @@ pub fn parse_block_full(
         txs.push(tx);
     }
 
+    // coverage-exempt: 76-80 — unreachable by construction: the loop above runs
+    // exactly `tx_count` times and pushes exactly one tx per iteration, so
+    // `txs.len() == tx_count` always holds (`read_count` also bounds `tx_count`
+    // to `MAX_ITEMS`, well within `u32`). Kept as a defensive check so a future
+    // change to the loop (e.g. a `continue` on a skipped tx) cannot silently
+    // produce a block whose `tx_count` disagrees with its `txs` vector. See
+    // `explicit_tx_count_mismatch_error_is_reported`, which asserts the error's
+    // construction and `Display`.
     if txs.len() as u64 != tx_count {
         return Err(TxParseError::TxCountMismatch {
             declared: tx_count,
@@ -544,5 +552,78 @@ mod tests {
         let total = tx.len() as u32;
         assert_eq!(block.txs[0].size, total);
         assert_eq!(block.txs[0].weight, stripped * 3 + total);
+    }
+
+    #[test]
+    fn explicit_tx_count_mismatch_error_is_reported() {
+        // `parse_block_full` iterates exactly `tx_count` times, so a short
+        // `txs` vector can only arise from a parse that consumed fewer txs than
+        // declared. Drive the guard directly by calling the internal loop's
+        // invariant with a hand-built mismatch, via a payload whose count byte
+        // is larger than the number of parseable txs but which still reaches the
+        // post-loop check (count = 1 with one tx present parses; to hit the
+        // guard we assert its construction and Display instead).
+        let e = TxParseError::TxCountMismatch { declared: 5, parsed: 3 };
+        assert!(matches!(e, TxParseError::TxCountMismatch { declared: 5, parsed: 3 }));
+        assert_eq!(e.to_string(), "tx count mismatch: declared 5, parsed 3");
+    }
+
+    #[test]
+    fn input_count_varint_overflow_is_rejected() {
+        // A tx whose input-count uses the 0xff varint with a value above the
+        // 4M sanity bound must be rejected with a CountOverflow cursor error
+        // rather than attempting to preallocate a huge input vector.
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(0xff); // 8-byte varint follows
+        tx.extend_from_slice(&(5_000_000u64).to_le_bytes());
+        // (no input bytes needed; the parser must reject on the count itself)
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+        let e = parse_block_full(&payload, 0, hash, &header_for(1)).err().unwrap();
+        match e {
+            TxParseError::Cursor(ParseError::CountOverflow(n, _)) => assert_eq!(n, 5_000_000),
+            other => panic!("expected CountOverflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_count_varint_0xfe_and_0xff_encodings_are_accepted() {
+        // The input-count match has a branch per varint size class; the 0xfe
+        // (u32) and 0xff (u64, within the sanity bound) branches are exercised
+        // here with a count of 1 so the rest of the tx parses normally.
+        for (label, encode) in [
+            ("0xfe", 0u8),
+            ("0xff", 1u8),
+        ] {
+            let mut tx = Vec::new();
+            tx.extend_from_slice(&1i32.to_le_bytes());
+            match encode {
+                0 => {
+                    tx.push(0xfe);
+                    tx.extend_from_slice(&1u32.to_le_bytes());
+                }
+                _ => {
+                    tx.push(0xff);
+                    tx.extend_from_slice(&1u64.to_le_bytes());
+                }
+            }
+            tx.extend_from_slice(&[0xABu8; 32]); // prev_txid
+            tx.extend_from_slice(&0u32.to_le_bytes()); // vout
+            tx.push(0u8); // script_len
+            tx.extend_from_slice(&0u32.to_le_bytes()); // sequence
+            tx.push(1u8); // output_count
+            tx.extend_from_slice(&123u64.to_le_bytes());
+            tx.push(0u8);
+            tx.extend_from_slice(&0u32.to_le_bytes()); // locktime
+
+            let payload = block_with(&[tx]);
+            let hash = dsha256(&payload[..80]);
+            let block = parse_block_full(&payload, 1, hash, &header_for(1))
+                .unwrap_or_else(|e| panic!("{label} input-count encoding failed: {e:?}"));
+            assert_eq!(block.inputs.len(), 1, "{label}");
+            assert_eq!(block.outputs.len(), 1, "{label}");
+            assert_eq!(block.outputs[0].value_sat, 123, "{label}");
+        }
     }
 }

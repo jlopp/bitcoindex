@@ -1,0 +1,42 @@
+# bitcoindex serving-layer configuration.
+#
+# Copy to `bidx.toml` and edit. Every value can also be overridden by a
+# `BIDX_*` environment variable (nested keys use `__`, e.g.
+# `BIDX_CLICKHOUSE__HOST`), which is what container orchestrators use for
+# secrets and per-environment hosts. Precedence: defaults < this file < env.
+
+# mainnet | testnet3 | testnet4 | signet | regtest
+network = "mainnet"
+
+# REST + Electrum JSON-RPC listener.
+api_addr = "0.0.0.0:8432"
+# Prometheus /metrics, /healthz, /readyz listener.
+metrics_addr = "0.0.0.0:9101"
+
+# Toggle the two serving surfaces independently.
+esplora_enabled = true
+electrum_enabled = true
+
+# Log filter (e.g. "info", "bidx=debug").
+log = "info"
+
+[clickhouse]
+host = "clickhouse"
+# Native protocol port — used by `bidx init-db` / `bidx load`.
+port = 9000
+# HTTP interface port — used by `bidx serve`. ClickHouse serves HTTP on a
+# different port than the native protocol; don't set this to 9000.
+http_port = 8123
+user = "default"
+# password = "..."           # prefer BIDX_CLICKHOUSE__PASSWORD in prod
+database = "bitcoin"
+timeout_secs = 30
+
+# Optional: Bitcoin Core RPC. Used for the readiness lag metric and by
+# `bidx verify`'s node-agreement check. Omit if the node is not reachable from
+# the serving host.
+[node]
+rpc_url = "http://127.0.0.1:8332"
+# cookie = "/home/bitcoin/.bitcoin/.cookie"
+# user = "rpcuser"
+# password = "rpcpassword"

@@ -70,8 +70,32 @@ Five core Parquet/ClickHouse tables: `blocks`, `transactions`, `inputs`,
 type, address hash, and creation height — this is what powers fees,
 balances, and coin-flow queries.
 
-ClickHouse additionally gets query-optimized projections:
-`transactions_by_txid`, `outputs_by_address`, `inputs_by_prev_output`.
+ClickHouse additionally gets twelve query-optimized derived tables
+(`transactions_by_txid`, `outputs_by_address`, `spends_by_spent_outpoint`,
+`address_history`, `utxos_by_address`, `address_stats`, and more) plus four
+projections and three skip indexes on the base tables. See
+[`doc/schema.md`](doc/schema.md) for the full catalogue and
+[`doc/data-model-rationale.md`](doc/data-model-rationale.md) for why each
+exists.
+
+## Documentation
+
+Full documentation lives in [`doc/`](doc/). Start with
+[`doc/README.md`](doc/README.md) for the reading order.
+
+| Document | Covers |
+|----------|--------|
+| [doc/schema.md](doc/schema.md) | Every ClickHouse table and field a user can query, plus indexes, MVs, and enumerations. |
+| [doc/query-cookbook.md](doc/query-cookbook.md) | Practical SQL recipes: blocks, txs, spends, addresses, UTXO set, miners, joins. |
+| [doc/cli.md](doc/cli.md) | Every `bidx` subcommand and flag, with typical workflows. |
+| [doc/architecture.md](doc/architecture.md) | How the pipeline works end to end, stage by stage. |
+| [doc/serving-api.md](doc/serving-api.md) | The Esplora REST, Electrum JSON-RPC, and ops surfaces. |
+| [doc/deployment-ops.md](doc/deployment-ops.md) | Building, deploying, and operating the stack. |
+| [doc/data-model-rationale.md](doc/data-model-rationale.md) | Why the schema is shaped the way it is. |
+| [doc/contributing.md](doc/contributing.md) | Dev setup, tests, coverage, and the PR flow. |
+
+The authoritative sources are the Rust code, not the docs; see
+[doc/README.md](doc/README.md#keeping-these-documents-honest) for the mapping.
 
 ## Build
 
@@ -84,6 +108,48 @@ export LIBCLANG_PATH=/usr/lib/llvm-18/lib   # wherever libclang lives
 export BINDGEN_EXTRA_CLANG_ARGS="-I$PWD/.build-shim/include"
 cargo build --release
 ```
+
+## Testing & coverage
+
+```bash
+cargo test --release --workspace     # the whole suite
+```
+
+**Policy: every Rust file a change touches must be at 100% line coverage.**
+This is enforced, not advisory — see `.cursor/rules/test-coverage.mdc` for the
+full rule and the reasoning behind it.
+
+Measure coverage with [cargo-tarpaulin](https://github.com/xd009642/tarpaulin)
+(config in `.tarpaulin.toml`; `--engine llvm` is required because the ptrace
+engine mis-handles the subprocesses the loader tests spawn):
+
+```bash
+cargo tarpaulin --workspace --out Json --output-dir target/coverage
+
+# Fail if any file changed against origin/master is below 100%:
+scripts/coverage/check-changed.sh target/coverage/tarpaulin-report.json origin/master
+```
+
+The gate is **per changed file**, not workspace-wide: the long-running
+`bidx-live` and pipeline paths that need a live bitcoind/ZMQ are not fully
+covered, and holding every PR to a workspace-wide threshold would either block
+all work or invite blanket exclusions. `.github/workflows/coverage.yml` runs the
+same check on every pull request, diffing against the PR's base branch.
+
+Current workspace total is ~96.7% (4089/4230 lines). Every file under
+`bidx-serve`, `bidx-loader`, and the `bidx-core` primitives is at 100%, and
+every file changed since the coverage gate was added is at 100% or carries a
+documented exemption.
+
+### Documented exemptions
+
+`.cursor/rules/test-coverage.mdc` permits a line to go untested when a comment
+explains *why* it is unreachable. `check-changed.sh` honours that: a comment
+containing `coverage-exempt` exempts the item it heads — a single statement, or,
+for a function/loop/closure, the whole brace block — from the 100% requirement.
+Use the explicit form `// coverage-exempt: 12-14, 20` when the untestable code
+spans lines the heuristic cannot bracket. Every exemption must still be justified
+in the comment; the marker is not a way to opt out of testing reachable code.
 
 ## Usage
 
@@ -225,6 +291,11 @@ etc.), and the UTXO set is durable in RocksDB. Re-running `parse` with
 Loading is per-entity via Parquet globs, so a failed load retries cleanly.
 
 ## Querying
+
+See [`doc/schema.md`](doc/schema.md) for the full table/field reference and
+[`doc/query-cookbook.md`](doc/query-cookbook.md) for ready-to-run recipes.
+The two rules that explain most surprises: hashes are raw wire-order bytes
+(reverse for display), and addresses are `(script_type, address_hash)` pairs.
 
 Hashes are stored as raw bytes. To match a display hex txid, reverse it.
 Example ClickHouse snippet to render a txid as conventional hex:

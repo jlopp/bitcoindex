@@ -130,9 +130,48 @@ mod tests {
 
     #[test]
     fn error_display_impls() {
-        use std::error::Error as _;
         let m = ZmqError::Malformed("foo".into());
         assert_eq!(m.to_string(), "malformed notification: foo");
         assert!(std::error::Error::source(&m).is_none());
+    }
+
+    #[test]
+    fn subscribe_and_receive_hashblock_roundtrip() {
+        // Bind an in-process PUB socket to an ephemeral port, connect a real
+        // ZmqSubscriber to it, and publish a `hashblock` message until it is
+        // received. This exercises `connect` (subscribe/hwm/connect) and
+        // `next_block_hash` (recv_multipart + parse) without a Bitcoin node.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let ctx = zmq::Context::new();
+        let publisher = ctx.socket(zmq::PUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+
+        let sub = ZmqSubscriber::connect(&ZmqConfig {
+            hashblock_endpoint: endpoint,
+        })
+        .unwrap();
+
+        let hash = [0x5Au8; 32];
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_sender = Arc::clone(&stop);
+        let sender = std::thread::spawn(move || {
+            // Republish until the slow-joiner subscription is established; the
+            // main thread stops us as soon as it receives one message.
+            while !stop_sender.load(Ordering::Relaxed) {
+                let _ = publisher.send_multipart(
+                    [b"hashblock".to_vec(), hash.to_vec()],
+                    0,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+
+        let got = sub.next_block_hash().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+        assert_eq!(*got.as_bytes(), hash);
     }
 }

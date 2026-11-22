@@ -25,6 +25,13 @@ bidx-perf/
 # Contains mutation testing data
 **/mutants.out*/
 
+# Coverage artifacts (cargo-tarpaulin + llvm profile data)
+build_rs_cov.profraw
+*.profraw
+target/coverage/
+cobertura.xml
+tarpaulin-report.*
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
