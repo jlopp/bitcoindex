@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # shellcheck is preinstalled on the ubuntu runners; pin the version we
       # have verified against so a runner image bump cannot change the result.

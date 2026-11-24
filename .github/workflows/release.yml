@@ -42,7 +42,7 @@ jobs:
             archive: bidx-aarch64-unknown-linux-gnu
             use_cross: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         # Only needed for the native target; `cross` installs its own deps in
@@ -103,7 +103,7 @@ jobs:
           cp *.cdx.json dist/ 2>/dev/null || true
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
           path: |
@@ -129,9 +129,9 @@ jobs:
             deb_arch: arm64
             rpm_arch: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: bidx-${{ matrix.target }}
           path: pkg-in
@@ -172,7 +172,7 @@ jobs:
           ls -la packages
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.deb_arch }}
           path: packages/*
@@ -186,9 +186,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -237,7 +237,7 @@ jobs:
           packaging/publish-tap.sh artifacts/bitcoindex.rb "${GITHUB_REF_NAME#v}"
 
       - name: Upload extras
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: extras
           path: |
@@ -250,8 +250,8 @@ jobs:
     needs: [build, package, extras]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -268,7 +268,7 @@ jobs:
             grep -q " $f\$" SHA256SUMS
           done
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/*.tar.gz
