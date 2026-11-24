@@ -31,11 +31,19 @@
           llvmPackages.libclang
         ];
 
-        # zmq-sys probes for a system libzmq before vendoring, so supplying
-        # `zeromq` avoids building it (and its libsodium) from source. reqwest
-        # uses rustls-tls, so no openssl is needed.
+        # `zeromq`: zmq-sys probes for a system libzmq before vendoring, so
+        #   supplying it avoids building libzmq (and its libsodium) from source.
+        # `zstd`: parquet's `zstd` feature pulls in zstd-sys, and nixpkgs'
+        #   rustPlatform cargo setup hook exports ZSTD_SYS_USE_PKG_CONFIG=1.
+        #   That forces zstd-sys to probe pkg-config for a system libzstd
+        #   instead of compiling its vendored copy, so `zstd` must be on the
+        #   pkg-config path or the build dies with "No package 'libzstd' found".
+        #   This is Nix-only: a plain `cargo build` leaves the var unset and
+        #   builds the vendored zstd, so it needs no libzstd-dev.
+        # reqwest uses rustls-tls, so no openssl is needed.
         buildInputs = with pkgs; [
           zeromq
+          zstd
         ];
 
         bidx = pkgs.rustPlatform.buildRustPackage {
