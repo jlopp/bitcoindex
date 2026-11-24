@@ -98,23 +98,86 @@ Full documentation lives in [`doc/`](doc/). Start with
 The authoritative sources are the Rust code, not the docs; see
 [doc/README.md](doc/README.md#keeping-these-documents-honest) for the mapping.
 
+## Install
+
+One command on Linux (x86_64 or aarch64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlopp/bitcoindex/master/scripts/install.sh | sh
+```
+
+Every install channel — the script, the container image, `.deb`/`.rpm`/`.apk`
+packages, Homebrew, `cargo install`, Nix, and building from source — is
+documented in **[doc/INSTALL.md](doc/INSTALL.md)**. Preview what the installer
+would do without changing anything:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlopp/bitcoindex/master/scripts/install.sh | sh -s -- --dry-run
+```
+
+The installer picks the right prebuilt release for your machine, verifies it
+against the release `SHA256SUMS`, and installs the two runtime dependencies the
+CLI needs — `libzmq5` (for `bidx live`) and `clickhouse-client` (for
+`init-db` / `load` / `migrate` / `verify` / `index rebuild`). Dependency
+installation is best-effort: if it fails the binary is still installed and the
+manual command is printed. It installs to `/usr/local/bin` when writable
+(using `sudo` if available) and falls back to `~/.local/bin` otherwise.
+
+```bash
+# Pin a version, or install elsewhere:
+curl -fsSL https://raw.githubusercontent.com/jlopp/bitcoindex/master/scripts/install.sh \
+  | sh -s -- --version v0.1.0 --bindir ~/.local/bin
+
+# Skip the dependency step (e.g. you manage packages yourself):
+curl -fsSL https://raw.githubusercontent.com/jlopp/bitcoindex/master/scripts/install.sh \
+  | sh -s -- --no-deps
+
+# No prebuilt for your distro/libc? Build from source instead:
+curl -fsSL https://raw.githubusercontent.com/jlopp/bitcoindex/master/scripts/install.sh \
+  | sh -s -- --from-source
+```
+
+Other channels, in brief (full details in [doc/INSTALL.md](doc/INSTALL.md)):
+
+```bash
+docker run --rm ghcr.io/jlopp/bitcoindex:latest --help   # container
+brew install jlopp/tap/bitcoindex                        # Homebrew
+cargo install --git https://github.com/jlopp/bitcoindex --locked --bin bidx
+nix profile install github:jlopp/bitcoindex              # Nix
+```
+
+Run `sh scripts/install.sh --help` for every flag. Prebuilt tarballs for
+`x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-gnu`, plus
+`.deb`/`.rpm`/`.apk` packages, a CycloneDX SBOM, and `SHA256SUMS`, are attached
+to each `v*` release.
+
 ## Build
 
-Requires a C toolchain and clang headers for RocksDB's bindgen step. On a
-machine where `stdbool.h` isn't in clang's default path, generate the shim
-(`.build-shim/include` holds gcc's copies of the C standard headers) and point
-bindgen at it:
+Requires a C toolchain and clang headers for RocksDB's bindgen step. Source the
+dev environment helper, which sets the required workarounds and locates
+libclang for you:
+
+```bash
+source scripts/dev-env.sh
+cargo build --release
+```
+
+By hand, that is (`.build-shim/include` holds gcc's copies of the C standard
+headers):
 
 ```bash
 ./scripts/build-shim.sh                              # writes .build-shim/include
-export LIBCLANG_PATH=/usr/lib/llvm-18/lib            # wherever libclang lives
+export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu       # wherever libclang lives
 export BINDGEN_EXTRA_CLANG_ARGS="-I$PWD/.build-shim/include"
+export CXXFLAGS="-include cstdint"
 cargo build --release
 ```
 
 `.build-shim/` is machine-specific and gitignored — the `Dockerfile` and the
 release workflow run the same script to generate it, so it is never committed
-and never copied from the build context.
+and never copied from the build context. The `LIBCLANG_PATH` above is the
+Debian/Ubuntu multiarch directory, not `/usr/lib/llvm-<version>/lib`; use
+`ldconfig -p | grep libclang` to find yours.
 
 ## Testing & coverage
 

@@ -1,0 +1,35 @@
+[Unit]
+Description=bitcoindex serving API (Esplora REST + Electrum JSON-RPC)
+Documentation=https://github.com/jlopp/bitcoindex/blob/master/doc/serving-api.md
+# The API talks to ClickHouse over HTTP; start after the network is up. It is
+# not ordered against ClickHouse itself because that may be a remote service.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# DynamicUser avoids creating a system account at package-install time; the
+# state directories below are owned by the transient user systemd allocates.
+DynamicUser=yes
+StateDirectory=bidx
+ConfigurationDirectory=bidx
+ExecStart=/usr/bin/bidx serve --config /etc/bidx/bidx.toml
+Restart=on-failure
+RestartSec=5s
+
+# `bidx serve` drains on SIGTERM: /readyz turns 503, in-flight requests get
+# server.shutdown_timeout_secs, then it exits 0. Give it room beyond the
+# default 90s so a slow drain is not SIGKILLed.
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+
+# The API is read-only over ClickHouse and needs no privileges.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# StateDirectory= grants a writable /var/lib/bidx; the API needs nothing else.
+ReadWritePaths=/var/lib/bidx
+
+[Install]
+WantedBy=multi-user.target

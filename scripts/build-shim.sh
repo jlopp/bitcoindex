@@ -52,4 +52,4 @@ for gcc in gcc-15 gcc-14 gcc-13 gcc-12; do
     fi
 done
 
-echo "build-shim: wrote $(ls "$out" | tr '\n' ' ')to $out"
+echo "build-shim: wrote $(find "$out" -maxdepth 1 -type f -printf '%f\n' | sort | tr '\n' ' ')to $out"

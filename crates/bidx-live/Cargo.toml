@@ -3,12 +3,14 @@ name = "bidx-live"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Live tip tracking: ZMQ block notifications, RPC catch-up, reorg handling"
 
 [dependencies]
-bidx-core = { path = "../bidx-core" }
-bidx-parser = { path = "../bidx-parser" }
-bidx-store = { path = "../bidx-store" }
+bidx-core.workspace = true
+bidx-parser.workspace = true
+bidx-store.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 zmq.workspace = true

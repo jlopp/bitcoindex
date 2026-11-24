@@ -1,0 +1,54 @@
+# typed: false
+# frozen_string_literal: true
+
+# Homebrew formula for bitcoindex.
+#
+# This is a BINARY formula: it downloads the prebuilt release tarball instead
+# of building from source, because RocksDB + libzmq is a multi-minute C++
+# compile nobody should pay for on `brew install`. Building from source is
+# supported by the installer's --from-source and by the Nix flake.
+#
+# Published to a tap so users run `brew install <owner>/tap/bitcoindex`. The
+# version and per-arch sha256s are generated from a release's SHA256SUMS by
+# packaging/update-formula.sh — do not hand-edit the placeholder fields.
+#
+# Linux-only: the release matrix has no darwin target, so refuse early with a
+# clear message instead of failing on a missing URL.
+class Bitcoindex < Formula
+  desc "Bitcoin blockchain indexer: blk*.dat -> Parquet -> ClickHouse"
+  homepage "https://github.com/jlopp/bitcoindex"
+  version "@@VERSION@@"
+  license "MIT"
+
+  depends_on :linux
+
+  on_linux do
+    # The prebuilt binary links the system libzmq (zmq-sys probes for it
+    # rather than vendoring), so `bidx live` needs it at runtime.
+    depends_on "zeromq"
+  end
+
+  on_intel do
+    url "https://github.com/jlopp/bitcoindex/releases/download/v@@VERSION@@/@@TARBALL_AMD64@@"
+    sha256 "@@SHA256_AMD64@@"
+  end
+
+  on_arm do
+    url "https://github.com/jlopp/bitcoindex/releases/download/v@@VERSION@@/@@TARBALL_ARM64@@"
+    sha256 "@@SHA256_ARM64@@"
+  end
+
+  livecheck do
+    url :stable
+    strategy :github_latest
+  end
+
+  def install
+    bin.install "bidx"
+  end
+
+  test do
+    # `bidx --version` prints "bidx <version>" without touching the network.
+    assert_match "bidx", shell_output("#{bin}/bidx --version")
+  end
+end

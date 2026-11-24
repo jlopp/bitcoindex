@@ -3,10 +3,12 @@ name = "bidx-serve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Serving API (Esplora REST + Electrum JSON-RPC), metrics, and health endpoints"
 
 [dependencies]
-bidx-core = { path = "../bidx-core" }
+bidx-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

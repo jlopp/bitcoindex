@@ -3,10 +3,12 @@ name = "bidx-loader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "ClickHouse schema management and Parquet bulk loader"
 
 [dependencies]
-bidx-core = { path = "../bidx-core" }
+bidx-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

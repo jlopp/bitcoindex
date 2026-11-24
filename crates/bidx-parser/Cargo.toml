@@ -3,10 +3,12 @@ name = "bidx-parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Raw blk*.dat block file reader and parallel parser"
 
 [dependencies]
-bidx-core = { path = "../bidx-core" }
+bidx-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 byteorder.workspace = true

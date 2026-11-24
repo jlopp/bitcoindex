@@ -1,0 +1,3 @@
+# Placeholder so the tap repository has its Formula/ directory from the first
+# commit. The real formula (Formula/bitcoindex.rb) is pushed by
+# packaging/publish-tap.sh on each release; do not add formulae by hand.

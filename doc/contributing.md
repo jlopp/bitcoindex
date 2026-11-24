@@ -21,15 +21,33 @@ plus the system `libzmq` for live mode:
 
 ```bash
 sudo apt-get install -y clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev
+```
 
+Then source the dev environment helper, which sets the three workarounds the
+build needs and detects where libclang actually lives on your machine:
+
+```bash
+source scripts/dev-env.sh
+cargo build --release
+```
+
+That is equivalent to doing it by hand:
+
+```bash
 ./scripts/build-shim.sh                          # writes .build-shim/include
-export LIBCLANG_PATH=/usr/lib/llvm-18/lib       # wherever libclang lives
+export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu  # wherever libclang lives
 export BINDGEN_EXTRA_CLANG_ARGS="-I$PWD/.build-shim/include"
 export CXXFLAGS="-include cstdint"               # rocksdb 8.x transitive <cstdint>
 cargo build --release
 ```
 
-The two `export`s are the workarounds the `Dockerfile` also bakes in:
+`scripts/dev-env.sh` is idempotent and keeps any values you set yourself. Note
+the `LIBCLANG_PATH` above is the Debian/Ubuntu multiarch directory, **not**
+`/usr/lib/llvm-<version>/lib` — the latter does not exist on a stock Ubuntu
+install, which is why the helper resolves the path with `ldconfig` instead of
+assuming it.
+
+The three `export`s are the workarounds the `Dockerfile` also bakes in:
 `BINDGEN_EXTRA_CLANG_ARGS` points bindgen at `.build-shim/include` (gcc's
 builtins) so `stdbool.h` resolves, and `CXXFLAGS=-include cstdint` covers
 rocksdb 8.x's reliance on transitive `<cstdint>` includes that GCC 15 no longer

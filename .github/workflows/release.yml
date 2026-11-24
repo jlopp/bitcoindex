@@ -1,8 +1,9 @@
 name: Release
 
-# Build prebuilt `bidx` binaries for the common Linux targets, attach them to
-# a GitHub release, and emit an SBOM + SHA256SUMS so operators can verify what
-# they download. Triggered by a `v*` tag.
+# Build prebuilt `bidx` binaries for the common Linux targets, package them as
+# .deb/.rpm/.apk, generate the apt repo tree and the Homebrew formula, publish
+# the formula to the Homebrew tap, and attach everything to a GitHub release
+# alongside an SBOM + SHA256SUMS. Triggered by a `v*` tag.
 
 on:
   push:
@@ -11,6 +12,10 @@ on:
 
 permissions:
   contents: write
+
+env:
+  # Pinned so a new nfpm release cannot change package output mid-flight.
+  NFPM_VERSION: "2.39.0"
 
 jobs:
   build:
@@ -67,7 +72,7 @@ jobs:
       #
       # BINDGEN_EXTRA_CLANG_ARGS must name the path *inside the container the
       # compiler runs in*, which differs per target:
-      #   * native `cargo` runs in the workspace itself → the host path;
+      #   * native `cargo` runs in the workspace itself -> the host path;
       #   * `cross` bind-mounts the project at `/project` (its working dir), so
       #     the host path does not exist and the include would be dropped.
       # Cross.toml passes the variable through into the `cross` container.
@@ -105,9 +110,144 @@ jobs:
             ${{ matrix.archive }}.tar.gz
             dist/*.cdx.json
 
+  # Distro packages are built only for the two glibc targets: .deb/.rpm/.apk
+  # all target glibc distros, and Alpine users are served by the installer's
+  # musl tarball. Each architecture needs its own arch *name* per packager.
+  package:
+    name: package ${{ matrix.deb_arch }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+            rpm_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bidx-${{ matrix.target }}
+          path: pkg-in
+
+      - name: Stage the binary for nfpm
+        run: |
+          mkdir -p dist
+          tar -xzf pkg-in/bidx-${{ matrix.target }}.tar.gz -C dist
+          test -x dist/bidx
+
+      - name: Install nfpm
+        run: |
+          curl -fsSL -o nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          tar xzf nfpm.tar.gz nfpm
+          sudo install -m 0755 nfpm /usr/local/bin/nfpm
+          nfpm --version
+
+      # `packaging/nfpm.yaml` reads NFPM_ARCH/NFPM_VERSION from the environment
+      # and expects `dist/bidx` staged above. `src` paths resolve relative to
+      # the working directory, so this must run from the repo root.
+      - name: Build .deb / .rpm / .apk
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eux
+          ver="${TAG#v}"
+          mkdir -p packages
+          NFPM_ARCH="${{ matrix.deb_arch }}" NFPM_VERSION="$ver" \
+            nfpm pkg --config packaging/nfpm.yaml --packager deb \
+            --target "packages/bitcoindex_${ver}_${{ matrix.deb_arch }}.deb"
+          NFPM_ARCH="${{ matrix.rpm_arch }}" NFPM_VERSION="$ver" \
+            nfpm pkg --config packaging/nfpm.yaml --packager rpm \
+            --target "packages/bitcoindex-${ver}-1.${{ matrix.rpm_arch }}.rpm"
+          NFPM_ARCH="${{ matrix.rpm_arch }}" NFPM_VERSION="$ver" \
+            nfpm pkg --config packaging/nfpm.yaml --packager apk \
+            --target "packages/bitcoindex_${ver}_${{ matrix.rpm_arch }}.apk"
+          ls -la packages
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.deb_arch }}
+          path: packages/*
+
+  # Everything that needs *all* architectures at once: SHA256SUMS, the apt
+  # repo tree (amd64 + arm64 in one Release file), and the Homebrew formula
+  # (which pins both tarball sha256s).
+  extras:
+    name: checksums, apt repo, formula
+    needs: [build, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Build apt repository tree
+        run: |
+          set -eux
+          mkdir -p debs
+          cp artifacts/*.deb debs/
+          ./packaging/deb-repo.sh debs apt-repo
+          # Ship the tree as one archive; a static host just unpacks it.
+          tar czf artifacts/bidx-apt-repo.tar.gz -C apt-repo .
+          ls -la apt-repo/dists/stable
+
+      - name: Render Homebrew formula
+        run: |
+          set -eux
+          ver="${GITHUB_REF_NAME#v}"
+          ./packaging/update-formula.sh "$ver" artifacts/SHA256SUMS \
+            packaging/homebrew/bitcoindex.rb.tmpl \
+            artifacts/bitcoindex.rb
+          # Fail loudly if the template did not render, rather than shipping a
+          # formula with placeholder fields.
+          ! grep -q '@@' artifacts/bitcoindex.rb
+
+      - name: Publish formula to the Homebrew tap
+        # Skipped, not failed, when the tap token is unset: the formula is still
+        # attached to the release below, it just is not pushed to the tap. The
+        # check is in the shell because `secrets` is not available to a step's
+        # `if:` condition.
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -eux
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "TAP_GITHUB_TOKEN not set; skipping tap publish"
+            echo "(the rendered formula is still attached to the release)"
+            exit 0
+          fi
+          packaging/publish-tap.sh artifacts/bitcoindex.rb "${GITHUB_REF_NAME#v}"
+
+      - name: Upload extras
+        uses: actions/upload-artifact@v4
+        with:
+          name: extras
+          path: |
+            artifacts/SHA256SUMS
+            artifacts/bidx-apt-repo.tar.gz
+            artifacts/bitcoindex.rb
+
   release:
     name: publish release
-    needs: build
+    needs: [build, package, extras]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,16 +255,27 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: Checksums
+      # SHA256SUMS is produced by the `extras` job from the three binary
+      # tarballs only — the same file the Homebrew formula was rendered
+      # against. Do not recompute it here: by now `artifacts/` also holds the
+      # apt-repo archive, which must not appear in the manifest.
+      - name: Verify SHA256SUMS covers every binary tarball
         run: |
+          set -eux
           cd artifacts
-          sha256sum *.tar.gz > SHA256SUMS
-          cat SHA256SUMS
+          for f in bidx-*.tar.gz; do
+            case "$f" in bidx-apt-repo.tar.gz) continue ;; esac
+            grep -q " $f\$" SHA256SUMS
+          done
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*.tar.gz
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/*.apk
             artifacts/SHA256SUMS
+            artifacts/bitcoindex.rb
             artifacts/*.cdx.json
           generate_release_notes: true

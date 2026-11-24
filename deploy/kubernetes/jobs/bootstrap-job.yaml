@@ -30,7 +30,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: init-db
-          image: ghcr.io/jameson/bitcoindex:edge
+          image: ghcr.io/jlopp/bitcoindex:edge
           args: ["init-db"]
           envFrom:
             - configMapRef: { name: bidx-ingest-env }
@@ -52,7 +52,7 @@ spec:
             - { name: home, mountPath: /home/bidx }
       containers:
         - name: load
-          image: ghcr.io/jameson/bitcoindex:edge
+          image: ghcr.io/jlopp/bitcoindex:edge
           args: ["load", "--upload", "--input", "/data/out"]
           envFrom:
             - configMapRef: { name: bidx-ingest-env }

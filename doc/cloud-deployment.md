@@ -52,7 +52,7 @@ Every push to `master` and every `v*` tag publishes a multi-arch
 
 | Tag | Meaning |
 |-----|---------|
-| `ghcr.io/jameson/bitcoindex:1.2.3`, `:1.2`, `:1` | Releases (semver). |
+| `ghcr.io/jlopp/bitcoindex:1.2.3`, `:1.2`, `:1` | Releases (semver). |
 | `:edge` | Latest `master`. |
 | `:sha-<short>` | One specific commit. |
 
@@ -60,11 +60,11 @@ Images carry SLSA build provenance and an SPDX SBOM attestation, and are
 signed keyless with cosign. To verify before deploying:
 
 ```bash
-cosign verify ghcr.io/jameson/bitcoindex:1.2.3 \
-  --certificate-identity-regexp 'https://github.com/jameson/bitcoindex/.github/workflows/image.yml@.*' \
+cosign verify ghcr.io/jlopp/bitcoindex:1.2.3 \
+  --certificate-identity-regexp 'https://github.com/jlopp/bitcoindex/.github/workflows/image.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-gh attestation verify oci://ghcr.io/jameson/bitcoindex:1.2.3 --owner jameson
+gh attestation verify oci://ghcr.io/jlopp/bitcoindex:1.2.3 --owner jlopp
 ```
 
 Pin by digest (`@sha256:…`) in production overlays.

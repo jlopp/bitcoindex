@@ -49,7 +49,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    # Or use the published image: ghcr.io/jameson/bitcoindex:<version>
+    # Or use the published image: ghcr.io/jlopp/bitcoindex:<version>
     image: bitcoindex/bidx:local
     container_name: bidx-serve
     restart: unless-stopped

@@ -1,0 +1,42 @@
+name: Shellcheck
+
+# Lint every shell script in the repo on each pull request. The installer is
+# the user's first contact with the project and runs as root via sudo, so a
+# quoting or word-splitting bug there is worth catching at review time.
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+    paths:
+      - "**/*.sh"
+      - ".github/workflows/shellcheck.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck is preinstalled on the ubuntu runners; pin the version we
+      # have verified against so a runner image bump cannot change the result.
+      - name: shellcheck version
+        run: shellcheck --version
+
+      # `-S style` fails on everything including style-level findings, so the
+      # scripts stay clean at the strictest setting rather than only "no
+      # errors". The installer is POSIX sh (it is piped to `sh`), so it is
+      # checked with -s sh; the rest are bash.
+      - name: Lint install.sh (POSIX sh)
+        run: shellcheck -s sh -S style scripts/install.sh
+
+      - name: Lint remaining scripts (bash)
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh' | grep -v '^scripts/install.sh$')
+          printf 'linting %d scripts\n' "${#scripts[@]}"
+          shellcheck -s bash -S style "${scripts[@]}"

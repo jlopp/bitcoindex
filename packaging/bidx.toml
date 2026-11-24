@@ -1,0 +1,56 @@
+# bitcoindex serving-layer configuration (package default).
+#
+# Installed as a config file, so a package upgrade will not overwrite your
+# edits. See /usr/share/doc/bitcoindex/bidx.toml.example for the fully
+# commented reference, or the repo's bidx.toml.example.
+#
+# Every value can also be overridden by a `BIDX_*` environment variable
+# (nested keys use `__`, e.g. `BIDX_CLICKHOUSE__HOST`). Precedence:
+# defaults < this file < env.
+
+network = "mainnet"
+api_addr = "0.0.0.0:8432"
+metrics_addr = "0.0.0.0:9101"
+esplora_enabled = true
+electrum_enabled = true
+log = "info"
+
+[clickhouse]
+# A local server by default; point this at your ClickHouse host (or a
+# comma-separated replica list) if it runs elsewhere.
+host = "localhost"
+scheme = "http"
+port = 9000        # native protocol: init-db / load
+http_port = 8123   # HTTP: the serve layer
+user = "default"
+# password = "..."   # prefer BIDX_CLICKHOUSE__PASSWORD
+database = "bitcoin"
+timeout_secs = 30
+
+[server]
+workers = 256
+queue = 1024
+keep_alive_secs = 5
+max_requests_per_conn = 1000
+drain_delay_secs = 5
+shutdown_timeout_secs = 25
+trust_forwarded_for = false
+
+[cache]
+enabled = true
+max_entries = 100000
+tip_ttl_ms = 1000
+address_ttl_ms = 2000
+immutable_ttl_secs = 300
+confirmations = 6
+
+[auth]
+required = false
+
+[rate_limit]
+per_ip_rps = 0.0
+per_ip_burst = 0.0
+
+[node]
+rpc_url = "http://127.0.0.1:8332"
+# cookie = "/home/bitcoin/.bitcoin/.cookie"

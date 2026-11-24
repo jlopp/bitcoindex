@@ -10,6 +10,7 @@ scaling a query fleet, see [cloud-deployment.md](cloud-deployment.md).
 
 ## Contents
 
+- [Installing](#installing)
 - [Building the binary](#building-the-binary)
 - [The Compose stack](#the-compose-stack)
 - [First run](#first-run)
@@ -22,6 +23,33 @@ scaling a query fleet, see [cloud-deployment.md](cloud-deployment.md).
 - [Upgrades and migrations](#upgrades-and-migrations)
 - [Troubleshooting](#troubleshooting)
 
+## Installing
+
+The quickest install on Linux (x86_64 or aarch64) is the release installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlopp/bitcoindex/master/scripts/install.sh | sh
+```
+
+It downloads the matching prebuilt tarball, verifies it against the release
+`SHA256SUMS`, and installs the runtime dependencies — `libzmq5` (needed by
+`bidx live`) and `clickhouse-client` (needed by `init-db`, `load`, `migrate`,
+`verify`, and `index rebuild`). Use `--no-deps` to skip that step, `--version`
+to pin a release, `--bindir` to choose the destination, `--dry-run` to preview
+without changing anything, and `--from-source` to build with cargo instead. It
+targets `/usr/local/bin` (via `sudo` when needed)
+and falls back to `~/.local/bin` when that is not writable.
+
+The multi-arch image is the zero-install alternative:
+
+```bash
+docker run --rm ghcr.io/jlopp/bitcoindex:latest --help
+```
+
+Build from source (below) if your distro or libc has no prebuilt artifact.
+[INSTALL.md](INSTALL.md) covers every channel, including the distro packages,
+Homebrew, `cargo install`, and Nix.
+
 ## Building the binary
 
 `bidx` links RocksDB (via `librocksdb-sys`, which runs bindgen) and, for live
@@ -31,19 +59,16 @@ mode, the system `libzmq`. Building from source needs a C/C++ toolchain,
 ```bash
 sudo apt-get install -y clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev
 
-# If stdbool.h isn't in clang's default include path, generate the shim from
-# gcc's builtins and point bindgen at it:
-./scripts/build-shim.sh
-export LIBCLANG_PATH=/usr/lib/llvm-18/lib       # wherever libclang lives
-export BINDGEN_EXTRA_CLANG_ARGS="-I$PWD/.build-shim/include"
-export CXXFLAGS="-include cstdint"               # rocksdb 8.x transitive <cstdint>
+source scripts/dev-env.sh                       # sets the workarounds + libclang path
 cargo build --release
 ```
 
 The `Dockerfile` bakes in both workarounds — it runs `scripts/build-shim.sh`
 inside the builder stage — so the container build needs no special environment.
 The shim itself is machine-specific and gitignored, which is why it is generated
-rather than shipped.
+rather than shipped. `scripts/dev-env.sh` does the same three `export`s and
+finds libclang with `ldconfig`, which matters because it is usually in the
+multiarch lib dir (`/usr/lib/x86_64-linux-gnu`), not `/usr/lib/llvm-<version>/lib`.
 
 Prebuilt binaries for `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
 and `aarch64-unknown-linux-gnu` are attached to each `v*` tag release, together

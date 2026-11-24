@@ -50,7 +50,7 @@ spec:
               app.kubernetes.io/name: bidx-serve
       containers:
         - name: serve
-          image: ghcr.io/jameson/bitcoindex
+          image: ghcr.io/jlopp/bitcoindex
           args: ["serve", "--config", "/etc/bidx/bidx.toml"]
           ports:
             - name: http

@@ -48,7 +48,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: live
-          image: ghcr.io/jameson/bitcoindex
+          image: ghcr.io/jlopp/bitcoindex
           # Flags fall back to BIDX_* env (see configmap.yaml / the Secret).
           args: ["live", "--ch-live"]
           envFrom:

@@ -1,0 +1,115 @@
+name: Nix
+
+# Two jobs with deliberately different cost profiles:
+#
+#   flake  - fast. Evaluates the flake and checks the attribute paths the docs
+#            tell users to run. Catches a broken input, a bad attribute path, or
+#            a Cargo.toml field the version lookup depends on, in well under a
+#            minute of wall time.
+#   build  - slow but real. Actually realises `.#packages.x86_64-linux.default`
+#            in the Nix sandbox (RocksDB + libzmq + the whole workspace) and
+#            smoke-tests the result. `--dry-run` only proves the derivation can
+#            be *planned*; it cannot catch a bindgen/LIBCLANG_PATH failure, a
+#            missing postInstall path, or a binary that does not run. This job
+#            is what proves `nix build` / `nix profile install` actually work.
+#
+# The build is only x86_64-linux: realising an aarch64 derivation on an x86_64
+# runner needs an emulator (binfmt), which ubuntu-latest does not provide.
+
+on:
+  pull_request:
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "packaging/**"
+      - ".github/workflows/nix.yml"
+  push:
+    branches: [main, master]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "packaging/**"
+      - ".github/workflows/nix.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded run on the same ref is wasted RocksDB compile time; cancel it.
+concurrency:
+  group: nix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flake:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Flake evaluates and metadata is sane
+        run: |
+          set -eux
+          nix flake metadata
+          # Attribute paths the docs tell users to run must exist.
+          nix eval --raw .#packages.x86_64-linux.default.pname
+          nix eval .#packages.x86_64-linux.default.version
+
+      - name: Package derivation plans without error
+        run: nix build --dry-run .#packages.x86_64-linux.default
+
+  build:
+    name: nix build (x86_64-linux)
+    needs: flake
+    runs-on: ubuntu-latest
+    # RocksDB is a multi-minute C++ compile; the first cold run is the worst.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            # Use every core the runner has for the C++ build.
+            max-jobs = auto
+
+      # Optional binary cache. Set a repository variable CACHIX_CACHE and a
+      # secret CACHIX_AUTH_TOKEN to reuse the RocksDB + workspace closure across
+      # runs; without them the job still builds from scratch, just slower.
+      # Gated on the variable (not the secret) because `secrets` is not
+      # available to a step's `if:` condition.
+      - name: Configure binary cache
+        if: ${{ vars.CACHIX_CACHE != '' }}
+        uses: cachix/cachix-action@v15
+        with:
+          name: ${{ vars.CACHIX_CACHE }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Realise the package
+        run: nix build --print-build-logs .#packages.x86_64-linux.default
+
+      - name: Smoke-test the built package
+        run: |
+          set -eux
+          # The binary runs and reports the workspace version.
+          ./result/bin/bidx --version
+          ./result/bin/bidx --version | grep -q '^bidx '
+          # The postInstall step shipped the same files the .deb/.rpm carry.
+          test -f ./result/etc/bidx/bidx.toml
+          test -f ./result/lib/systemd/system/bidx-serve.service
+
+      - name: The dev shell resolves
+        run: nix develop --command cargo --version

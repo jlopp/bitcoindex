@@ -5,6 +5,7 @@ query surfaces it exposes.
 
 | Document | Covers |
 |----------|--------|
+| [INSTALL.md](INSTALL.md) | Every way to install `bidx`: the install script, container image, distro packages, Homebrew, cargo, Nix, and building from source — plus verification, uninstall, and install troubleshooting. |
 | [schema.md](schema.md) | Every ClickHouse table and field a user can query: the five base entity tables, the index tables, `meta_schema`, in-place indexes, materialized views, and the script-type / history-kind enumerations. |
 | [query-cookbook.md](query-cookbook.md) | Practical SQL recipes: blocks, transactions, inputs/outputs, spends, addresses, UTXO set, miners, and cross-table joins — plus performance notes. |
 | [cli.md](cli.md) | Every `bidx` subcommand and flag: `headers`, `parse`, `live`, `init-db`, `load`, `migrate`, `index`, `serve`, `verify`, `inspect`, `bench`. |
@@ -19,6 +20,7 @@ query surfaces it exposes.
 
 - **New to the project** — [architecture.md](architecture.md) first, then
   [schema.md](schema.md).
+- **Installing it** — [INSTALL.md](INSTALL.md) for every install channel.
 - **Writing queries** — [schema.md](schema.md) for the shape,
   [query-cookbook.md](query-cookbook.md) for recipes.
 - **Operating the service** — [cli.md](cli.md), then

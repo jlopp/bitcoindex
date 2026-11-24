@@ -1,0 +1,73 @@
+# nFPM configuration for the `bidx` distro packages (.deb / .rpm / .apk).
+#
+#   NFPM_ARCH=<arch> NFPM_VERSION=<version> nfpm pkg --config packaging/nfpm.yaml \
+#       --packager deb --target dist/bidx_<version>_<arch>.deb
+#
+# nfpm expands ${VAR} from the environment (and `$$` is a literal `$`). The
+# per-packager architecture *names* differ — deb wants `amd64`/`arm64`, rpm and
+# apk want `x86_64`/`aarch64` — so the caller sets NFPM_ARCH for each packager
+# (see .github/workflows/release.yml). `src` paths resolve relative to the
+# working directory, so run nfpm from the repo root with the unpacked `bidx`
+# staged at `dist/bidx`.
+#
+# Runtime dependencies are per-family: libzmq is `libzmq5` on Debian/Ubuntu and
+# `zeromq` on Fedora/Alpine. `clickhouse-client` is deliberately NOT a package
+# dependency — it lives in the ClickHouse apt/rpm repos, not the distro ones, so
+# declaring it would make the package uninstallable on a clean system. The
+# README and `bidx init-db` explain how to get it.
+
+name: bitcoindex
+arch: ${NFPM_ARCH}
+version: ${NFPM_VERSION}
+section: utils
+priority: optional
+maintainer: Jameson Lopp <jlopp@users.noreply.github.com>
+description: |
+  Bitcoin blockchain indexer: blk*.dat -> Parquet -> ClickHouse.
+
+  Parses raw blk*.dat files straight from a synced Bitcoin Core node, links
+  spends through an embedded RocksDB UTXO set, writes columnar Parquet, and
+  bulk-loads into ClickHouse for analytical querying. Also serves an
+  Esplora-compatible REST API and Electrum JSON-RPC.
+
+  Note: `bidx init-db`, `load`, `migrate`, `verify`, and `index rebuild` shell
+  out to `clickhouse-client`, which is not packaged here — install it from
+  https://clickhouse.com/docs/en/install.
+vendor: bitcoindex
+homepage: https://github.com/jlopp/bitcoindex
+license: MIT
+
+contents:
+  - src: dist/bidx
+    dst: /usr/bin/bidx
+  # Marked as a config file so a package upgrade does not clobber an operator's
+  # edits (deb `conffiles`, rpm `%config`).
+  - src: packaging/bidx.toml
+    dst: /etc/bidx/bidx.toml
+    type: config
+  - src: packaging/systemd/bidx-serve.service
+    dst: /usr/lib/systemd/system/bidx-serve.service
+
+scripts:
+  # Reload systemd so the unit is visible immediately after install.
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+
+overrides:
+  deb:
+    depends:
+      - libzmq5
+  rpm:
+    depends:
+      - zeromq
+  apk:
+    depends:
+      - zeromq
+    # Alpine has no systemd; drop the unit rather than ship a file that
+    # nothing will read.
+    contents:
+      - src: dist/bidx
+        dst: /usr/bin/bidx
+      - src: packaging/bidx.toml
+        dst: /etc/bidx/bidx.toml
+        type: config

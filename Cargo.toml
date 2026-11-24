@@ -15,9 +15,22 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/jameson/bitcoindex"
+repository = "https://github.com/jlopp/bitcoindex"
+homepage = "https://github.com/jlopp/bitcoindex"
+keywords = ["bitcoin", "indexer", "blockchain", "clickhouse", "parquet"]
+categories = ["command-line-utilities", "database"]
 
 [workspace.dependencies]
+# Internal crates. The `version` is what crates.io publishing needs (a bare
+# `path` dependency cannot be packaged); `path` keeps local builds pointing at
+# the working tree. Keep `version` in lockstep with `workspace.package.version`.
+bidx-core = { path = "crates/bidx-core", version = "0.1.0" }
+bidx-parser = { path = "crates/bidx-parser", version = "0.1.0" }
+bidx-store = { path = "crates/bidx-store", version = "0.1.0" }
+bidx-live = { path = "crates/bidx-live", version = "0.1.0" }
+bidx-loader = { path = "crates/bidx-loader", version = "0.1.0" }
+bidx-serve = { path = "crates/bidx-serve", version = "0.1.0" }
+
 anyhow = { version = "1", features = ["backtrace"] }
 thiserror = "2"
 byteorder = "1"

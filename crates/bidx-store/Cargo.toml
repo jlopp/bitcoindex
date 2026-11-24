@@ -3,10 +3,12 @@ name = "bidx-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "RocksDB UTXO store and Parquet intermediate writers"
 
 [dependencies]
-bidx-core = { path = "../bidx-core" }
+bidx-core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 rocksdb.workspace = true
