@@ -325,6 +325,29 @@ build_from_source() {
     install_binary "$src/src/target/release/bidx"
 }
 
+# --- release resolution ----------------------------------------------------
+# Print the newest published release tag for $REPO, or nothing if the repo has
+# no published release at all. Empty output means "nothing to install".
+#
+# `/releases/latest` is the fast path, but it deliberately omits prereleases
+# and drafts, so it 404s on a repository whose only releases are prereleases -
+# which is exactly this project today. Rather than fail the whole install on a
+# young repo, fall back to the newest published release of any kind.
+resolve_latest_version() {
+    tag="$(curl -fsSL --proto '=https' --tlsv1.2 --retry 3 \
+        "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+    if [ -z "$tag" ]; then
+        # /releases is newest-first, so the first tag_name is the newest
+        # published release, prereleases included.
+        tag="$(curl -fsSL --proto '=https' --tlsv1.2 --retry 3 \
+            "https://api.github.com/repos/$REPO/releases?per_page=1" 2>/dev/null \
+            | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+        [ -z "$tag" ] || warn "no stable release yet; using the latest prerelease $tag"
+    fi
+    printf '%s' "$tag"
+}
+
 # --- main ------------------------------------------------------------------
 if [ "$FROM_SOURCE" -eq 1 ]; then
     build_from_source
@@ -335,10 +358,9 @@ else
             VERSION="v<latest>"
         else
             info "resolving latest release of $REPO"
-            VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-                | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)"
-            [ -n "$VERSION" ] || die "could not determine the latest release; \
-pass --version <tag> (e.g. --version v0.1.0)"
+            VERSION="$(resolve_latest_version)"
+            [ -n "$VERSION" ] || die "no releases found for $REPO; \
+pass --version <tag> (e.g. --version v0.1.0) or use --from-source"
         fi
     fi
     case "$VERSION" in
@@ -362,7 +384,9 @@ pass --version <tag> (e.g. --version v0.1.0)"
 
         curl -fsSL --proto '=https' --tlsv1.2 --retry 3 \
             -o "$tmp/$ARCHIVE" "$BASE/$ARCHIVE" \
-            || die "download failed: $BASE/$ARCHIVE (does $VERSION ship a $TARGET build?)"
+            || die "download failed: $BASE/$ARCHIVE - either $VERSION has no \
+$TARGET build or its release assets have not finished publishing yet \
+(check https://github.com/$REPO/releases/tag/$VERSION)"
         curl -fsSL --proto '=https' --tlsv1.2 --retry 3 \
             -o "$tmp/SHA256SUMS" "$BASE/SHA256SUMS" \
             || die "could not download SHA256SUMS for $VERSION"

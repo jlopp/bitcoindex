@@ -90,7 +90,10 @@ curl -fsSL https://raw.githubusercontent.com/jlopp/bitcoindex/master/scripts/ins
 The script:
 
 1. Detects the architecture (`x86_64`/`aarch64`) and libc (glibc/musl).
-2. Resolves the release (`releases/latest`, or `--version`).
+2. Resolves the release (`releases/latest`, or `--version`). If the repository
+   has no stable release yet, it falls back to the newest published release of
+   any kind — GitHub's `releases/latest` deliberately omits prereleases and
+   drafts, so it 404s on a repository whose only releases are prereleases.
 3. Downloads the matching tarball and **verifies its SHA-256** against the
    release `SHA256SUMS`, refusing to install on a mismatch.
 4. Installs the binary — `/usr/local/bin` when writable, via `sudo` for the
@@ -490,6 +493,7 @@ directories yourself when you want the space back.
 | `error while loading shared libraries: libzmq.so.5` | The binary links the system libzmq. Install `libzmq5` (deb) / `zeromq` (rpm, apk). Only `live` needs it. |
 | `command not found: clickhouse-client` | Install it from the ClickHouse repo (see [above](#what-you-need-before-you-start)). Needed by `init-db`/`load`/`migrate`/`verify`/`index rebuild`. |
 | `checksum mismatch for bidx-…` | The download was corrupted or tampered with. Re-run; if it persists, verify manually against `SHA256SUMS`. |
+| `download failed … release assets have not finished publishing` | The release exists but its `Release` workflow has not attached the tarballs yet (or it has no build for your target). Wait for the workflow to finish, or re-run with `--version`/`--from-source`. |
 | `no prebuilt binary for architecture` | Use `--from-source`, or the container image. |
 | Installer fell back to `~/.local/bin` | The prefix was not writable. Add it to `PATH`, or re-run with `sudo`. |
 | `'stdbool.h' file not found` on a source build | Source `scripts/dev-env.sh`, or run `./scripts/build-shim.sh` and export `BINDGEN_EXTRA_CLANG_ARGS` as in [option 7](#7-build-from-source). |
