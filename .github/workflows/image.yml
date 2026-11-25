@@ -163,6 +163,15 @@ jobs:
           image: ${{ steps.name.outputs.image }}@${{ steps.digest.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
+          # The action defaults this to true, and on a `v*` tag push it then
+          # tries to attach the SBOM to the GitHub release. That needs
+          # `contents: write`, which this job deliberately does not have (it
+          # only needs `packages: write` to push the image), so the upload
+          # fails with "Resource not accessible by integration". The release's
+          # SBOM is already produced and attached by release.yml (CycloneDX),
+          # and the attestation below still uses the local sbom.spdx.json, so
+          # skip the release attach rather than widen this job's permissions.
+          upload-release-assets: false
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2

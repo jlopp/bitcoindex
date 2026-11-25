@@ -212,6 +212,15 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      # apt-ftparchive, used by deb-repo.sh below, ships in apt-utils and is
+      # not installed on the runner image, so deb-repo.sh fails with
+      # "apt-ftparchive: command not found" (exit 127). Install it explicitly.
+      - name: Install apt-ftparchive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils
+          apt-ftparchive --version
+
       - name: Build apt repository tree
         run: |
           set -eux
