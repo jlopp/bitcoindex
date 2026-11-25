@@ -1,16 +1,24 @@
-# Cross-compilation configuration for `cross` (used by the release workflow).
+# Cross-compilation configuration for `cross`.
+#
+# The only target that still builds through `cross` is
+# x86_64-unknown-linux-musl. The glibc targets build natively on their matching
+# hosted runner (see .github/workflows/release.yml): aarch64 does *not* go
+# through `cross` because the `cross` aarch64 image is Ubuntu 16.04 and ships
+# libclang 3.8, too old for the bindgen librocksdb-sys uses — it calls
+# clang_getTranslationUnitTargetInfo (libclang >= 5.0) and panics with
+# "loaded `libclang` instance = 3.8.x". The arm64 runner has libclang 18.
 #
 # The binary links two heavy native deps:
 #   * RocksDB (librocksdb-sys) — C++, built from source, needs clang/bindgen.
 #   * libzmq (zmq-sys)        — C++, built from source with libsodium.
 #
-# A bare `musl-tools`/`gcc-aarch64-linux-gnu` install is not enough: those ship
-# a C compiler only, and neither the musl nor the aarch64 sysroot has libzmq or
-# libclang. `cross` runs the build inside a container per target, so we install
-# exactly what the native build needs (the same package set as the test
-# workflow) into that container. `libzmq3-dev` is required because zmq-sys's
-# build script probes for a system libzmq before vendoring; clang/libclang-dev
-# is required because bindgen dlopens libclang at build time.
+# A bare `musl-tools` install is not enough: it ships a C compiler only, and the
+# musl sysroot has neither libzmq nor libclang. `cross` runs the build inside a
+# container per target, so we install exactly what the native build needs (the
+# same package set as the test workflow) into that container. `libzmq3-dev` is
+# required because zmq-sys's build script probes for a system libzmq before
+# vendoring; clang/libclang-dev is required because bindgen dlopens libclang at
+# build time.
 
 [build.env]
 passthrough = [
@@ -20,12 +28,13 @@ passthrough = [
 
 [target.x86_64-unknown-linux-musl]
 pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev",
-]
-
-[target.aarch64-unknown-linux-gnu]
-pre-build = [
+    # DEBIAN_FRONTEND must be exported in the same shell as the install: the
+    # base image sets it via `ARG` (build-time only), so it is NOT present in
+    # the container's environment when `cross` runs this as `RUN eval` and it
+    # does not carry across list entries. Without it, tzdata (pulled in
+    # transitively by python3 via llvm-dev) opens its geographic-area prompt
+    # under the Readline debconf frontend and the build hangs forever on stdin.
+    "export DEBIAN_FRONTEND=noninteractive",
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-dev cmake pkg-config libzmq3-dev",
 ]

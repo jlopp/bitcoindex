@@ -20,32 +20,45 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # Each target picks the runner that has the matching CPU (see the matrix).
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Native build on the runner: has the full system toolchain, so no
-          # container indirection is needed.
+          # Native builds run on the runner itself and use its full system
+          # toolchain (libclang 18 on ubuntu-24.04), so no container
+          # indirection is needed.
           - target: x86_64-unknown-linux-gnu
             archive: bidx-x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
             use_cross: false
-          # Cross targets go through `cross`, which runs the build inside a
-          # per-target container and installs the C/C++ toolchain + libclang +
-          # libzmq the native deps need (see Cross.toml). A plain
-          # musl-tools/gcc-aarch64 install cannot build RocksDB or libzmq.
-          - target: x86_64-unknown-linux-musl
-            archive: bidx-x86_64-unknown-linux-musl
-            use_cross: true
+          # aarch64 builds natively on the free arm64 hosted runner, mirroring
+          # the image workflow. It must not go through `cross`: the `cross`
+          # aarch64 image is Ubuntu 16.04 and ships libclang 3.8, which is too
+          # old for the bindgen that librocksdb-sys uses — bindgen calls
+          # clang_getTranslationUnitTargetInfo (libclang >= 5.0) and panics
+          # with "loaded `libclang` instance = 3.8.x". The arm64 runner has
+          # libclang 18, so it builds without a container.
           - target: aarch64-unknown-linux-gnu
             archive: bidx-aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            use_cross: false
+          # The musl target still goes through `cross`, which runs the build
+          # inside a per-target container and installs the C/C++ toolchain +
+          # libclang + libzmq the native deps need (see Cross.toml). A plain
+          # musl-tools install cannot build RocksDB or libzmq, and the musl
+          # cross image is Ubuntu 20.04 with a new enough libclang.
+          - target: x86_64-unknown-linux-musl
+            archive: bidx-x86_64-unknown-linux-musl
+            runner: ubuntu-latest
             use_cross: true
     steps:
       - uses: actions/checkout@v7
 
       - name: Install system build dependencies
-        # Only needed for the native target; `cross` installs its own deps in
+        # Only needed for the native targets; `cross` installs its own deps in
         # the target container.
         if: matrix.use_cross == false
         run: |
