@@ -385,21 +385,6 @@ FROM bitcoin.outputs_by_address
 WHERE address_hash = <32-byte-hash>;
 ```
 
-## Status / roadmap
-
-- [x] Header pass with cumulative-work main-chain selection
-- [x] Parallel full parse (txs, inputs, outputs, witness metrics)
-- [x] RocksDB UTXO spend linking + fee computation
-- [x] Parquet intermediates (zstd, rotating parts)
-- [x] ClickHouse schema + bulk loader
-- [x] Live tip tracking (ZMQ `hashblock` + RPC catch-up) with undo-log reorg handling
-- [x] `bidx bench` — per-stage timing with orthogonal mode toggles (headers / parse / utxo / sink / full) to attribute bottlenecks
-- [x] Sink & UTXO overlap: sink I/O (Parquet encode + file write) runs on a dedicated sink thread, overlapped with the consumer's RocksDB commit via a bounded channel
-- [x] Retraction of live-Parquet rows for disconnected blocks (open-part rows are dropped exactly from the in-memory window; a deeper reorg records a `.live-reorg-floor` sidecar for the loader)
-- [x] Direct ClickHouse live inserts (bypass Parquet) for sub-minute tip freshness (`bidx live --ch-live`, streaming `RowBinary` over one open `clickhouse-client` pipe per table)
-- [x] Optional witness payload table (opt-in `--capture-witness`, kept out of the hot tables)
-- [x] Base58/bech32 rendering helpers (executable UDF crate `bidx-udf`, ClickHouse SQL view, and a `bidx index` helper)
-
 ## License
 
 MIT

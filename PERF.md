@@ -606,8 +606,9 @@ built as a minimum viable cache and A/B-tested.
 ### Design
 
 `RecentUtxoCache` — a bounded `FxHashMap<[u8;36], UtxoValue>` plus a creation-
-ordered `VecDeque` for eviction. `--utxo-cache-mb <N>` enables it (default 0 =
-disabled, i.e. the baseline).
+ordered `VecDeque` for eviction. `--utxo-cache-mb <N>` sets its size in MiB;
+`0` disables it (the A/B baseline). Since §12 it is **auto-sized from host
+memory by default** rather than disabled.
 
 Decisions worth recording, because each was a fork in the road:
 
@@ -695,4 +696,92 @@ Three unit tests pin the instrumentation, so the numbers above can be trusted:
 `pending` hit in the same block, asserting the split sums to the input count),
 `apply_block_reports_no_db_lookups_when_all_spends_are_same_block`, and
 `apply_block_excludes_coinbase_from_lookup_counts`.
+
+## 12. Spending the idle RAM: auto-sized caches, one block cache, tuned writes, parallel header pass
+
+The report that started this: a mainnet bulk index on a 12-core / 32 GB / NVMe
+box spent **25 minutes in the header pass** and was only at **height 760,000
+after 13 hours** (~6 blocks/s), with the suspicion that RAM sat idle while the
+box thrashed the disks. Four changes, A–D:
+
+- **A — the recent-UTXO cache is now on in production, and auto-sized.** §11
+  built `RecentUtxoCache` but left it off by default and reachable only from
+  `bench`. It is wired into `bidx parse` and sized from host memory.
+  `--utxo-cache-mb <N>` overrides; `0` restores the §11 baseline.
+- **B — one shared, auto-sized RocksDB block cache.** `tuned_options` used to
+  build a *separate* 1 GiB cache per column family, tripling memory and
+  preventing a block read for one family being reused by another. There is now
+  exactly one `Cache` handle, cloned into every CF descriptor and sized from
+  host memory. `--block-cache-mb <N>` overrides.
+- **C — write-path tuning scales with the core count.** `max_background_jobs`
+  and `max_subcompactions` were hardcoded to 8. They now derive from
+  `available_parallelism()` (`background_jobs_for` / `subcompactions_for`, both
+  clamped), so a 12- or 16-core box no longer runs every compaction on a single
+  thread. `increase_parallelism` follows the same value.
+- **D — the header pass is parallel.** `build_chain_index` now scans blk files
+  with Rayon (`files.par_iter().map(scan_file).collect()`), each file producing
+  an allocation-local `Vec`, merged **in file-id order** so first-seen-wins on
+  duplicate block hashes stays deterministic.
+
+### The memory budget (`bidx_core::mem`)
+
+Reads `/proc/meminfo`. `MemAvailable` is the input (not `MemTotal` — on a busy
+box that ignores every other process). Usable = `MemAvailable` − 10%
+(measurement reserve) − 2 GiB (runtime reserve: parse scratch, reorder buffer,
+sink batches, allocator slack); the caches take 60% of that, split 60/40 to the
+recent-UTXO cache and the RocksDB block cache. On the 32 GB measurement box
+(~12.4 GiB available): **~3.3 GiB recent + ~2.2 GiB block**. If `/proc/meminfo`
+is unreadable the fallback is the old 1 GiB block cache and no recent cache, so
+behaviour on a host without `/proc` is unchanged.
+
+### Measurements (signet, heights 0..310,000, 8 threads, 16-core box)
+
+Seeded run with the cache auto-enabled:
+
+| metric | value |
+|---|---:|
+| blocks/s | **746.8** |
+| pipeline wall | 415.1 s (apply 351.8 s) |
+| cache hits | **64,868,912** |
+| DB lookups | 46,916 (**0.73%**) |
+| db_time | 0.72 s (**0.2%** of apply) |
+| missing UTXOs | **0** |
+| peak RSS | 18.6 GB |
+
+The same range with `--utxo-cache-mb 0` on a fresh store **did not finish in 50
+minutes** (vs 6.9 min) and was killed still running — **>7× slower**. Every
+cross-block spend becomes a RocksDB point lookup without the cache, and on this
+dense range that is the entire apply cost.
+
+Header pass: signet (149 blk files, 22 GB) scans in **28–45 s** in parallel.
+
+### Caveats (read before trusting this on mainnet)
+
+- **Cold-start short runs do not benefit.** A 1,500-block run over a store
+  seeded only to that range's start spends more time *filling* the cache than
+  it saves and measured *slower* with the cache on. The cache pays off over a
+  long contiguous run, which is exactly the bulk-index case.
+- **The >7× cache-off figure is a strong signal, not an isolated one.** It was
+  measured on tmpfs (`/tmp`), so the comparison is RocksDB per-lookup work, not
+  disk I/O, and the cache-off run was killed rather than completed. §11's
+  controlled testnet4 A/B (disk-backed, both sides seeded) showed a smaller but
+  clean **+15.7%** throughput. Re-measure on a disk-backed mainnet corpus.
+- **Testnet4/signet hit rates overstate mainnet.** A few GiB window covers a
+  large fraction of a small chain's UTXO set; on mainnet it will cover much
+  less. The auto-sizing is the right default; the *magnitude* must be
+  re-measured on mainnet.
+- **`--utxo-cache-mb`/`--block-cache-mb` still ignore `bidx live`.** Live mode
+  keeps the recent cache off (undo correctness); it now gets the auto-sized
+  block cache but not the recent cache.
+
+### Tests
+
+`bidx_core::mem` has 8 unit tests (field parsing present/missing/garbage,
+zero-safe and clamped budgeting, the exact 60/40 split). `utxo.rs` adds
+`open_tuned_sizes_a_single_shared_block_cache`, `open_tuned_enables_the_recent_cache`,
+and `background_jobs_and_subcompactions_scale_and_clamp`; `pipeline.rs` adds
+`resolve_cache_bytes_prefers_overrides_and_falls_back_to_budget` and an
+end-to-end auto-network/default-checkpoint-path run; `chain.rs`'s parallel pass
+is exercised by the existing chain-index tests. Per-file coverage is at 100%
+for every touched file (`scripts/coverage/check-changed.sh`).
 

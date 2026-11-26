@@ -120,12 +120,13 @@ pub struct BenchConfig {
     #[arg(long, default_value_t = false)]
     pub allow_missing_utxos: bool,
 
-    /// Enable the in-memory recent-UTXO cache with this budget, in MiB. 0 (the
-    /// default) disables it, which is the baseline. The cache keeps the most
-    /// recently created outputs in memory so a spend of a recent output is
-    /// answered without a RocksDB lookup. Only applies in bulk (non-undo) mode.
-    #[arg(long, default_value_t = 0)]
-    pub utxo_cache_mb: usize,
+    /// In-memory recent-UTXO cache budget in MiB. Omitted (the default) sizes
+    /// it from the host's available memory, matching `bidx parse`; pass `0` to
+    /// disable it for an A/B baseline, or an explicit MiB to pin it. The cache
+    /// keeps the most recently created outputs in memory so a spend of a recent
+    /// output is answered without a RocksDB lookup. Bulk (non-undo) mode only.
+    #[arg(long)]
+    pub utxo_cache_mb: Option<usize>,
 
     /// Emit a RocksDB internal-properties snapshot per trial. Off by default
     /// because reading some properties can block briefly on a running DB.
@@ -358,13 +359,20 @@ impl Tuning {
 fn open_utxo_for_bench(
     path: &Path,
     rocksdb_stats: bool,
-    cache_mb: usize,
+    cache_mb: Option<usize>,
 ) -> Result<UtxoStore, bidx_store::UtxoError> {
-    match (rocksdb_stats, cache_mb) {
-        (true, 0) => UtxoStore::open_statistics(path),
-        (false, 0) => UtxoStore::open(path),
-        (true, mb) => UtxoStore::open_cached_statistics(path, mb << 20),
-        (false, mb) => UtxoStore::open_cached(path, mb << 20),
+    // Default to the same auto-sized caches production uses, so a bare
+    // `bidx bench --mode full` measures the real read path. An explicit MiB
+    // (including 0, the A/B baseline) pins the recent cache; the block cache
+    // always comes from the host budget.
+    let budget = bidx_core::plan_cache_budget_for_host();
+    let recent = cache_mb
+        .map(|mb| mb << 20)
+        .unwrap_or(budget.recent_cache_bytes);
+    if rocksdb_stats {
+        UtxoStore::open_tuned_statistics(path, budget.block_cache_bytes, recent)
+    } else {
+        UtxoStore::open_tuned(path, budget.block_cache_bytes, recent)
     }
 }
 
@@ -618,7 +626,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // allowed to run, or no block can ever unblock the
                         // consumer and the whole pipeline deadlocks.
                         //
-                        // coverage-exempt: 629, 631-635 — mirror of the production
+                        // coverage-exempt: 637, 639-640, 642 — mirror of the production
                         // spin in `pipeline::run_parse`. The body (and the
                         // second `&&` clause, which short-circuits) only runs
                         // when the consumer is `reorder_high` blocks behind
@@ -647,7 +655,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // consumer is gone, which is usually the RSS watchdog
                         // having aborted it. Surface the real cause.
                         //
-                        // coverage-exempt: 656-660 — the map_err closure body
+                        // coverage-exempt: 664-667 — the map_err closure body
                         // only runs when a send to the consumer fails, which
                         // needs the consumer thread to have aborted mid-run;
                         // the fixtures never provoke that. The closure's
@@ -673,6 +681,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     if let Some(h) = consumer_handle {
         let us = h
             .join()
+            // coverage-exempt: consumer only returns Err by panicking (not in fixtures)
             .map_err(|_| anyhow::anyhow!("consumer panicked"))??;
         utxo_samples = us;
     } else {
@@ -897,7 +906,7 @@ pub(crate) struct OomWatchdog {
 /// process.
 fn rss_trips(rss_kb: u64, max_rss_kb: u64) -> bool {
     if rss_kb > max_rss_kb {
-        // coverage-exempt: 905-906 — the `tracing::error!` field expressions
+        // coverage-exempt: 914-916 — the `tracing::error!` field expressions
         // are only evaluated when a subscriber is installed; the unit tests
         // run without one, so only the macro's target line is instrumented.
         // The branch itself is covered by `rss_trips_logs_and_trips_only_over_the_limit`.
@@ -1298,7 +1307,7 @@ mod tests {
             channel_depth: None,
             repeat: 1,
             allow_missing_utxos: false,
-            utxo_cache_mb: 0,
+            utxo_cache_mb: None,
             rocksdb_stats: false,
             csv: None,
         }
@@ -2424,20 +2433,31 @@ mod tests {
 
     #[test]
     fn open_utxo_for_bench_selects_variant_by_flags() {
-        // The four-way (statistics, block-cache) matrix must pick the matching
-        // `open*` variant. Each arm opens a real store in its own dir so the
-        // branch is genuinely executed; `statistics_enabled` distinguishes the
-        // statistics axis, and `cached_open_answers_a_recent_output_from_memory`
-        // below distinguishes the block-cache axis.
-        for (stats, mb) in [(true, 0usize), (false, 0), (true, 4), (false, 4)] {
+        // The (statistics, cache) matrix must pick the matching `open*`
+        // variant. Each arm opens a real store in its own dir so the branch is
+        // genuinely executed; `statistics_enabled` distinguishes the statistics
+        // axis, and the recent-cache axis is checked via `cache_stats`.
+        for (stats, mb) in [
+            (true, None),
+            (false, None),
+            (true, Some(0usize)),
+            (false, Some(4usize)),
+        ] {
             let dir = std::env::temp_dir().join(format!(
-                "bidx-bench-open-{}-{}-{mb}",
+                "bidx-bench-open-{}-{}-{}",
                 std::process::id(),
-                stats as u8
+                stats as u8,
+                mb.map(|m| m as i64).unwrap_or(-1)
             ));
             let _ = std::fs::remove_dir_all(&dir);
             let store = open_utxo_for_bench(&dir, stats, mb).unwrap();
-            assert_eq!(store.statistics_enabled(), stats, "stats={stats} mb={mb}");
+            assert_eq!(store.statistics_enabled(), stats, "stats={stats} mb={mb:?}");
+            // `Some(0)` disables the cache; `None` auto-sizes it (non-zero on
+            // any host with usable memory); `Some(4)` enables it.
+            match mb {
+                Some(0) => assert!(store.cache_stats().is_none(), "explicit 0 disables"),
+                _ => assert!(store.cache_stats().is_some(), "cache expected for {mb:?}"),
+            }
             drop(store);
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2452,10 +2472,11 @@ mod tests {
         // (cache_hits == 1, no DB lookup); without one it falls through to the
         // database (cache_hits == 0, one lookup). This is the observable
         // difference the (stats, cache) match arms select between.
-        fn run(cache_mb: usize) -> bidx_store::SpendResult {
+        fn run(cache_mb: Option<usize>) -> bidx_store::SpendResult {
             let dir = std::env::temp_dir().join(format!(
-                "bidx-bench-cache-{}-{cache_mb}",
-                std::process::id()
+                "bidx-bench-cache-{}-{}",
+                std::process::id(),
+                cache_mb.map(|m| m as i64).unwrap_or(-1)
             ));
             let _ = std::fs::remove_dir_all(&dir);
             let store = open_utxo_for_bench(&dir, false, cache_mb).unwrap();
@@ -2519,14 +2540,14 @@ mod tests {
             res
         }
 
-        let cached = run(1);
+        let cached = run(Some(1));
         assert_eq!(
             cached.cache_hits, 1,
             "a recent output must be served from the cache"
         );
         assert_eq!(cached.db_lookups, 0, "cache hit must not touch the DB");
 
-        let uncached = run(0);
+        let uncached = run(Some(0));
         assert_eq!(uncached.cache_hits, 0, "no cache means no cache hits");
         assert_eq!(uncached.db_lookups, 1, "no cache means a DB lookup");
     }

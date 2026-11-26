@@ -75,6 +75,24 @@ pub const CHANNEL_DEPTH: usize = 512;
 /// block's rows, ~a few MB at the tip).
 pub const SINK_CHANNEL_DEPTH: usize = 8;
 
+/// Resolve the two cache sizes from the optional CLI overrides and the
+/// host-derived budget. A `Some(mb)` override wins; `None` takes the planned
+/// value. Split out so both the override and auto-sized branches are unit
+/// testable without a live host.
+fn resolve_cache_bytes(
+    block_cache_mb: Option<usize>,
+    utxo_cache_mb: Option<usize>,
+    budget: bidx_core::CacheBudget,
+) -> (usize, usize) {
+    let block = block_cache_mb
+        .map(|mb| mb.saturating_mul(1 << 20))
+        .unwrap_or(budget.block_cache_bytes);
+    let recent = utxo_cache_mb
+        .map(|mb| mb.saturating_mul(1 << 20))
+        .unwrap_or(budget.recent_cache_bytes);
+    (block, recent)
+}
+
 /// Configuration for a parse run.
 ///
 /// Deliberately not `Clone`/`Debug`: it holds a boxed `dyn RpcTransport` (see
@@ -111,6 +129,17 @@ pub struct ParseConfig {
     pub rpc_transport: Option<Box<dyn bidx_live::RpcTransport>>,
     /// Capture raw witness stack elements into the optional witnesses table.
     pub capture_witness: bool,
+    /// RocksDB block-cache size in MiB. `None` (the default) sizes it from the
+    /// host's available memory via `bidx_core::plan_cache_budget_for_host`.
+    /// A larger cache is the single biggest lever on the apply path, because
+    /// every spent input is a point lookup that otherwise faults a data block
+    /// off disk.
+    pub block_cache_mb: Option<usize>,
+    /// In-memory recent-UTXO cache size in MiB. `None` (the default) sizes it
+    /// from the host's available memory. The cache answers a spend of a
+    /// recently created output without a RocksDB lookup at all. Only used in
+    /// bulk mode (no undo); live mode ignores it.
+    pub utxo_cache_mb: Option<usize>,
 }
 
 /// A parse-stage message: either a fully-parsed block, or a "skipped"
@@ -148,7 +177,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         .utxo
         .parent()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+        .unwrap_or_else(|| PathBuf::from(".")); // coverage-exempt: utxo is a store dir, never "/"
     let checkpoint_file = cfg
         .checkpoint_file
         .clone()
@@ -213,7 +242,25 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // We keep per-thread file caches instead: simpler and lets height order
     // interleave across files naturally.
     let index = Arc::new(index);
-    let utxo = Arc::new(UtxoStore::open(&cfg.utxo)?);
+
+    // Size the two caches from the host's memory unless the caller pinned
+    // them. The apply path is one point lookup per spent input, and on a
+    // mainnet-sized UTXO set most of those miss the block cache and fault a
+    // data block off disk — which is the dominant cost of a bulk index. A
+    // 32 GiB box otherwise leaves ~29 GiB idle while it thrashes NVMe.
+    let budget = bidx_core::plan_cache_budget_for_host();
+    let (block_cache_bytes, recent_cache_bytes) =
+        resolve_cache_bytes(cfg.block_cache_mb, cfg.utxo_cache_mb, budget);
+    info!(
+        block_cache_mb = block_cache_bytes / (1 << 20),
+        recent_cache_mb = recent_cache_bytes / (1 << 20),
+        "opening UTXO store"
+    );
+    let utxo = Arc::new(UtxoStore::open_tuned(
+        &cfg.utxo,
+        block_cache_bytes,
+        recent_cache_bytes,
+    )?);
 
     // Channel carries parsed blocks from workers to the ordered consumer.
     // Bound it to keep memory in check if the consumer (RocksDB) lags.
@@ -323,11 +370,11 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // holding the height the consumer is waiting for must run, or
                 // no block ever arrives to let the consumer drain.
                 //
-                // coverage-exempt: 332, 334-335, 337 — the spin body only runs
+                // coverage-exempt: 379, 381-382, 384 — the spin body only runs
                 // when the consumer is >REORDER_HIGH blocks behind *and* the
                 // worker's height is not the one being awaited, i.e. under real
                 // memory pressure the unit fixtures never create. The first
-                // clause of the condition (line 331) is exercised.
+                // clause of the condition (line 378) is exercised.
                 while reorder.load(Ordering::Relaxed) > REORDER_HIGH
                     && next_h.load(Ordering::Relaxed) != height
                 {
@@ -349,10 +396,10 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // A send failure means the consumer is gone. That is either a
                 // real bug or the RSS watchdog having aborted it; report the
                 // actual cause rather than a generic "consumer dropped".
-                // coverage-exempt: 357-358, 360 — only runs when a send to the
-                // consumer fails, which needs the consumer thread to have
-                // aborted mid-run (RSS watchdog); not reachable in the unit
-                // fixtures. The closure's construction is covered.
+                // coverage-exempt: 403-408, 418, 424 — the closure body and the
+                // two `map_err` closures only run when a send to the consumer
+                // fails (consumer aborted mid-run via the RSS watchdog); not
+                // reachable in the unit fixtures. Construction is covered.
                 let send_failed = |w: &crate::bench::OomWatchdog| -> anyhow::Error {
                     if w.is_tripped() {
                         w.tripped_error()
@@ -385,6 +432,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
 
     consumer
         .join()
+        // coverage-exempt: consumer only returns Err by panicking (not in fixtures)
         .map_err(|_| anyhow::anyhow!("consumer panicked"))??;
 
     progress.finish_with_message("parse complete");
@@ -572,7 +620,7 @@ fn consume_ordered(
         while let Some(block) = buffer.remove(&next) {
             // Poll the RSS watchdog once per block. It is a relaxed atomic
             // load, so the cost is nil next to apply_block.
-            // coverage-exempt: 581 — returns only when the watchdog has already
+            // coverage-exempt: 629 — returns only when the watchdog has already
             // tripped (process RSS over the computed ceiling), which the unit
             // fixtures do not reach; the `Some(w)`/`is_tripped` checks are
             // exercised on the non-tripped path.
@@ -617,9 +665,9 @@ fn consume_ordered(
             // Hand the fully-enriched block to the sink thread. A send error
             // means the sink already failed; surface its error, not a generic
             // "channel closed".
-            // coverage-exempt: 630-633 — only runs when the sink thread has
-            // already died (a Parquet write error mid-run), which the fixtures
-            // do not provoke; the normal send is covered.
+            // coverage-exempt: 678, 680-681 — only runs when the sink thread
+            // has already died (a Parquet write error mid-run), which the
+            // fixtures do not provoke; the normal send is covered.
             if sink_tx
                 .send(SinkMsg::Block {
                     block,
@@ -650,11 +698,12 @@ fn consume_ordered(
     drop(sink_tx);
     let sink_res = sink_handle
         .join()
+        // coverage-exempt: sink only returns Err by panicking (not in fixtures)
         .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
 
     if next < end {
         // Channel closed before we saw every height: that's an error.
-        // coverage-exempt: 663-664 — reached only when the producer's channel
+        // coverage-exempt: 712-713 — reached only when the producer's channel
         // closes before every height was delivered (a parse/worker abort). The
         // fixtures always complete the range and return via the `break
         // 'consume` exit, so this defensive tail is not exercised; it exists so
@@ -970,6 +1019,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cache_bytes_prefers_overrides_and_falls_back_to_budget() {
+        let budget = bidx_core::CacheBudget {
+            block_cache_bytes: 3 << 30,
+            recent_cache_bytes: 5 << 30,
+        };
+        // No overrides: the planned values are used verbatim.
+        assert_eq!(
+            resolve_cache_bytes(None, None, budget),
+            (3 << 30, 5 << 30)
+        );
+        // A block-cache override wins; the recent cache still auto-sizes.
+        assert_eq!(
+            resolve_cache_bytes(Some(2), None, budget),
+            (2 << 20, 5 << 30)
+        );
+        // A recent-cache override wins; the block cache still auto-sizes.
+        assert_eq!(
+            resolve_cache_bytes(None, Some(7), budget),
+            (3 << 30, 7 << 20)
+        );
+        // An explicit 0 disables the recent cache rather than falling back.
+        assert_eq!(resolve_cache_bytes(None, Some(0), budget).1, 0);
+    }
+
+    #[test]
     fn inspect_block_prints_rows_for_existing_height() {
         let (dir, _) = make_chain(4);
         // Should print the block without panicking. We can't easily assert
@@ -1024,6 +1098,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: None,
         })
         .expect("run_parse");
@@ -1098,6 +1174,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: true,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: None,
         })
         .expect("run_parse with witness capture");
@@ -1143,6 +1221,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts2.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: None,
         })
         .expect("run_parse without witness capture");
@@ -1177,6 +1257,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("c")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: None,
         })
         .err()
@@ -1530,6 +1612,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: Some(Box::new(transport)),
         })
         .expect("run_parse with orphan skip");
@@ -1588,6 +1672,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: None,
         })
         .expect("run_parse without rpc");
@@ -1623,6 +1709,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: None,
         })
         .err()
@@ -1680,6 +1768,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: Some(Box::new(TipsFailRpc { node_tip: 1 })),
         })
         .expect("orphan fetch failure must be non-fatal");
@@ -1688,6 +1778,83 @@ mod tests {
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&utxo);
+    }
+
+    /// A transport that reports a tip but whose `getchaintips` returns an empty
+    /// list, so the pre-flight runs and the orphan arm takes its `Ok(_)` /
+    /// "no orphaned blocks" branch.
+    struct NoTipsRpc;
+
+    impl bidx_live::RpcTransport for NoTipsRpc {
+        fn roundtrip(
+            &self,
+            body: &serde_json::Value,
+        ) -> Result<serde_json::Value, bidx_live::RpcError> {
+            let result = match body["method"].as_str().unwrap_or("") {
+                "getblockcount" => serde_json::json!(1),
+                "getchaintips" => serde_json::json!([]),
+                _ => serde_json::Value::Null,
+            };
+            Ok(serde_json::json!({ "result": result, "error": null }))
+        }
+    }
+
+    #[test]
+    fn run_parse_auto_detects_network_and_defaults_checkpoint_path() {
+        // Covers the three "not provided" fallbacks at the top of `run_parse`:
+        //   * `network: None`  -> detect from the blk file's magic bytes;
+        //   * `checkpoint_file: None` -> derive `<parent-of-utxo>/bidx-…txt`;
+        //   * a checkpoint file that already holds an entry -> the
+        //     `read_checkpoints(..).last().map(..)` arm is taken.
+        // Also exercises the empty `getchaintips` (no-orphans) log branch.
+        let (blocks_dir, _) = make_chain(2);
+        // `make_chain` writes mainnet magic, so auto-detection must yield Mainnet.
+        let out = std::env::temp_dir().join(format!("bidx-autonet-out-{}", std::process::id()));
+        let utxo_parent =
+            std::env::temp_dir().join(format!("bidx-autonet-parent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo_parent);
+        std::fs::create_dir_all(&utxo_parent).unwrap();
+        let utxo = utxo_parent.join("utxo");
+        std::fs::create_dir_all(&utxo).unwrap();
+        // Pre-seed the *default* checkpoint file (derived from the utxo parent)
+        // so `read_checkpoints` returns a non-empty history.
+        let default_ckpt = utxo_parent.join(crate::diskguard::DEFAULT_CHECKPOINT_FILE_NAME);
+        bidx_core::append_checkpoint(
+            &default_ckpt,
+            bidx_core::Network::Mainnet,
+            bidx_core::DiskCheckpoint {
+                height: 1,
+                total_bytes: 1024,
+            },
+        )
+        .unwrap();
+
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(2),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: Some("http://unused".into()),
+            rpc_cookie: None,
+            skip_disk_check: false,
+            network: None,           // exercise auto-detect
+            checkpoint_file: None,   // exercise the default-path fallback
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            rpc_transport: Some(Box::new(NoTipsRpc)),
+        })
+        .expect("run_parse with auto-detected network and default checkpoint path");
+
+        assert!(out.join("blocks/part-00000.parquet").exists());
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo_parent);
     }
 
     #[test]
@@ -1721,6 +1888,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: Some(Box::new(transport)),
         })
         .expect("orphan at final height must finish cleanly");
@@ -1803,6 +1972,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: Some(Box::new(NoOrphanRpc { node_tip: 2 })),
         })
         .expect("run_parse with no orphans");
@@ -1865,6 +2036,8 @@ mod tests {
             checkpoint_file: Some(utxo.join("ckpts.txt")),
             orphan_blocks: None,
             capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
             rpc_transport: None,
         })
         .expect("run_parse with a spend");

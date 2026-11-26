@@ -391,7 +391,7 @@ impl CacheStats {
     }
 }
 
-/// Block cache capacity, shared by every column family.
+/// Default block cache capacity, shared by every column family.
 ///
 /// The default was RocksDB's own 32 MiB — measured, not assumed: a probe run
 /// reported `block_cache_capacity 33554432`. That is ~2,000x smaller than the
@@ -400,7 +400,66 @@ impl CacheStats {
 ///
 /// The cache is shared across column families so the read path cannot be
 /// starved by the undo/meta families, which are written far more than read.
-const BLOCK_CACHE_BYTES: usize = 1 << 30; // 1 GiB
+/// This 1 GiB value is now only the *fallback*: callers that know the host's
+/// memory (via `bidx_core::plan_cache_budget_for_host`) pass a larger size
+/// through [`UtxoStore::open_tuned`]. It is kept as the default so a bare
+/// `open()` on a small host cannot allocate an outsized cache.
+pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 1 << 30; // 1 GiB
+
+/// Write-path tuning that does not depend on the block cache. Applied to the
+/// database *and* to every column family (see [`tuned_options`]).
+///
+/// `max_background_jobs` and `max_subcompactions` scale with the host's core
+/// count: the previous hardcoded 8 was tuned on an 8-core box, and on a 12- or
+/// 16-core machine leaving cores idle during L0/L1 compaction is free
+/// throughput left on the table. `subcompactions` in particular lets a single
+/// large compaction use multiple cores.
+fn apply_write_tuning(opts: &mut Options) {
+    // A 512 MiB buffer means a flush every ~8s at the observed write rate
+    // rather than every second; with 4 buffers we can absorb a burst while a
+    // flush is in flight.
+    opts.set_write_buffer_size(512 << 20);
+    opts.set_max_write_buffer_number(4);
+    opts.set_target_file_size_base(256 << 20);
+    opts.set_level_zero_file_num_compaction_trigger(8);
+    opts.set_level_zero_slowdown_writes_trigger(20);
+    opts.set_level_zero_stop_writes_trigger(30);
+    let jobs = default_background_jobs();
+    opts.set_max_background_jobs(jobs);
+    opts.increase_parallelism(jobs);
+    // Parallelize a single compaction across cores (bounded by the core count,
+    // since each subcompaction is a thread). Without this a 12-core box runs
+    // every compaction single-threaded.
+    opts.set_max_subcompactions(default_subcompactions());
+    opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+}
+
+/// Background jobs for the write path: one per core, clamped to a sane range.
+/// Exposed so a test can pin the policy without a specific machine.
+pub(crate) fn background_jobs_for(cores: usize) -> i32 {
+    cores.clamp(4, 16) as i32
+}
+
+/// Subcompactions for one compaction: roughly half the cores, at least 2 so a
+/// dual-core box still parallelizes, at most 8 (RocksDB's own practical cap).
+pub(crate) fn subcompactions_for(cores: usize) -> u32 {
+    (cores / 2).clamp(2, 8) as u32
+}
+
+fn default_background_jobs() -> i32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    background_jobs_for(cores)
+}
+
+fn default_subcompactions() -> u32 {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    subcompactions_for(cores)
+}
 
 /// Tuning applied to the database *and* to every column family.
 ///
@@ -412,29 +471,22 @@ const BLOCK_CACHE_BYTES: usize = 1 << 30; // 1 GiB
 /// family* — the default CF carried RocksDB's stock 64 MiB write buffer and
 /// 32 MiB block cache regardless of what `open_with` configured. The measured
 /// symptom was a write-buffer flush every ~1s at tip instead of every ~8s.
-fn tuned_options(statistics: bool) -> Options {
+///
+/// The block cache is passed in as a shared handle rather than constructed
+/// here: a store allocates exactly *one* cache and hands the same `Arc`-backed
+/// handle to every column family. Constructing a fresh cache per CF (as this
+/// used to) both tripled the memory and fragmented it, so a lookup in the UTXO
+/// family could not benefit from blocks the undo family had already read.
+fn tuned_options(statistics: bool, block_cache: &rocksdb::Cache) -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
-    // A 512 MiB buffer means a flush every ~8s at the observed write rate
-    // rather than every second; with 4 buffers we can absorb a burst while a
-    // flush is in flight.
-    opts.set_write_buffer_size(512 << 20);
-    opts.set_max_write_buffer_number(4);
-    opts.set_target_file_size_base(256 << 20);
-    opts.set_level_zero_file_num_compaction_trigger(8);
-    opts.set_level_zero_slowdown_writes_trigger(20);
-    opts.set_level_zero_stop_writes_trigger(30);
-    opts.set_max_background_jobs(8);
-    opts.increase_parallelism(8);
-    opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-    opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+    apply_write_tuning(&mut opts);
     // A real block cache, plus a Bloom filter so a lookup for a spent outpoint
     // can reject a missing key without touching a data block. Both are
     // attached per-CF, which is the only place they take effect.
     let mut block_opts = rocksdb::BlockBasedOptions::default();
-    let cache = rocksdb::Cache::new_lru_cache(BLOCK_CACHE_BYTES);
-    block_opts.set_block_cache(&cache);
+    block_opts.set_block_cache(block_cache);
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_bloom_filter(10.0, false);
@@ -448,14 +500,15 @@ fn tuned_options(statistics: bool) -> Options {
 }
 
 impl UtxoStore {
-    /// Open in bulk-load mode (no WAL, no undo logging).
+    /// Open in bulk-load mode (no WAL, no undo logging), with the default
+    /// block cache and no recent-UTXO cache.
     pub fn open(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, false, false, false)
+        Self::open_with(path, false, false, false, DEFAULT_BLOCK_CACHE_BYTES, 0)
     }
 
     /// Open in live mode: WAL enabled (durable per-block) and undo logging.
     pub fn open_live(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, true, true, false)
+        Self::open_with(path, true, true, false, DEFAULT_BLOCK_CACHE_BYTES, 0)
     }
 
     /// Like [`UtxoStore::open`] but with RocksDB statistics enabled, which
@@ -463,7 +516,7 @@ impl UtxoStore {
     /// amount of per-operation overhead, so this is for diagnosis, not for
     /// throughput runs.
     pub fn open_statistics(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, false, false, true)
+        Self::open_with(path, false, false, true, DEFAULT_BLOCK_CACHE_BYTES, 0)
     }
 
     /// Open in bulk-load mode with the in-memory recent-UTXO cache enabled.
@@ -474,16 +527,64 @@ impl UtxoStore {
     /// byte-exact for reorgs, and mixing an in-memory view into that path adds
     /// a correctness risk for no benchmarkable benefit.
     pub fn open_cached(path: &Path, cache_bytes: usize) -> Result<Self, UtxoError> {
-        let mut store = Self::open_with(path, false, false, false)?;
-        store.recent = Some(Mutex::new(RecentUtxoCache::new(cache_bytes)));
-        Ok(store)
+        Self::open_with(
+            path,
+            false,
+            false,
+            false,
+            DEFAULT_BLOCK_CACHE_BYTES,
+            cache_bytes,
+        )
     }
 
     /// Open in bulk-load mode with both the cache and RocksDB statistics.
     pub fn open_cached_statistics(path: &Path, cache_bytes: usize) -> Result<Self, UtxoError> {
-        let mut store = Self::open_with(path, false, false, true)?;
-        store.recent = Some(Mutex::new(RecentUtxoCache::new(cache_bytes)));
-        Ok(store)
+        Self::open_with(
+            path,
+            false,
+            false,
+            true,
+            DEFAULT_BLOCK_CACHE_BYTES,
+            cache_bytes,
+        )
+    }
+
+    /// Open in bulk-load mode with an explicit block-cache size (bytes) and
+    /// recent-UTXO cache size (bytes; 0 disables it).
+    ///
+    /// This is the entry point production bulk indexing uses: it sizes both
+    /// caches from the host's available memory (see
+    /// `bidx_core::plan_cache_budget_for_host`) so a large-RAM box is not left
+    /// faulting the UTXO read path off disk.
+    pub fn open_tuned(
+        path: &Path,
+        block_cache_bytes: usize,
+        recent_cache_bytes: usize,
+    ) -> Result<Self, UtxoError> {
+        Self::open_with(
+            path,
+            false,
+            false,
+            false,
+            block_cache_bytes,
+            recent_cache_bytes,
+        )
+    }
+
+    /// [`UtxoStore::open_tuned`] with RocksDB statistics enabled.
+    pub fn open_tuned_statistics(
+        path: &Path,
+        block_cache_bytes: usize,
+        recent_cache_bytes: usize,
+    ) -> Result<Self, UtxoError> {
+        Self::open_with(
+            path,
+            false,
+            false,
+            true,
+            block_cache_bytes,
+            recent_cache_bytes,
+        )
     }
 
     fn open_with(
@@ -491,20 +592,29 @@ impl UtxoStore {
         wal: bool,
         undo_enabled: bool,
         statistics: bool,
+        block_cache_bytes: usize,
+        recent_cache_bytes: usize,
     ) -> Result<Self, UtxoError> {
+        // One block cache, shared by every column family. Allocating it here
+        // (rather than inside `tuned_options`) is what makes the sharing real:
+        // the same handle is cloned into each CF descriptor below, so a block
+        // read for the undo family can be reused by the UTXO family and the
+        // total is bounded by one budget instead of three.
+        let block_cache = rocksdb::Cache::new_lru_cache(block_cache_bytes.max(1));
+
         // DB-level options: create flags, background threads, statistics.
-        let mut opts = tuned_options(statistics);
+        let mut opts = tuned_options(statistics, &block_cache);
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
 
         // Per-CF options: this is where the storage tuning actually lands.
-        // The undo and meta families get the same table factory and cache but
-        // do not need a large write buffer, since they are tiny next to the
-        // UTXO family.
-        let utxo_cf_opts = tuned_options(statistics);
+        // The undo and meta families share the same table factory and cache;
+        // they do not need a large write buffer, since they are tiny next to
+        // the UTXO family, but they must still point at the *shared* cache.
+        let utxo_cf_opts = tuned_options(statistics, &block_cache);
         let mut aux_cf_opts = Options::default();
         let mut aux_block_opts = rocksdb::BlockBasedOptions::default();
-        aux_block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(BLOCK_CACHE_BYTES));
+        aux_block_opts.set_block_cache(&block_cache);
         aux_cf_opts.set_block_based_table_factory(&aux_block_opts);
         aux_cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
@@ -519,7 +629,11 @@ impl UtxoStore {
             db,
             path: path.to_path_buf(),
             pending: Mutex::new(FxHashMap::default()),
-            recent: None,
+            recent: if recent_cache_bytes > 0 {
+                Some(Mutex::new(RecentUtxoCache::new(recent_cache_bytes)))
+            } else {
+                None
+            },
             undo_enabled,
             statistics,
         })
@@ -883,11 +997,9 @@ impl UtxoStore {
     }
 
     fn property_or_unavailable(&self, prop: impl rocksdb::CStrLike) -> String {
-        self.db
-            .property_value(prop)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "unavailable".to_string())
+        // Delegated to a pure helper so the `None` arm (a property RocksDB
+        // declines to answer) is unit-testable without a property that errors.
+        format_property(self.db.property_value(prop).ok().flatten())
     }
 
     /// Lines from the `rocksdb.stats` blob that mention stalls, which is
@@ -926,6 +1038,13 @@ impl UtxoStore {
     pub fn disk_size_bytes(&self) -> u64 {
         bidx_core::dir_size_bytes(&self.path)
     }
+}
+
+/// Render a RocksDB property value, substituting `"unavailable"` when the
+/// property is absent. Split out from `property_or_unavailable` so the `None`
+/// arm — a property RocksDB declines to answer — is directly testable.
+fn format_property(value: Option<String>) -> String {
+    value.unwrap_or_else(|| "unavailable".to_string())
 }
 
 #[inline]
@@ -1388,7 +1507,7 @@ mod tests {
             .parse()
             .expect("numeric");
         assert_eq!(
-            cache, BLOCK_CACHE_BYTES,
+            cache, DEFAULT_BLOCK_CACHE_BYTES,
             "block cache on the default CF must be the configured size, not RocksDB's 32 MiB default"
         );
 
@@ -1400,10 +1519,74 @@ mod tests {
         // The block-cache assertion above is the load-bearing one; this one
         // documents intent for the buffer size.
         assert!(
-            BLOCK_CACHE_BYTES >= 512 << 20,
+            DEFAULT_BLOCK_CACHE_BYTES >= 512 << 20,
             "cache must dominate the write buffer for the read path"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit block-cache size must reach the column family, and it must
+    /// be *one* cache shared across CFs rather than one per CF. Both are
+    /// load-bearing: a per-CF cache silently triples memory and prevents a
+    /// block read for one family being reused by another.
+    #[test]
+    fn open_tuned_sizes_a_single_shared_block_cache() {
+        let dir = tmp_path("tunedcache");
+        // A deliberately non-default, easily-recognized size.
+        let want = 256 << 20;
+        let db = UtxoStore::open_tuned_statistics(&dir, want, 0).unwrap();
+        let props: std::collections::HashMap<String, String> =
+            db.perf_properties().into_iter().collect();
+        let cache: usize = props
+            .get("block_cache_capacity")
+            .expect("block_cache_capacity present")
+            .parse()
+            .expect("numeric");
+        assert_eq!(cache, want, "explicit block-cache size must reach the CF");
+        // No recent cache requested → none enabled.
+        assert!(db.cache_stats().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `open_tuned` with a non-zero recent-cache budget must enable the cache
+    /// and answer a spend from it, i.e. the plumbing actually reaches the
+    /// store rather than being accepted and dropped.
+    #[test]
+    fn open_tuned_enables_the_recent_cache() {
+        let dir = tmp_path("tunedrecent");
+        let db = UtxoStore::open_tuned(&dir, DEFAULT_BLOCK_CACHE_BYTES, 8 << 20).unwrap();
+        let stats = db.cache_stats().expect("recent cache enabled by budget");
+        assert_eq!(stats.budget_bytes, 8 << 20);
+        let a = [0x51u8; 32];
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 123)])
+            .unwrap();
+        let t1 = [0x52u8; 32];
+        let r = db
+            .apply_block(
+                1,
+                &[tx_row(1, 0, t1)],
+                &[inp_row(1, 0, 0, t1, a, 0, false)],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(r.cache_hits, 1, "recent spend must hit the cache");
+        assert_eq!(r.db_lookups, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The write-path tuning must scale with the core count, with a floor and a
+    /// ceiling so neither a tiny nor a huge host gets an absurd value.
+    #[test]
+    fn background_jobs_and_subcompactions_scale_and_clamp() {
+        assert_eq!(background_jobs_for(1), 4);
+        assert_eq!(background_jobs_for(8), 8);
+        assert_eq!(background_jobs_for(12), 12);
+        assert_eq!(background_jobs_for(64), 16);
+
+        assert_eq!(subcompactions_for(1), 2);
+        assert_eq!(subcompactions_for(4), 2);
+        assert_eq!(subcompactions_for(12), 6);
+        assert_eq!(subcompactions_for(64), 8);
     }
 
     /// The H2 counters must be internally consistent: every non-coinbase input
@@ -1870,5 +2053,14 @@ mod tests {
         assert!(!db2.statistics_enabled());
         assert!(db2.stall_report().is_empty());
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// `perf_properties` must report a property RocksDB declines to answer as
+    /// `"unavailable"` rather than dropping the row, so two runs can be diffed
+    /// key-for-key. The `None` arm is what this pins.
+    #[test]
+    fn format_property_reports_unavailable_for_a_missing_value() {
+        assert_eq!(format_property(Some("123".to_string())), "123");
+        assert_eq!(format_property(None), "unavailable");
     }
 }

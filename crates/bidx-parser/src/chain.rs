@@ -5,6 +5,7 @@
 
 use crate::blkfile::{discover_blk_files, BlkError, BlkFile};
 use bidx_core::{BlockLocation, ChainIndex, Hash32};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::path::Path;
 use tracing::info;
@@ -29,6 +30,31 @@ struct HeaderEntry {
     /// log-space, and exact ties in cumulative work do not decide the
     /// main chain on mainnet (we never observe equal-work competing tips).
     work: f64,
+}
+
+/// Scan a single blk file into `(hash, HeaderEntry)` pairs in file order, plus
+/// the number of records seen.
+///
+/// The `Vec` is built per file rather than merged into a shared map so the
+/// parallel map is allocation-local and lock-free; the caller merges the
+/// per-file vectors in file-id order to preserve first-seen-wins determinism.
+fn scan_file(path: &Path, file_id: u32) -> Result<(Vec<(Hash32, HeaderEntry)>, usize), BlkError> {
+    let bf = BlkFile::open(path, file_id)?;
+    let mut out: Vec<(Hash32, HeaderEntry)> = Vec::new();
+    for rec in bf.records() {
+        let rec = rec?;
+        let work = work_from_bits(rec.header.bits);
+        out.push((
+            rec.hash,
+            HeaderEntry {
+                prev: rec.header.prev_hash,
+                location: rec.location,
+                work,
+            },
+        ));
+    }
+    let count = out.len();
+    Ok((out, count))
 }
 
 /// Derive approximate proof-of-work from compact `bits`.
@@ -104,24 +130,30 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
     let files = discover_blk_files(blocks_dir)?;
     info!(files = files.len(), "header pass: scanning blk files");
 
+    // Scan the blk files in parallel. A full mainnet header pass is a
+    // single-threaded walk of the whole blk corpus and took ~25 minutes on a
+    // 12-core box; the per-file scan is embarrassingly parallel (each file is
+    // independent mmap + record walk), so only the merge below stays serial.
+    //
+    // `collect` into a `Vec` preserves input order, and `discover_blk_files`
+    // returns files sorted by id, so the merge sees records in exactly the same
+    // order the old sequential loop did. That is what keeps first-seen-wins
+    // deterministic across duplicate block hashes.
+    let scanned: Vec<(Vec<(Hash32, HeaderEntry)>, usize)> = files
+        .par_iter()
+        .map(|(file_id, path)| scan_file(path, *file_id))
+        .collect::<Result<Vec<_>, BlkError>>()?;
+
     let mut headers: FxHashMap<Hash32, HeaderEntry> = FxHashMap::default();
     let mut stats = ChainBuildStats::default();
-
-    for (file_id, path) in &files {
-        let bf = BlkFile::open(path, *file_id)?;
+    for (records, count) in scanned {
         stats.files_scanned += 1;
-        for rec in bf.records() {
-            let rec = rec?;
-            stats.total_records += 1;
-            let work = work_from_bits(rec.header.bits);
+        stats.total_records += count;
+        for (hash, entry) in records {
             // First-seen wins on hash duplicates (BIP30 duplicate coinbases
             // share txids, not block hashes, so block-hash dupes indicate
             // duplicated file content — keep the earliest copy).
-            headers.entry(rec.hash).or_insert(HeaderEntry {
-                prev: rec.header.prev_hash,
-                location: rec.location,
-                work,
-            });
+            headers.entry(hash).or_insert(entry);
         }
     }
     stats.unique_blocks = headers.len();
@@ -145,7 +177,7 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
             // `genesis_candidates`, which is built from `headers` keys, so the
             // lookup cannot miss. Guarded rather than indexed to keep the pass
             // total against a future change to how the stack is seeded.
-            // coverage-exempt: 150 — the `continue` below, unreachable as explained above.
+            // coverage-exempt: 182 — the `continue` below, unreachable as explained above.
             let Some(entry) = headers.get(&h) else {
                 continue;
             };

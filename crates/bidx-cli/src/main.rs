@@ -165,6 +165,19 @@ enum Cmd {
         /// table needs it.
         #[arg(long)]
         capture_witness: bool,
+
+        /// RocksDB block-cache size in MiB. Default: auto-sized from the
+        /// host's available memory. A larger cache is the biggest single lever
+        /// on bulk-index throughput, since every spent input is a point lookup
+        /// that otherwise reads a data block off disk.
+        #[arg(long)]
+        block_cache_mb: Option<usize>,
+
+        /// In-memory recent-UTXO cache size in MiB. Default: auto-sized from
+        /// the host's available memory. Answers spends of recently created
+        /// outputs without a RocksDB lookup. Ignored by `live` (undo) mode.
+        #[arg(long)]
+        utxo_cache_mb: Option<usize>,
     },
 
     /// Create ClickHouse schema (idempotent).
@@ -394,6 +407,8 @@ fn run(cli: Cli) -> Result<()> {
             network,
             checkpoint_file,
             capture_witness,
+            block_cache_mb,
+            utxo_cache_mb,
         } => {
             pipeline::run_parse(pipeline::ParseConfig {
                 blocks_dir,
@@ -411,6 +426,8 @@ fn run(cli: Cli) -> Result<()> {
                 orphan_blocks: None,
                 rpc_transport: None,
                 capture_witness,
+                block_cache_mb,
+                utxo_cache_mb,
             })?;
         }
 
