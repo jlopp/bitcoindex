@@ -12,7 +12,9 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 env_script="${repo_root}/.cursor/hooks/env.sh"
 
-mkdir -p -m 700 "${repo_root}/.tmp" "${repo_root}/.sandbox-cache"
+# `umask 077` (rather than `mkdir -m`) so the mode applies to *every* directory
+# `-p` creates, not just the deepest one (shellcheck SC2174).
+( umask 077 && mkdir -p "${repo_root}/.tmp" "${repo_root}/.sandbox-cache" )
 
 # Idempotent guard so retried commands aren't double-prefixed.
 prefix=". \"${env_script}\"; "

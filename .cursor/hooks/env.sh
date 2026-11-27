@@ -6,7 +6,9 @@ _bidx_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 _bidx_tmp="${_bidx_repo_root}/.tmp"
 _bidx_cache="${_bidx_repo_root}/.sandbox-cache"
 
-mkdir -p -m 700 "${_bidx_tmp}" "${_bidx_cache}"
+# `umask 077` (rather than `mkdir -m`) so the mode applies to *every* directory
+# `-p` creates, not just the deepest one (shellcheck SC2174).
+( umask 077 && mkdir -p "${_bidx_tmp}" "${_bidx_cache}" )
 
 export TMPDIR="${_bidx_tmp}"
 export TMP="${_bidx_tmp}"
