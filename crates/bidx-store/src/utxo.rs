@@ -154,7 +154,9 @@ fn max_entries_for(budget_bytes: usize) -> usize {
 
 #[inline]
 fn bucket_cap_for(entries: usize) -> usize {
-    (entries.saturating_mul(4) / 3 + 1).next_power_of_two().max(4)
+    (entries.saturating_mul(4) / 3 + 1)
+        .next_power_of_two()
+        .max(4)
 }
 
 /// A strictly memory-bounded cache of the most recently created UTXOs.
@@ -266,7 +268,10 @@ impl RecentUtxoCache {
     }
 
     fn ensure_bucket_capacity(&mut self) {
-        let target_entries = (self.len + 1).saturating_mul(2).max(4).min(self.max_entries);
+        let target_entries = (self.len + 1)
+            .saturating_mul(2)
+            .max(4)
+            .min(self.max_entries);
         let bcap = bucket_cap_for(target_entries);
         // Drop the old bucket array before allocating the new one so the two
         // large buffers do not coexist at peak RSS.
@@ -1028,10 +1033,7 @@ impl UtxoStore {
     /// memtable cap, and file-LRU bound all derive from one ceiling, so the
     /// process cannot be sized past the watchdog limit it will abort at. See
     /// `bidx_core::mem`.
-    pub fn open_planned(
-        path: &Path,
-        plan: &bidx_core::MemoryPlan,
-    ) -> Result<Self, UtxoError> {
+    pub fn open_planned(path: &Path, plan: &bidx_core::MemoryPlan) -> Result<Self, UtxoError> {
         Self::open_with(
             path,
             false,
@@ -1076,10 +1078,7 @@ impl UtxoStore {
     /// total write I/O. It is the right default only when the load is
     /// write-dominated and the store is not read heavily until it finishes,
     /// which is exactly an initial bulk index.
-    pub fn open_planned_bulk(
-        path: &Path,
-        plan: &bidx_core::MemoryPlan,
-    ) -> Result<Self, UtxoError> {
+    pub fn open_planned_bulk(path: &Path, plan: &bidx_core::MemoryPlan) -> Result<Self, UtxoError> {
         Self::open_with(
             path,
             false,
@@ -1149,8 +1148,7 @@ impl UtxoStore {
         // The undo and meta families share the same table factory and cache;
         // they do not need a large write buffer, since they are tiny next to
         // the UTXO family, but they must still point at the *shared* cache.
-        let mut utxo_cf_opts =
-            tuned_options(statistics, &block_cache, bulk, memtable_budget_bytes);
+        let mut utxo_cf_opts = tuned_options(statistics, &block_cache, bulk, memtable_budget_bytes);
         // Per-CF options are what actually take effect (see `tuned_options`), so
         // the deferral must be set here too, not only on the DB-level options.
         utxo_cf_opts.set_disable_auto_compactions(auto_compaction_disabled);
@@ -2215,7 +2213,10 @@ mod tests {
             .expect("block_cache_capacity present")
             .parse()
             .expect("numeric");
-        assert_eq!(cache, plan.block_cache_bytes, "plan block cache must reach the CF");
+        assert_eq!(
+            cache, plan.block_cache_bytes,
+            "plan block cache must reach the CF"
+        );
         assert_eq!(
             db.cache_stats().unwrap().budget_bytes,
             plan.recent_cache_bytes,
@@ -2230,7 +2231,10 @@ mod tests {
             ..plan
         };
         let db2 = UtxoStore::open_planned(&dir2, &zero).unwrap();
-        assert!(db2.cache_stats().is_none(), "zero recent cache must disable it");
+        assert!(
+            db2.cache_stats().is_none(),
+            "zero recent cache must disable it"
+        );
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
@@ -2747,7 +2751,10 @@ mod tests {
         assert_eq!(c.entries[c.head as usize].val.value_sat, 2);
         // Inserting `k3` at capacity=2 must evict `k1` (still `head`), keeping `k2`.
         c.insert(k3, v1);
-        assert!(c.remove(&k1).is_none(), "refreshed k1 remained oldest and was evicted");
+        assert!(
+            c.remove(&k1).is_none(),
+            "refreshed k1 remained oldest and was evicted"
+        );
         assert_eq!(c.remove(&k2).unwrap().value_sat, 1);
         assert_eq!(c.remove(&k3).unwrap().value_sat, 1);
     }
@@ -2811,7 +2818,11 @@ mod tests {
         assert_eq!(c.len(), 16);
         // Only 17 distinct slots were ever needed simultaneously (16 resident +
         // 1 transient churn slot recycled 20,000 times via `free_head`).
-        assert_eq!(c.entries.len(), 17, "spent slots must be recycled via free_head");
+        assert_eq!(
+            c.entries.len(),
+            17,
+            "spent slots must be recycled via free_head"
+        );
         assert!(c.entries.capacity() <= max_entries);
         assert!(
             c.entries.capacity() * std::mem::size_of::<CacheEntry>()
@@ -2911,7 +2922,10 @@ mod tests {
             let k = make_k(id);
             c.insert(k, make_v(id));
             let (oldest_k, _) = model.pop_front().unwrap();
-            assert!(c.remove(&oldest_k).is_none(), "FIFO order broken after compaction");
+            assert!(
+                c.remove(&oldest_k).is_none(),
+                "FIFO order broken after compaction"
+            );
             model.push_back((k, id));
         }
         for (k, expected_val) in model {

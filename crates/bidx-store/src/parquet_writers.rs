@@ -311,7 +311,13 @@ impl ParquetSink {
     pub fn create(dir: &Path, part: u32, cfg: SinkConfig) -> Result<Self, SinkError> {
         let bs = cfg.batch_size;
         let witnesses_w = if cfg.capture_witness {
-            Some(create_writer(dir, "witnesses", part, witnesses_schema(), bs)?)
+            Some(create_writer(
+                dir,
+                "witnesses",
+                part,
+                witnesses_schema(),
+                bs,
+            )?)
         } else {
             None
         };

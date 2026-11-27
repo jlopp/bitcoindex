@@ -33,28 +33,23 @@ pub struct BlkRecord {
     pub header_raw: [u8; BLOCK_HEADER_LEN],
 }
 
-/// Memory-mapped view over a single blkNNNNN.dat file.
-///
-/// Supports Bitcoin Core v28+ **blocks XOR obfuscation**: if `xor.dat` is
-/// present next to the blk file, the payload is XOR-decoded at open time
-/// into an owned buffer (one bulk decode per file). Otherwise we keep the
-/// zero-copy mmap view.
-///
+/// Backing storage for a [`BlkFile`].
 enum BlkData {
-    /// Zero-copy mmap view for plain `blk*.dat` files, trimmed at `data_end`.
+    /// Zero-copy mmap view for plain `blk*.dat` files, trimmed at `data_end`
+    /// and hinted with `POSIX_MADV_SEQUENTIAL` so the kernel prefetches ahead.
     Mmap { mmap: Mmap, data_end: usize },
-    /// Owned plaintext payload for XOR-obfuscated `blk*.dat` files. Dropping
-    /// the raw `Mmap` once decoding completes halves resident memory per cached
-    /// file (~128 MiB instead of 128 MiB `RssAnon` + 128 MiB `RssFile`).
+    /// Owned plaintext payload for XOR-obfuscated `blk*.dat` files, read
+    /// sequentially into a single `Vec<u8>` and XOR-decoded in place (avoiding
+    /// `mmap` page-fault storms, double-buffering, and `munmap` TLB shootdowns).
     Decoded(Vec<u8>),
 }
 
 /// View over a single `blkNNNNN.dat` file.
 ///
 /// If a sibling `xor.dat` holds a non-zero 8-byte key (Bitcoin Core v28+
-/// default `-blocksxor=1`), the meaningful prefix is decoded at open time
-/// into an owned buffer and the raw `mmap` is dropped immediately. Otherwise
-/// we keep the zero-copy mmap view.
+/// default `-blocksxor=1`), the file is read sequentially into a single buffer,
+/// trimmed to the last complete record boundary, and XOR-decoded in place.
+/// Otherwise we keep a zero-copy `Mmap` view hinted for sequential readahead.
 ///
 /// Bitcoin Core preallocates blk files to 128 MiB with trailing zero
 /// padding; we trim at open time so iterators see "no more records" as
@@ -66,51 +61,66 @@ pub struct BlkFile {
 }
 
 impl BlkFile {
-    /// Open the blk file following Bitcoin Core's blk*.dat convention.
+    /// Open the blk file following Bitcoin Core's `blk*.dat` convention,
+    /// probing the parent directory's `xor.dat` automatically.
+    ///
+    /// Hot-path callers that open many files from the same directory should
+    /// read the key once via [`read_xor_key_from_dir`] and call
+    /// [`BlkFile::open_with_key`] to avoid repeating `xor.dat` syscalls.
     pub fn open(path: &Path, file_id: u32) -> Result<Self, BlkError> {
-        let file = File::open(path).map_err(|e| BlkError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        // SAFETY: we never mutate through the map; caller must ensure the
-        // file isn't concurrently truncated (fine for a stopped/quiet node,
-        // or a copied snapshot).
-        // coverage-exempt: the mmap only fails on an OS-level fault (out of
-        // address space, or the file truncated between open and map) that cannot
-        // be forced portably; the File::open error above already covers the
-        // "missing/unreadable path" case the tests exercise.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| BlkError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        let xor_key = read_xor_key(path);
-        // Determine where the meaningful data ends.
-        //
-        // Bitcoin Core preallocates blk files with trailing zero padding, and
-        // XOR decode turns raw zeros into the key pattern, so the padding must
-        // be trimmed against the RAW view before decoding. But a file is not
-        // always padded: when the node is still writing, or the last record
-        // happens to end at EOF, the final record can itself end in zero bytes
-        // (a transaction whose locktime is 0). Trimming on "last non-zero byte"
-        // alone then eats real data, and the last record's declared length
-        // overruns the trimmed slice — a spurious `bad record len`.
-        //
-        // So walk the records instead. That is exact for both padded and
-        // unpadded files, and it also yields a correct length for XOR files
-        // (where the "trailing zeros" heuristic cannot work at all, because
-        // every padding byte decodes to a non-zero key byte).
-        let data_end = record_walk_end(&mmap, xor_key.as_ref());
-        let backing = match &xor_key {
+        Self::open_with_key(path, file_id, read_xor_key(path))
+    }
+
+    /// Open the blk file using a pre-resolved optional 8-byte `xor.dat` key.
+    pub fn open_with_key(
+        path: &Path,
+        file_id: u32,
+        xor_key: Option<[u8; 8]>,
+    ) -> Result<Self, BlkError> {
+        let backing = match xor_key {
             Some(key) => {
-                // Decode only the live prefix (`..data_end`) so trailing
-                // preallocated zero padding is neither faulted nor allocated,
-                // then drop `mmap` immediately so its file-backed pages do not
-                // stay resident alongside `decoded`.
-                let decoded = xor_decode(&mmap[..data_end], key);
-                drop(mmap);
-                BlkData::Decoded(decoded)
+                // Sequential kernel `read` into a single owned buffer, followed
+                // by record-boundary trim and in-place 8-byte-chunk XOR decode.
+                // Compared to `Mmap::map` + allocating a second 128 MiB Vec +
+                // `drop(mmap)`, this halves peak per-open allocation, avoids
+                // 32,768 minor page faults per file, and eliminates cross-core
+                // `munmap` TLB shootdown IPIs across worker threads.
+                let mut buf = std::fs::read(path).map_err(|source| BlkError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                let data_end = record_walk_end(&buf, Some(&key));
+                buf.truncate(data_end);
+                // Release preallocated trailing megabytes on partially filled
+                // tip files while avoiding realloc copies on ordinary files
+                // whose trailing padding is only a few kilobytes.
+                if buf.capacity().saturating_sub(buf.len()) >= (1 << 20) {
+                    buf.shrink_to_fit();
+                }
+                xor_decode_in_place(&mut buf, &key);
+                BlkData::Decoded(buf)
             }
-            None => BlkData::Mmap { mmap, data_end },
+            None => {
+                let file = File::open(path).map_err(|source| BlkError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                // SAFETY: we never mutate through the map; caller must ensure
+                // the file isn't concurrently truncated (fine for a stopped or
+                // quiet node, or a copied snapshot).
+                // coverage-exempt: the mmap only fails on an OS-level fault
+                // (out of address space, or file truncated between open and
+                // map) that cannot be forced portably; `File::open` above
+                // covers missing/unreadable paths.
+                let mmap = unsafe { Mmap::map(&file) }.map_err(|source| BlkError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                #[cfg(unix)]
+                let _ = mmap.advise(memmap2::Advice::Sequential);
+                let data_end = record_walk_end(&mmap, None);
+                BlkData::Mmap { mmap, data_end }
+            }
         };
         Ok(BlkFile {
             file_id,
@@ -147,22 +157,144 @@ impl BlkFile {
         }
     }
 
-    /// Read the full payload (header + txs) for a known location.
-    /// Returns bytes starting at the 80-byte header.
-    pub fn block_bytes(&self, loc: &BlockLocation) -> Result<&[u8], BlkError> {
+    /// Validate `loc` against this file's trimmed length and return the
+    /// `(start, end)` byte range of its block payload (starting at the 80-byte
+    /// header). Used by zero-copy callers that hold `Arc<BlkFile>` alongside
+    /// the slice bounds instead of copying each block into a separate buffer.
+    #[inline]
+    pub fn block_range(&self, loc: &BlockLocation) -> Result<(usize, usize), BlkError> {
         let start = loc.data_offset() as usize;
-        let len = loc.record_len as usize - 8;
-        let end = start + len;
-        let buf = self.data();
-        if end > buf.len() {
-            return Err(BlkError::Corrupt {
+        let buf_len = self.len();
+        let end = (loc.record_len as usize)
+            .checked_sub(8)
+            .and_then(|len| start.checked_add(len));
+        match end {
+            Some(end) if end <= buf_len => Ok((start, end)),
+            _ => Err(BlkError::Corrupt {
                 file_id: self.file_id,
                 offset: loc.offset,
-                reason: format!("record overruns file: end {end}, file len {}", buf.len()),
-            });
+                reason: format!(
+                    "record overruns file: offset {}, record_len {}, file len {buf_len}",
+                    loc.offset, loc.record_len
+                ),
+            }),
         }
-        Ok(&buf[start..end])
     }
+
+    /// Read the full payload (header + txs) for a known location.
+    /// Returns bytes starting at the 80-byte header.
+    #[inline]
+    pub fn block_bytes(&self, loc: &BlockLocation) -> Result<&[u8], BlkError> {
+        let (start, end) = self.block_range(loc)?;
+        Ok(&self.data()[start..end])
+    }
+}
+
+fn open_with_len(path: &Path) -> std::io::Result<(File, u64)> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    Ok((file, len))
+}
+
+#[cfg(unix)]
+#[inline]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(mut file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
+}
+
+/// Scan only the 88-byte record prefixes (`magic[4] + len[4] + header[80]`) of
+/// `path`, skipping block transaction payloads via positional `pread`s.
+///
+/// Matches [`BlkFile::open_with_key`] + [`BlkFile::records`] semantics on
+/// preallocated zero padding, partial trailing records, XOR obfuscation, and
+/// corrupt initial records without reading, faulting, or XOR-decoding the
+/// multi-megabyte transaction bodies (~680 GiB on mainnet vs ~79 MiB of
+/// record headers).
+pub fn scan_blk_headers(
+    path: &Path,
+    file_id: u32,
+    xor_key: Option<[u8; 8]>,
+    mut on_record: impl FnMut(BlkRecord),
+) -> Result<(), BlkError> {
+    let (file, file_len) = open_with_len(path).map_err(|source| BlkError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    let mut pos = 0u64;
+    let mut raw = [0u8; 8 + BLOCK_HEADER_LEN];
+    while pos + 8 <= file_len {
+        let rem = file_len - pos;
+        let want = rem.min((8 + BLOCK_HEADER_LEN) as u64) as usize;
+        // coverage-exempt: `pos + want <= file_len` holds by construction, so
+        // `read_exact_at` only fails on an OS-level mid-scan I/O fault or
+        // concurrent external file truncation (missing/unreadable files are
+        // covered via `open_with_len` above).
+        read_exact_at(&file, &mut raw[..want], pos).map_err(|source| BlkError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        let raw_first_zero = raw[0] == 0;
+        if let Some(k) = &xor_key {
+            let base = (pos as usize) & 7;
+            for (i, b) in raw[..want].iter_mut().enumerate() {
+                *b ^= k[(base + i) & 7];
+            }
+        }
+
+        let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as u64;
+        let bad_magic = !is_known_network_magic(magic);
+        let bad_len = len < BLOCK_HEADER_LEN as u64 || len > rem - 8;
+        if bad_magic || bad_len {
+            // At offset 0, distinguish preallocated zero padding (raw zeros on
+            // disk or XOR-streamed zeros that decode to `magic == 0`) from a
+            // genuinely malformed file so a wrong `--blocks-dir` still surfaces
+            // "bad magic" / "bad record len". After at least one valid record
+            // (`pos > 0`), any non-magic or truncated tail is preallocated
+            // padding or an incomplete write and ends the scan cleanly.
+            if pos == 0 && !raw_first_zero && magic != 0 {
+                let reason = if bad_magic {
+                    format!("bad magic 0x{magic:08x}")
+                } else {
+                    format!("bad record len {len}")
+                };
+                return Err(BlkError::Corrupt {
+                    file_id,
+                    offset: 0,
+                    reason,
+                });
+            }
+            break;
+        }
+
+        let mut header_raw = [0u8; BLOCK_HEADER_LEN];
+        header_raw.copy_from_slice(&raw[8..8 + BLOCK_HEADER_LEN]);
+        let header = BlockHeader::parse(&header_raw);
+        let hash = header.hash(&header_raw);
+        let location = BlockLocation {
+            file_id,
+            offset: pos,
+            record_len: (len + 8) as u32,
+        };
+        on_record(BlkRecord {
+            location,
+            header,
+            hash,
+            header_raw,
+        });
+        pos += 8 + len;
+    }
+    Ok(())
 }
 
 /// Find where the meaningful data ends by walking the record framing.
@@ -227,44 +359,41 @@ fn record_walk_end(raw: &[u8], key: Option<&[u8; 8]>) -> usize {
     end
 }
 
-/// Read the 8-byte XOR key from `xor.dat` in the same directory as
-/// `blk_path`, if present and well-formed.
-fn read_xor_key(blk_path: &Path) -> Option<[u8; 8]> {
-    let dir = blk_path.parent()?;
-    let p = dir.join("xor.dat");
-    let raw = std::fs::read(&p).ok()?;
-    if raw.len() != 8 {
-        return None;
-    }
-    let mut k = [0u8; 8];
-    k.copy_from_slice(&raw);
+/// Read the 8-byte XOR key from `<blocks_dir>/xor.dat`, if present and
+/// well-formed (8 bytes, not all-zero).
+///
+/// Callers that open or scan many `blk*.dat` files in the same directory
+/// should call this once and pass the result to [`BlkFile::open_with_key`] or
+/// [`scan_blk_headers`] instead of re-reading `xor.dat` per file.
+pub fn read_xor_key_from_dir(blocks_dir: &Path) -> Option<[u8; 8]> {
+    let raw = std::fs::read(blocks_dir.join("xor.dat")).ok()?;
+    let k: [u8; 8] = raw.try_into().ok()?;
     // An all-zero key would be a no-op; treat as "no obfuscation".
-    if k == [0u8; 8] {
-        None
-    } else {
-        Some(k)
-    }
+    (k != [0u8; 8]).then_some(k)
 }
 
-/// XOR-decode `buf` against an 8-byte repeating key.
-/// Perf note: 8 bytes at a time using a u64 keeps this ~memory-bandwidth
-/// bound, on par with the mmap page-in cost the caller is replacing.
-fn xor_decode(buf: &[u8], key: &[u8; 8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(buf.len());
-    let mut key8 = [0u8; 8];
-    key8.copy_from_slice(key);
-    let k64 = u64::from_le_bytes(key8);
-    let mut chunks = buf.chunks_exact(8);
-    for c in &mut chunks {
-        let v = u64::from_le_bytes(c.try_into().unwrap());
-        out.extend_from_slice(&(v ^ k64).to_le_bytes());
+/// Read the 8-byte XOR key from `xor.dat` in the same directory as `blk_path`.
+#[inline]
+fn read_xor_key(blk_path: &Path) -> Option<[u8; 8]> {
+    blk_path.parent().and_then(read_xor_key_from_dir)
+}
+
+/// XOR-decode `buf` in place against an 8-byte repeating key.
+///
+/// Processes fixed `[u8; 8]` chunks without per-chunk bounds checks or buffer
+/// growth so LLVM auto-vectorizes the hot loop into wide SIMD XORs in L1/L2
+/// cache with zero extra heap allocation.
+fn xor_decode_in_place(buf: &mut [u8], key: &[u8; 8]) {
+    let k64 = u64::from_le_bytes(*key);
+    let (chunks, rem) = buf.as_chunks_mut::<8>();
+    for c in chunks {
+        *c = (u64::from_le_bytes(*c) ^ k64).to_le_bytes();
     }
-    let rem = chunks.remainder();
-    let start = buf.len() - rem.len();
-    for (i, b) in rem.iter().enumerate() {
-        out.push(b ^ key8[(start + i) % 8]);
+    // `chunks` consumed an exact multiple of 8 bytes, so `rem` starts at
+    // keystream index 0.
+    for (i, b) in rem.iter_mut().enumerate() {
+        *b ^= key[i];
     }
-    out
 }
 
 pub struct BlkRecordIter<'a> {
@@ -389,24 +518,26 @@ mod tests {
     fn xor_decode_roundtrip_and_partial_tail() {
         let key: [u8; 8] = [0x99, 0x73, 0xa9, 0x54, 0x4c, 0x10, 0x97, 0x0c];
         let plaintext: Vec<u8> = (0..100u8).collect();
-        let obfuscated: Vec<u8> = plaintext
+        let mut buf: Vec<u8> = plaintext
             .iter()
             .enumerate()
             .map(|(i, b)| b ^ key[i % 8])
             .collect();
-        let back = xor_decode(&obfuscated, &key);
-        assert_eq!(back, plaintext);
-        // Empty input → empty output (no panics on chunks_exact(8)=0).
-        assert!(xor_decode(&[], &key).is_empty());
+        xor_decode_in_place(&mut buf, &key);
+        assert_eq!(buf, plaintext);
+        // Empty input → empty output (no panics on as_chunks_mut::<8>()).
+        let mut empty: Vec<u8> = Vec::new();
+        xor_decode_in_place(&mut empty, &key);
+        assert!(empty.is_empty());
         // Length not divisible by 8 exercises the remainder path.
         let tiny = vec![0xAAu8; 5];
-        let xored: Vec<u8> = tiny
+        let mut xored: Vec<u8> = tiny
             .iter()
             .enumerate()
             .map(|(i, b)| b ^ key[i % 8])
             .collect();
-        let back = xor_decode(&xored, &key);
-        assert_eq!(back, tiny);
+        xor_decode_in_place(&mut xored, &key);
+        assert_eq!(xored, tiny);
     }
 
     /// Build `n` synthetic records of `payload_len` bytes each, ending in a
@@ -818,19 +949,22 @@ mod tests {
 
     #[test]
     fn xor_decode_handles_non_multiple_of_eight_lengths() {
-        // `chunks_exact(8)` leaves a remainder; the tail must be XORed with the
-        // correct keystream offset, so a round-trip of a 13-byte buffer must be
-        // exact.
+        // `as_chunks_mut::<8>()` leaves a remainder; the tail must be XORed
+        // with the correct keystream offset, so a round-trip of a 13-byte
+        // buffer must be exact.
         let key = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let plain: Vec<u8> = (0..13u8).collect();
-        let enc: Vec<u8> = plain
+        let mut enc: Vec<u8> = plain
             .iter()
             .enumerate()
             .map(|(i, b)| b ^ key[i % 8])
             .collect();
-        assert_eq!(xor_decode(&enc, &key), plain);
+        xor_decode_in_place(&mut enc, &key);
+        assert_eq!(enc, plain);
         // Empty input round-trips to empty.
-        assert!(xor_decode(&[], &key).is_empty());
+        let mut empty: Vec<u8> = Vec::new();
+        xor_decode_in_place(&mut empty, &key);
+        assert!(empty.is_empty());
     }
 
     #[test]
@@ -915,6 +1049,182 @@ mod tests {
         assert_eq!(bf.data(), plain.as_slice());
         let count = bf.records().filter(|r| r.is_ok()).count();
         assert_eq!(count, 2);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn open_with_key_shrinks_large_preallocated_padding_and_reports_io_error() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bidx-blk-shrink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let key = [0x21u8, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98];
+        fs::write(tmp.join("xor.dat"), key).unwrap();
+        assert_eq!(read_xor_key_from_dir(&tmp), Some(key));
+
+        // 1.5 MiB of preallocated trailing padding triggers `shrink_to_fit()`
+        // (>= 1 MiB unused tail) so partially filled tip files release excess
+        // capacity.
+        let plain = synth_records(2, 100, false);
+        let mut padded = plain.clone();
+        padded.resize(plain.len() + (3 << 19), 0);
+        let obf: Vec<u8> = padded
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i & 7])
+            .collect();
+        let path = tmp.join("blk00000.dat");
+        fs::write(&path, &obf).unwrap();
+
+        let bf = BlkFile::open_with_key(&path, 0, Some(key)).unwrap();
+        assert_eq!(bf.data(), plain.as_slice());
+        match &bf.backing {
+            BlkData::Decoded(v) => assert!(
+                v.capacity() < (1 << 20),
+                "trimmed buffer must release >1 MiB preallocated tail, got cap {}",
+                v.capacity()
+            ),
+            BlkData::Mmap { .. } => panic!("expected Decoded backing"),
+        }
+
+        // Missing path under Some(key) surfaces Io carrying the path.
+        let missing = tmp.join("blk99999.dat");
+        match BlkFile::open_with_key(&missing, 99999, Some(key)) {
+            Err(BlkError::Io { path: p, .. }) => assert_eq!(p, missing),
+            Err(e) => panic!("expected Io error, got {e:?}"),
+            Ok(_) => panic!("expected Io error, got Ok"),
+        }
+
+        // `block_range` rejects underflow (`record_len < 8`) without panicking.
+        let bad_underflow = BlockLocation {
+            file_id: 0,
+            offset: 0,
+            record_len: 4,
+        };
+        assert!(matches!(
+            bf.block_range(&bad_underflow),
+            Err(BlkError::Corrupt { .. })
+        ));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_blk_headers_matches_full_open_across_plain_xor_padded_and_corrupt() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bidx-scan-hdrs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Non-8-aligned payload length (113 bytes -> record size 121) ensures
+        // subsequent record offsets land on non-zero `pos & 7` XOR alignments.
+        let plain = synth_records(5, 113, true);
+        let mut padded = plain.clone();
+        padded.extend_from_slice(&[0u8; 512]);
+        let plain_path = tmp.join("blk00000.dat");
+        fs::write(&plain_path, &padded).unwrap();
+
+        let bf = BlkFile::open_with_key(&plain_path, 0, None).unwrap();
+        let expected: Vec<(u32, u64, u32, bidx_core::Hash32)> = bf
+            .records()
+            .map(|r| {
+                let r = r.unwrap();
+                (
+                    r.location.file_id,
+                    r.location.offset,
+                    r.location.record_len,
+                    r.hash,
+                )
+            })
+            .collect();
+
+        let mut scanned = Vec::new();
+        scan_blk_headers(&plain_path, 0, None, |r| {
+            scanned.push((
+                r.location.file_id,
+                r.location.offset,
+                r.location.record_len,
+                r.hash,
+            ));
+        })
+        .unwrap();
+        assert_eq!(scanned, expected);
+
+        // Same records under XOR obfuscation + XOR-streamed padding.
+        let key = [0xAAu8, 0x55, 0xF0, 0x0F, 0x12, 0x34, 0x56, 0x78];
+        let obf: Vec<u8> = padded
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i & 7])
+            .collect();
+        let xor_path = tmp.join("blk00001.dat");
+        fs::write(&xor_path, &obf).unwrap();
+
+        let mut scanned_xor = Vec::new();
+        scan_blk_headers(&xor_path, 1, Some(key), |r| {
+            scanned_xor.push((
+                0, // normalize file_id to compare against file 0
+                r.location.offset,
+                r.location.record_len,
+                r.hash,
+            ));
+        })
+        .unwrap();
+        assert_eq!(scanned_xor, expected);
+
+        // Trailing <8-byte stub after valid record stops cleanly.
+        let mut stub = synth_records(1, 80, false);
+        stub.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        let stub_path = tmp.join("blk00002.dat");
+        fs::write(&stub_path, &stub).unwrap();
+        let mut count = 0usize;
+        scan_blk_headers(&stub_path, 2, None, |_| count += 1).unwrap();
+        assert_eq!(count, 1);
+
+        // Empty file (<8 bytes) and pure zero padding yield 0 records cleanly,
+        // both plain and XOR-streamed.
+        let zero_path = tmp.join("blk00003.dat");
+        fs::write(&zero_path, [0u8; 64]).unwrap();
+        count = 0;
+        scan_blk_headers(&zero_path, 3, None, |_| count += 1).unwrap();
+        assert_eq!(count, 0);
+        let xor_zero: Vec<u8> = (0..64).map(|i| key[i & 7]).collect();
+        fs::write(&zero_path, &xor_zero).unwrap();
+        scan_blk_headers(&zero_path, 3, Some(key), |_| count += 1).unwrap();
+        assert_eq!(count, 0);
+
+        // Corrupt magic at offset 0 returns Corrupt("bad magic ...").
+        let bad_magic_path = tmp.join("blk00004.dat");
+        let mut bad_magic = Vec::new();
+        bad_magic.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        bad_magic.extend_from_slice(&80u32.to_le_bytes());
+        bad_magic.extend_from_slice(&[1u8; 80]);
+        fs::write(&bad_magic_path, &bad_magic).unwrap();
+        match scan_blk_headers(&bad_magic_path, 4, None, |_| {}) {
+            Err(BlkError::Corrupt { reason, .. }) => assert!(reason.contains("bad magic")),
+            other => panic!("expected Corrupt bad magic, got {other:?}"),
+        }
+
+        // Corrupt record len at offset 0 returns Corrupt("bad record len ...").
+        let bad_len_path = tmp.join("blk00005.dat");
+        let mut bad_len = Vec::new();
+        bad_len.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        bad_len.extend_from_slice(&12u32.to_le_bytes());
+        bad_len.extend_from_slice(&[1u8; 80]);
+        fs::write(&bad_len_path, &bad_len).unwrap();
+        match scan_blk_headers(&bad_len_path, 5, None, |_| {}) {
+            Err(BlkError::Corrupt { reason, .. }) => assert!(reason.contains("bad record len")),
+            other => panic!("expected Corrupt bad record len, got {other:?}"),
+        }
+
+        // Missing file returns Io carrying the path.
+        let missing = tmp.join("blk99998.dat");
+        match scan_blk_headers(&missing, 99998, None, |_| {}) {
+            Err(BlkError::Io { path: p, .. }) => assert_eq!(p, missing),
+            other => panic!("expected Io error, got {other:?}"),
+        }
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

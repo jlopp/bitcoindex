@@ -1162,4 +1162,62 @@ bugs caused it:
   (`parquet_writers.rs`), and unpinned RocksDB index/filter caching +
   budget-scaled `write_buffer_size` (`utxo.rs`).**
 
+---
+
+## 18. Block-file disk I/O & memory-bandwidth optimizations
+
+Reading and decoding `blk*.dat` files across ~900,000 mainnet blocks (~680 GiB
+across ~4,800 × 128 MiB files) had five major avoidable I/O, syscall, and
+memory-copy overheads:
+
+1. **Header-only `pread` scanner (`scan_blk_headers`) for `build_chain_index`
+   (`crates/bidx-parser/src/blkfile.rs`, `chain.rs`).**
+   Previously `chain::scan_file` called `BlkFile::open` on every `blkNNNNN.dat`
+   file, faulting and XOR-decoding all ~680 GiB of multi-megabyte transaction
+   bodies into 128 MiB `Vec<u8>` buffers just to inspect the 88-byte record
+   prefix (`magic[4] + len[4] + header[80]`). `scan_blk_headers` walks record
+   offsets using `FileExt::read_exact_at` (`pread64`) into an 88-byte stack
+   buffer, XOR-decoding only those 88 bytes when obfuscated and jumping directly
+   across each block payload (`pos += 8 + len`) — shrinking logical header-pass
+   reads from ~680 GiB to ~79 MiB (~8,600× less XOR work, zero 128 MiB heap
+   allocations).
+2. **Zero-copy `CachedBlock` handle (`Deref<Target = [u8]>`) in
+   `ThreadFileCache` (`crates/bidx-cli/src/pipeline.rs`, `bench/mod.rs`).**
+   `ThreadFileCache::block_bytes` previously returned `Arc::from(slice)`
+   (`Arc<[u8]>`), allocating and `memcpy`ing every 1–4 MiB block (~680 GiB
+   total) even though `Arc<BlkFile>` was already reference-counted. `CachedBlock`
+   holds `(Arc<BlkFile>, start, end)` validated via `BlkFile::block_range` and
+   derefs directly to `&[u8]` with zero allocation and zero copy, and workers
+   drop `CachedBlock` immediately after `parse_block_full` before `tx.send`.
+3. **Per-`file_id` singleflight loading + lock-free MRU fast path in
+   `ThreadFileCache` (`crates/bidx-cli/src/pipeline.rs`).**
+   - *Singleflight:* When 12 workers simultaneously cross into a cold
+     `blkNNNNN.dat`, an `inflight` per-`file_id` `OnceLock` ensures only one
+     worker reads and XOR-decodes the 128 MiB file while sibling workers wait on
+     the same `OnceLock`, eliminating the 12× thundering-herd I/O and 1.5 GiB
+     transient buffer spike.
+   - *Lock-free MRU hit:* `CacheInner::mru_file_id` (`AtomicU32`) short-circuits
+     `touch()` when a cache hit is already at the MRU tail (~99.5% of sequential
+     block reads), avoiding `lru.lock()` and `VecDeque` linear scans on every
+     block.
+4. **Sequential `std::fs::read` + in-place SIMD-friendly XOR decode for
+   `xor.dat` files, and `POSIX_MADV_SEQUENTIAL` for plain `Mmap` files
+   (`crates/bidx-parser/src/blkfile.rs`).**
+   - When `xor.dat` is active, `BlkFile::open_with_key` reads sequentially into
+     a single owned `Vec<u8>`, trims trailing preallocated padding via
+     `record_walk_end` (`shrink_to_fit` when \(\ge 1\text{ MiB}\)), and decodes
+     in place via `as_chunks_mut::<8>()` — avoiding `mmap` setup, 32,768 minor
+     page faults per file, a second 128 MiB allocation, and cross-core `munmap`
+     TLB shootdown IPIs.
+   - When `xor.dat` is absent, `Mmap::map` immediately issues
+     `mmap.advise(memmap2::Advice::Sequential)` so the kernel prefetches ahead
+     at full NVMe sequential bandwidth.
+5. **Directory-cached `xor.dat` key (`read_xor_key_from_dir` +
+   `BlkFile::open_with_key`, `blkfile.rs`, `chain.rs`, `pipeline.rs`).**
+   Both `build_chain_index` and `ThreadFileCache::with_capacity` resolve
+   `<blocks_dir>/xor.dat` once at startup and pass the cached `Option<[u8; 8]>`
+   to every file scan/open, eliminating ~38,000 redundant `xor.dat` syscalls
+   across a full chain run.
+
+
 

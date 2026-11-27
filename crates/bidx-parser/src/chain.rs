@@ -3,7 +3,7 @@
 //! accumulated work (approximated by longest connected chain — with full
 //! headers available we compute real cumulative work from `bits`).
 
-use crate::blkfile::{discover_blk_files, BlkError, BlkFile};
+use crate::blkfile::{discover_blk_files, read_xor_key_from_dir, scan_blk_headers, BlkError};
 use bidx_core::{BlockLocation, ChainIndex, Hash32};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -32,17 +32,19 @@ struct HeaderEntry {
     work: f64,
 }
 
-/// Scan a single blk file into `(hash, HeaderEntry)` pairs in file order, plus
-/// the number of records seen.
+/// Scan only the 88-byte record prefixes of a single blk file into
+/// `(hash, HeaderEntry)` pairs in file order, plus the number of records seen.
 ///
-/// The `Vec` is built per file rather than merged into a shared map so the
-/// parallel map is allocation-local and lock-free; the caller merges the
-/// per-file vectors in file-id order to preserve first-seen-wins determinism.
-fn scan_file(path: &Path, file_id: u32) -> Result<(Vec<(Hash32, HeaderEntry)>, usize), BlkError> {
-    let bf = BlkFile::open(path, file_id)?;
+/// Uses [`scan_blk_headers`] (`pread` over record boundaries) rather than
+/// [`crate::BlkFile::open`] so the header pass reads ~79 MiB of 88-byte header
+/// prefixes instead of faulting and XOR-decoding ~680 GiB of full block bodies.
+fn scan_file(
+    path: &Path,
+    file_id: u32,
+    xor_key: Option<[u8; 8]>,
+) -> Result<(Vec<(Hash32, HeaderEntry)>, usize), BlkError> {
     let mut out: Vec<(Hash32, HeaderEntry)> = Vec::new();
-    for rec in bf.records() {
-        let rec = rec?;
+    scan_blk_headers(path, file_id, xor_key, |rec| {
         let work = work_from_bits(rec.header.bits);
         out.push((
             rec.hash,
@@ -52,7 +54,7 @@ fn scan_file(path: &Path, file_id: u32) -> Result<(Vec<(Hash32, HeaderEntry)>, u
                 work,
             },
         ));
-    }
+    })?;
     let count = out.len();
     Ok((out, count))
 }
@@ -128,20 +130,20 @@ fn resolve_cum(
 /// stale branches (post-BIP30 fixed duplicates etc.) are handled correctly.
 pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildStats), BlkError> {
     let files = discover_blk_files(blocks_dir)?;
-    info!(files = files.len(), "header pass: scanning blk files");
+    let xor_key = read_xor_key_from_dir(blocks_dir);
+    info!(
+        files = files.len(),
+        xor = xor_key.is_some(),
+        "header pass: scanning blk headers"
+    );
 
-    // Scan the blk files in parallel. A full mainnet header pass is a
-    // single-threaded walk of the whole blk corpus and took ~25 minutes on a
-    // 12-core box; the per-file scan is embarrassingly parallel (each file is
-    // independent mmap + record walk), so only the merge below stays serial.
-    //
+    // Scan only the 88-byte record prefixes across all blk files in parallel.
     // `collect` into a `Vec` preserves input order, and `discover_blk_files`
-    // returns files sorted by id, so the merge sees records in exactly the same
-    // order the old sequential loop did. That is what keeps first-seen-wins
-    // deterministic across duplicate block hashes.
+    // returns files sorted by id, so the merge sees records in deterministic
+    // file-id order and preserves first-seen-wins on duplicate block hashes.
     let scanned: Vec<(Vec<(Hash32, HeaderEntry)>, usize)> = files
         .par_iter()
-        .map(|(file_id, path)| scan_file(path, *file_id))
+        .map(|(file_id, path)| scan_file(path, *file_id, xor_key))
         .collect::<Result<Vec<_>, BlkError>>()?;
 
     let mut headers: FxHashMap<Hash32, HeaderEntry> = FxHashMap::default();
@@ -177,7 +179,7 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
             // `genesis_candidates`, which is built from `headers` keys, so the
             // lookup cannot miss. Guarded rather than indexed to keep the pass
             // total against a future change to how the stack is seeded.
-            // coverage-exempt: 182 — the `continue` below, unreachable as explained above.
+            // coverage-exempt — the `continue` below, unreachable as explained above.
             let Some(entry) = headers.get(&h) else {
                 continue;
             };
@@ -544,5 +546,46 @@ mod tests {
 
         // A hash that is not present at all also yields None.
         assert!(resolve_cum(Hash32([0xEE; 32]), &headers, &mut cum).is_none());
+    }
+
+    #[test]
+    fn build_chain_index_scans_xor_obfuscated_files_and_surfaces_corrupt_header() {
+        let dir = tmp_dir("xor_chain");
+        let key = [0x13u8, 0x57, 0x9B, 0xDF, 0x24, 0x68, 0xAC, 0xE0];
+        std::fs::write(dir.join("xor.dat"), key).unwrap();
+
+        let genesis = header(Hash32::ZERO, 0x1d00ffff, 50);
+        let g = dsha256(&genesis);
+        let b1 = header(g, 0x1d00ffff, 51);
+        let b1h = dsha256(&b1);
+        write_blk(&dir, 0, &[genesis, b1]);
+        // Obfuscate blk00000.dat in place with `key`.
+        let p0 = dir.join("blk00000.dat");
+        let plain = std::fs::read(&p0).unwrap();
+        let obf: Vec<u8> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i & 7])
+            .collect();
+        std::fs::write(&p0, obf).unwrap();
+
+        let (idx, stats) = build_chain_index(&dir).unwrap();
+        assert_eq!(stats.tip_height, 1);
+        assert_eq!(stats.tip_hash, b1h);
+        assert_eq!(idx.by_height.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Corrupt blk00000.dat propagates BlkError::Corrupt out of scan_file.
+        let bad_dir = tmp_dir("corrupt_chain");
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&0xCAFEBABEu32.to_le_bytes());
+        bad.extend_from_slice(&80u32.to_le_bytes());
+        bad.extend_from_slice(&[1u8; 80]);
+        std::fs::write(bad_dir.join("blk00000.dat"), bad).unwrap();
+        assert!(matches!(
+            build_chain_index(&bad_dir),
+            Err(BlkError::Corrupt { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&bad_dir);
     }
 }

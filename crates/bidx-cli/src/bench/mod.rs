@@ -704,7 +704,11 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         header_raw.copy_from_slice(&bytes[..80]);
                         let header = bidx_core::BlockHeader::parse(&header_raw);
                         let hash = bidx_core::dsha256(&header_raw);
-                        let block = bidx_parser::parse_block_full(&bytes, height, hash, &header)?;
+                        let block = {
+                            let b = bidx_parser::parse_block_full(&bytes, height, hash, &header)?;
+                            drop(bytes);
+                            b
+                        };
                         let dt = t.elapsed().as_nanos() as u64;
                         parse_wall_w.fetch_add(dt, Ordering::Relaxed);
                         crate::pipeline::send_work_item(
@@ -996,7 +1000,7 @@ fn recover_rss_kb(max_rss_kb: u64) -> u64 {
 /// process.
 fn rss_trips(rss_kb: u64, max_rss_kb: u64) -> bool {
     if rss_kb > max_rss_kb {
-        // coverage-exempt: 1038-1040 — the `tracing::error!` field expressions
+        // coverage-exempt: 1007-1011 — the `tracing::error!` field expressions
         // are only evaluated when a subscriber is installed; the unit tests
         // run without one, so only the macro's target line is instrumented.
         // The branch itself is covered by `rss_trips_logs_and_trips_only_over_the_limit`.
@@ -2429,7 +2433,10 @@ mod tests {
         assert!(!w.is_pressured());
         assert_eq!(w.soft_rss_kb(), soft_rss_kb(u64::MAX));
         assert_eq!(w.recover_rss_kb(), recover_rss_kb(u64::MAX));
-        assert!(w.recover_rss_kb() < w.soft_rss_kb(), "hysteresis band required");
+        assert!(
+            w.recover_rss_kb() < w.soft_rss_kb(),
+            "hysteresis band required"
+        );
     }
 
     #[test]
@@ -2442,7 +2449,10 @@ mod tests {
         while !w.is_tripped() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(w.is_pressured(), "a tripped watchdog must also be pressured");
+        assert!(
+            w.is_pressured(),
+            "a tripped watchdog must also be pressured"
+        );
     }
 
     #[test]

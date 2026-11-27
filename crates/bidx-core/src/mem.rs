@@ -191,7 +191,11 @@ pub fn plan_memory(available_kb: u64, total_kb: u64) -> MemoryPlan {
     // A bogus `MemAvailable` above `MemTotal` (seen on some kernels) is clamped
     // to the physical machine. A zero `MemTotal` is ignored rather than used as
     // the cap, so a missing field cannot collapse the budget to nothing.
-    let cap = if total_kb == 0 { available_kb } else { total_kb };
+    let cap = if total_kb == 0 {
+        available_kb
+    } else {
+        total_kb
+    };
     let available_kb = available_kb.min(cap);
 
     let ceiling_kb = available_kb
@@ -276,7 +280,10 @@ mod tests {
     #[test]
     fn meminfo_field_reads_the_named_field_only() {
         let blob = "MemTotal:       31617968 kB\nMemAvailable:   19306756 kB\nSwapTotal: 0 kB\n";
-        assert_eq!(meminfo_field_kb(Some(blob), "MemAvailable:"), Some(19_306_756));
+        assert_eq!(
+            meminfo_field_kb(Some(blob), "MemAvailable:"),
+            Some(19_306_756)
+        );
         assert_eq!(meminfo_field_kb(Some(blob), "MemTotal:"), Some(31_617_968));
         // A field that is not present yields None.
         assert_eq!(meminfo_field_kb(Some(blob), "MemFree:"), None);
@@ -285,9 +292,15 @@ mod tests {
     #[test]
     fn meminfo_field_rejects_garbage_and_missing_input() {
         // Non-numeric value.
-        assert_eq!(meminfo_field_kb(Some("MemAvailable: lots kB\n"), "MemAvailable:"), None);
+        assert_eq!(
+            meminfo_field_kb(Some("MemAvailable: lots kB\n"), "MemAvailable:"),
+            None
+        );
         // Value with no token after the name.
-        assert_eq!(meminfo_field_kb(Some("MemAvailable:\n"), "MemAvailable:"), None);
+        assert_eq!(
+            meminfo_field_kb(Some("MemAvailable:\n"), "MemAvailable:"),
+            None
+        );
         // No content at all.
         assert_eq!(meminfo_field_kb(None, "MemAvailable:"), None);
     }
@@ -319,14 +332,19 @@ mod tests {
         let fixed_kb = FIXED_RUNTIME_RESERVE_KB.min(ceiling_kb / 8);
         assert_eq!(memtable_kb, MEMTABLE_BUDGET_KB);
         assert_eq!(fixed_kb, FIXED_RUNTIME_RESERVE_KB);
-        let cache_kb =
-            (ceiling_kb - (memtable_kb + fixed_kb + file_kb)) * CACHE_FRACTION_PCT / 100;
+        let cache_kb = (ceiling_kb - (memtable_kb + fixed_kb + file_kb)) * CACHE_FRACTION_PCT / 100;
         let recent_kb = cache_kb * RECENT_SHARE_PCT / 100;
         assert_eq!(p.recent_cache_bytes, (recent_kb * 1024) as usize);
-        assert_eq!(p.block_cache_bytes, ((cache_kb - recent_kb) * 1024) as usize);
+        assert_eq!(
+            p.block_cache_bytes,
+            ((cache_kb - recent_kb) * 1024) as usize
+        );
         // The recent cache gets the larger share by construction.
         assert!(p.recent_cache_bytes > p.block_cache_bytes);
-        assert_eq!(p.memtable_budget_bytes, (MEMTABLE_BUDGET_KB * 1024) as usize);
+        assert_eq!(
+            p.memtable_budget_bytes,
+            (MEMTABLE_BUDGET_KB * 1024) as usize
+        );
         assert_eq!(p.file_cache_files, MAX_FILE_CACHE_FILES);
     }
 
@@ -384,9 +402,15 @@ mod tests {
     #[test]
     fn plan_scales_the_file_lru_with_the_ceiling() {
         // A small ceiling keeps a single decoded file...
-        assert_eq!(plan_memory(4 * 1024 * 1024, 4 * 1024 * 1024).file_cache_files, 1);
+        assert_eq!(
+            plan_memory(4 * 1024 * 1024, 4 * 1024 * 1024).file_cache_files,
+            1
+        );
         // ...a medium ceiling scales proportionally...
-        assert_eq!(plan_memory(16 * 1024 * 1024, 16 * 1024 * 1024).file_cache_files, 6);
+        assert_eq!(
+            plan_memory(16 * 1024 * 1024, 16 * 1024 * 1024).file_cache_files,
+            6
+        );
         // ...and a large one caps at MAX_FILE_CACHE_FILES rather than pinning gigabytes.
         assert_eq!(
             plan_memory(256 * 1024 * 1024, 256 * 1024 * 1024).file_cache_files,
@@ -430,7 +454,10 @@ mod tests {
     #[test]
     fn cache_budget_wrapper_matches_the_plan() {
         let p = plan_memory(16 * 1024 * 1024, 16 * 1024 * 1024);
-        assert_eq!(plan_cache_budget(16 * 1024 * 1024, 16 * 1024 * 1024), p.caches());
+        assert_eq!(
+            plan_cache_budget(16 * 1024 * 1024, 16 * 1024 * 1024),
+            p.caches()
+        );
     }
 
     #[test]

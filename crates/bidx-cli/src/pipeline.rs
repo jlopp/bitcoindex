@@ -14,7 +14,9 @@
 
 use crate::diskguard::{DiskGuardConfig, DiskRecorder, DEFAULT_CHECKPOINT_FILE_NAME};
 use anyhow::{Context, Result};
-use bidx_parser::{parse_block_full, parse_block_full_opts, BlkFile, FullBlock};
+use bidx_parser::{
+    parse_block_full, parse_block_full_opts, read_xor_key_from_dir, BlkFile, FullBlock,
+};
 use bidx_store::{ParquetSink, SinkConfig, UtxoStore};
 use crossbeam_channel::{bounded, Receiver};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -403,12 +405,17 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                     // ordered consumer so it advances past this height.
                     if let Some(orphans) = &orphan_blocks {
                         if orphans.contains(&hash) {
+                            drop(bytes);
                             orphans_skipped.fetch_add(1, Ordering::Relaxed);
                             send_work_item(&tx, WorkItem::Skipped { height }, &watchdog_w)?;
                             continue;
                         }
                     }
                     let block = parse_block_full_opts(&bytes, height, hash, &header, parse_opts)?;
+                    // Release the `Arc<BlkFile>` reference before blocking on
+                    // `tx.send` so an evicted 128 MiB file buffer can be freed
+                    // immediately rather than lingering across channel backpressure.
+                    drop(bytes);
                     send_work_item(&tx, WorkItem::Block { height, block }, &watchdog_w)?;
                 }
             })
@@ -458,14 +465,48 @@ pub(crate) struct ThreadFileCache {
     inner: Arc<CacheInner>,
 }
 
+/// Zero-copy view into a cached [`BlkFile`]'s payload for one block.
+///
+/// Holds the `Arc<BlkFile>` backing the `Mmap` or decoded `Vec<u8>` alongside
+/// the validated `[start..end]` slice bounds, eliminating the per-block heap
+/// allocation + multi-megabyte `memcpy` (`Arc::from(slice)`) across ~680 GiB of
+/// mainnet block payloads.
+pub(crate) struct CachedBlock {
+    file: Arc<BlkFile>,
+    start: usize,
+    end: usize,
+}
+
+impl std::ops::Deref for CachedBlock {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.file.data()[self.start..self.end]
+    }
+}
+
+type InflightLoad = Arc<std::sync::OnceLock<std::result::Result<Arc<BlkFile>, String>>>;
+
 struct CacheInner {
     /// LRU list, oldest at front, most-recently-used at back.
     lru: parking_lot::Mutex<std::collections::VecDeque<u32>>,
     map: parking_lot::RwLock<FxHashMap<u32, Arc<BlkFile>>>,
+    /// Per-`file_id` singleflight table so that when 12 workers simultaneously
+    /// cross into a new `blkNNNNN.dat`, only one worker reads and XOR-decodes
+    /// the 128 MiB file while the others wait on its `OnceLock`.
+    inflight: parking_lot::Mutex<FxHashMap<u32, InflightLoad>>,
+    /// Most-recently-used `file_id` (`u32::MAX` when empty). Lets ~99.5% of
+    /// sequential block hits skip locking `lru` and scanning the `VecDeque`.
+    mru_file_id: AtomicU32,
+    /// Optional 8-byte `xor.dat` key resolved once for `blocks_dir`.
+    xor_key: Option<[u8; 8]>,
     /// Maximum resident files. A shared `AtomicUsize` so `shrink_to` (called by
     /// the consumer under memory pressure) lowers the bound for every clone —
     /// each worker holds its own `ThreadFileCache` but they share this inner.
-    capacity: std::sync::atomic::AtomicUsize,
+    capacity: AtomicUsize,
+    #[cfg(test)]
+    opens: AtomicUsize,
 }
 
 impl Clone for ThreadFileCache {
@@ -490,12 +531,18 @@ impl ThreadFileCache {
     /// so a memory plan can scale the decoded-file heap with the ceiling.
     pub(crate) fn with_capacity(blocks_dir: &Path, capacity: usize) -> Self {
         let capacity = capacity.max(1);
+        let xor_key = read_xor_key_from_dir(blocks_dir);
         ThreadFileCache {
             blocks_dir: blocks_dir.to_path_buf(),
             inner: Arc::new(CacheInner {
                 lru: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
                 map: parking_lot::RwLock::new(FxHashMap::default()),
-                capacity: std::sync::atomic::AtomicUsize::new(capacity),
+                inflight: parking_lot::Mutex::new(FxHashMap::default()),
+                mru_file_id: AtomicU32::new(u32::MAX),
+                xor_key,
+                capacity: AtomicUsize::new(capacity),
+                #[cfg(test)]
+                opens: AtomicUsize::new(0),
             }),
         }
     }
@@ -506,7 +553,6 @@ impl ThreadFileCache {
     /// not re-request files it no longer needs, so re-growing only risks
     /// re-approaching the ceiling).
     pub(crate) fn shrink_to(&self, capacity: usize) {
-        use std::sync::atomic::Ordering;
         let capacity = capacity.max(1);
         let cur = self.inner.capacity.load(Ordering::Relaxed);
         if capacity >= cur {
@@ -535,7 +581,6 @@ impl ThreadFileCache {
     }
 
     fn touch(&self, file_id: u32) {
-        use std::sync::atomic::Ordering;
         let capacity = self.inner.capacity.load(Ordering::Relaxed);
         let mut lru = self.inner.lru.lock();
         // Move `file_id` to the back (most recently used).
@@ -543,6 +588,7 @@ impl ThreadFileCache {
             lru.remove(pos);
         }
         lru.push_back(file_id);
+        self.inner.mru_file_id.store(file_id, Ordering::Relaxed);
         // Evict oldest if over capacity.
         while lru.len() > capacity {
             if let Some(old) = lru.pop_front() {
@@ -553,29 +599,41 @@ impl ThreadFileCache {
         }
     }
 
-    pub(crate) fn block_bytes(
-        &self,
-        loc: &bidx_core::BlockLocation,
-    ) -> Result<std::sync::Arc<[u8]>> {
-        let f = {
-            let files = self.inner.map.read();
-            files.get(&loc.file_id).cloned()
-        };
-        let f = match f {
-            Some(bf) => {
-                self.touch(loc.file_id);
-                bf
+    fn get_file(&self, file_id: u32) -> Result<Arc<BlkFile>> {
+        if let Some(bf) = self.inner.map.read().get(&file_id).cloned() {
+            if self.inner.mru_file_id.load(Ordering::Relaxed) != file_id {
+                self.touch(file_id);
             }
-            None => {
-                let path = self.blocks_dir.join(format!("blk{:05}.dat", loc.file_id));
-                let bf = Arc::new(BlkFile::open(&path, loc.file_id)?);
-                self.inner.map.write().insert(loc.file_id, Arc::clone(&bf));
-                self.touch(loc.file_id);
-                bf
-            }
+            return Ok(bf);
+        }
+
+        let slot = {
+            let mut inflight = self.inner.inflight.lock();
+            Arc::clone(inflight.entry(file_id).or_default())
         };
-        let slice = f.block_bytes(loc)?;
-        Ok(Arc::from(slice))
+        let res = slot.get_or_init(|| {
+            #[cfg(test)]
+            self.inner.opens.fetch_add(1, Ordering::Relaxed);
+            let path = self.blocks_dir.join(format!("blk{:05}.dat", file_id));
+            let bf = Arc::new(
+                BlkFile::open_with_key(&path, file_id, self.inner.xor_key)
+                    .map_err(|e| e.to_string())?,
+            );
+            self.inner.map.write().insert(file_id, Arc::clone(&bf));
+            self.touch(file_id);
+            Ok(bf)
+        });
+        self.inner.inflight.lock().remove(&file_id);
+        match res {
+            Ok(bf) => Ok(Arc::clone(bf)),
+            Err(msg) => anyhow::bail!("{msg}"),
+        }
+    }
+
+    pub(crate) fn block_bytes(&self, loc: &bidx_core::BlockLocation) -> Result<CachedBlock> {
+        let file = self.get_file(loc.file_id)?;
+        let (start, end) = file.block_range(loc)?;
+        Ok(CachedBlock { file, start, end })
     }
 }
 
@@ -627,8 +685,7 @@ pub(crate) fn send_work_item(
 /// sustained pressure episode. Spans ten 200 ms watchdog polls so `VmRSS`
 /// reflects the previous step's `mremap` / `malloc_trim` before deciding
 /// whether a further step is required.
-pub(crate) const PRESSURE_RELIEF_COOLDOWN: std::time::Duration =
-    std::time::Duration::from_secs(2);
+pub(crate) const PRESSURE_RELIEF_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Progressive memory-pressure controller shared by `consume_ordered` and
 /// `bench::bench_consume`.
@@ -1192,10 +1249,7 @@ mod tests {
             recent_cache_bytes: 5 << 30,
         };
         // No overrides: the planned values are used verbatim.
-        assert_eq!(
-            resolve_cache_bytes(None, None, budget),
-            (3 << 30, 5 << 30)
-        );
+        assert_eq!(resolve_cache_bytes(None, None, budget), (3 << 30, 5 << 30));
         // A block-cache override wins; the recent cache still auto-sizes.
         assert_eq!(
             resolve_cache_bytes(Some(2), None, budget),
@@ -1699,6 +1753,86 @@ mod tests {
     }
 
     #[test]
+    fn thread_file_cache_singleflight_mru_fast_path_and_error_cleanup() {
+        let dir = make_many_blk_files(3);
+        let xor_key = [0x33u8, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA];
+        // Obfuscate all 3 files so singleflight also exercises cached xor.dat
+        // decoding across concurrent threads.
+        fs::write(dir.join("xor.dat"), xor_key).unwrap();
+        for file_id in 0..3u32 {
+            let p = dir.join(format!("blk{:05}.dat", file_id));
+            let plain = fs::read(&p).unwrap();
+            let obf: Vec<u8> = plain
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ xor_key[i & 7])
+                .collect();
+            fs::write(&p, obf).unwrap();
+        }
+
+        let cache = ThreadFileCache::with_capacity(&dir, 2);
+        let loc = |file_id: u32| BlockLocation {
+            file_id,
+            offset: 0,
+            record_len: (BLOCK_HEADER_LEN + 1 + 47 + 8) as u32,
+        };
+
+        // 8 threads simultaneously request file 0 on a cold cache: singleflight
+        // must open & XOR-decode file 0 exactly once and return the same Arc.
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let files: Vec<Arc<BlkFile>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let c = cache.clone();
+                    let b = Arc::clone(&barrier);
+                    s.spawn(move || {
+                        b.wait();
+                        let blk = c.block_bytes(&loc(0)).unwrap();
+                        assert_eq!((&*blk).len() as u32, loc(0).record_len - 8);
+                        blk.file
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            cache.inner.opens.load(Ordering::Relaxed),
+            1,
+            "singleflight must open cold blk00000.dat exactly once across 8 threads"
+        );
+        for other in &files[1..] {
+            assert!(
+                Arc::ptr_eq(&files[0], other),
+                "all concurrent callers must share the same Arc<BlkFile>"
+            );
+        }
+        drop(files);
+
+        // MRU fast path (`mru_file_id == 0`) skips `touch` and does not reopen.
+        let b_mru = cache.block_bytes(&loc(0)).unwrap();
+        assert_eq!(cache.inner.opens.load(Ordering::Relaxed), 1);
+        drop(b_mru);
+
+        // Open file 1 (`lru = [0, 1]`, `mru = 1`), then re-read file 0
+        // (`mru != 0` triggers `touch`, rotating `lru` to `[1, 0]`, `mru = 0`),
+        // then open file 2 at capacity 2 -> must evict file 1 (not file 0!).
+        cache.block_bytes(&loc(1)).unwrap();
+        cache.block_bytes(&loc(0)).unwrap();
+        cache.block_bytes(&loc(2)).unwrap();
+        assert_eq!(cache.resident(), 2);
+        assert!(cache.inner.map.read().contains_key(&0));
+        assert!(cache.inner.map.read().contains_key(&2));
+        assert!(!cache.inner.map.read().contains_key(&1));
+
+        // Missing file surfaces error and cleans up its `inflight` slot.
+        let err = cache.block_bytes(&loc(9999));
+        assert!(err.is_err());
+        assert!(cache.inner.inflight.lock().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pressure_state_sheds_on_rising_edge_and_progressively_after_cooldown() {
         // Relief must fire immediately on the rising edge, suppress per-block
         // shedding during the cooldown window, fire additional progressive
@@ -1763,7 +1897,10 @@ mod tests {
         let mut s2 = PressureState::new(4);
         assert_eq!(s2.poll(true, t0, None, &cache), 0);
         assert_eq!(s2.file_cache_bound, 2);
-        assert_eq!(s2.poll(true, t0 + PRESSURE_RELIEF_COOLDOWN, None, &cache), 0);
+        assert_eq!(
+            s2.poll(true, t0 + PRESSURE_RELIEF_COOLDOWN, None, &cache),
+            0
+        );
         assert_eq!(s2.file_cache_bound, 1);
         assert_eq!(
             s2.poll(true, t0 + PRESSURE_RELIEF_COOLDOWN * 2, None, &cache),
@@ -2288,8 +2425,8 @@ mod tests {
             rpc_url: Some("http://unused".into()),
             rpc_cookie: None,
             skip_disk_check: false,
-            network: None,           // exercise auto-detect
-            checkpoint_file: None,   // exercise the default-path fallback
+            network: None,         // exercise auto-detect
+            checkpoint_file: None, // exercise the default-path fallback
             orphan_blocks: None,
             capture_witness: false,
             block_cache_mb: None,
