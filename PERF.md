@@ -1003,3 +1003,30 @@ that the views are dropped *before* the base load, the backfill runs *after* it,
 and the views are recreated *last* — the ordering is the whole point. Per-file
 coverage is at 100% for both touched files.
 
+### One `INSERT ... UNION ALL` per two-source table
+
+Three derived tables are fed by *two* materialized views each
+(`address_history`, `utxos_by_address`, `address_stats`). The backfill builds
+each of them with a **single** `INSERT ... SELECT ... UNION ALL SELECT ...`
+rather than two separate `INSERT`s. Each ClickHouse `INSERT` produces its own
+set of parts that the server later merges, so one statement halves the part
+count — and the merge writes — for those tables. The rows are identical either
+way; only the delivery changes. This also matches `backfill_coinstats`, which
+already unions its fund/spend halves.
+
+### In-memory memtable merge before flush (`bidx-store`)
+
+`apply_write_tuning` sets `min_write_buffer_number_to_merge(2)` in bulk mode
+(live mode keeps the default of 1). A bulk index creates an outpoint and spends
+it a short time later; with the default, if the `put` and the `delete` land in
+two different memtables, RocksDB flushes **both** — two SST entries for a UTXO
+that no longer exists. Merging two memtables in memory first applies
+last-write-wins across them, so the pair cancels and *neither* reaches L0: a
+short-lived output costs zero flush bytes instead of two. `finalize_bulk_load`
+would drop the cancelled pair anyway, so the steady-state store is identical —
+this only removes the intermediate L0 write. The policy lives in the pure
+`memtables_to_merge(bulk)` helper (tested) so it is pinned without a live store.
+**This one has no before/after bench yet** — it is a write-path change to
+`bidx-store`, and `rust-performance.mdc` asks for a `bidx bench --mode full`
+comparison; record it here once measured.
+

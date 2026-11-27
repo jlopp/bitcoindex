@@ -499,6 +499,9 @@ fn apply_write_tuning(opts: &mut Options, bulk: bool) {
     opts.set_max_subcompactions(default_subcompactions());
     opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
     opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+    // Merge memtables in memory before flushing (bulk: two, live: one). See
+    // `memtables_to_merge` for why a bulk load wants this.
+    opts.set_min_write_buffer_number_to_merge(memtables_to_merge(bulk));
 
     if bulk {
         // Let the bottommost level absorb the bulk of the data instead of
@@ -536,6 +539,30 @@ pub(crate) fn background_jobs_for(cores: usize) -> i32 {
 /// dual-core box still parallelizes, at most 8 (RocksDB's own practical cap).
 pub(crate) fn subcompactions_for(cores: usize) -> u32 {
     (cores / 2).clamp(2, 8) as u32
+}
+
+/// `min_write_buffer_number_to_merge`: how many memtables RocksDB merges in
+/// memory before flushing to L0.
+///
+/// A bulk index creates an outpoint and spends it a short time later. If the
+/// `put` and the `delete` land in two different memtables, the default (1)
+/// flushes both: two SST entries for a UTXO that no longer exists. Merging two
+/// memtables first applies last-write-wins across them, so the pair cancels and
+/// *neither* reaches L0 — a short-lived output costs zero flush bytes instead
+/// of two. `finalize_bulk_load` would drop the cancelled pair anyway, so the
+/// steady-state store is identical; this removes the intermediate write.
+///
+/// Live mode keeps the default (1): it flushes per block for crash durability
+/// (the WAL is on and synced there), and holding memtables back would widen the
+/// unrecoverable window for no throughput benefit. Exposed as a pure function
+/// so the policy is unit-tested without a live store, matching the
+/// `background_jobs_for` / `subcompactions_for` pattern.
+pub(crate) fn memtables_to_merge(bulk: bool) -> i32 {
+    if bulk {
+        2
+    } else {
+        1
+    }
 }
 
 fn default_background_jobs() -> i32 {
@@ -2053,6 +2080,14 @@ mod tests {
         assert_eq!(subcompactions_for(4), 2);
         assert_eq!(subcompactions_for(12), 6);
         assert_eq!(subcompactions_for(64), 8);
+    }
+
+    /// A bulk load merges two memtables before flushing (so create+spend pairs
+    /// cancel and never reach L0); live mode keeps the per-buffer default.
+    #[test]
+    fn memtables_to_merge_is_two_for_bulk_one_for_live() {
+        assert_eq!(memtables_to_merge(true), 2);
+        assert_eq!(memtables_to_merge(false), 1);
     }
 
     /// The H2 counters must be internally consistent: every non-coinbase input

@@ -896,43 +896,42 @@ pub fn backfill_derived_indexes(db: &str) -> Vec<String> {
             "INSERT INTO {db}.spends_by_address (spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height) \
              SELECT spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height FROM {db}.spends"
         ),
-        // 6. address_history (fund + spend)
+        // 6. address_history (fund + spend). The fund and spend halves are
+        // `UNION ALL`ed into one `INSERT` rather than issued as two statements:
+        // each `INSERT` creates its own parts, which ClickHouse then merges, so
+        // one statement halves the part count (and the merge writes) for the
+        // table. The rows are identical either way — the two live MVs insert
+        // them separately, and this only changes how they reach the target.
         format!("TRUNCATE TABLE {db}.address_history"),
         format!(
             "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
              SELECT address_hash, height, tx_index, txid, toInt64(value_sat) AS value_sat, toUInt8(0) AS kind \
-             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
-        ),
-        format!(
-            "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
+             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
+             UNION ALL \
              SELECT spent_address_hash AS address_hash, height, spending_tx_index AS tx_index, \
                     spending_txid AS txid, toInt64(-spent_value_sat) AS value_sat, toUInt8(1) AS kind \
              FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
         ),
-        // 7. utxos_by_address (fund + spend)
+        // 7. utxos_by_address (fund + spend) — `UNION ALL`, see above.
         format!("TRUNCATE TABLE {db}.utxos_by_address"),
         format!(
             "INSERT INTO {db}.utxos_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign) \
              SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat, toInt8(1) AS sign \
-             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
-        ),
-        format!(
-            "INSERT INTO {db}.utxos_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign) \
+             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
+             UNION ALL \
              SELECT spent_address_hash AS address_hash, spent_script_type AS script_type, height, \
                     spending_tx_index AS tx_index, spent_vout AS output_index, spent_txid AS txid, \
                     spent_value_sat AS value_sat, toInt8(-1) AS sign \
              FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
         ),
-        // 15. address_stats (fund + spend)
+        // 15. address_stats (fund + spend) — `UNION ALL`, see above.
         format!("TRUNCATE TABLE {db}.address_stats"),
         format!(
             "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
              SELECT address_hash, toUInt64(1) AS funded_count, value_sat AS funded_sum, \
                     toUInt64(0) AS spent_count, toUInt64(0) AS spent_sum, toUInt64(1) AS history_count \
-             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
-        ),
-        format!(
-            "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
+             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
+             UNION ALL \
              SELECT spent_address_hash AS address_hash, toUInt64(0) AS funded_count, \
                     toUInt64(0) AS funded_sum, toUInt64(1) AS spent_count, \
                     spent_value_sat AS spent_sum, toUInt64(1) AS history_count \
@@ -1584,10 +1583,22 @@ mod tests {
                 "{table} must have a backfill insert"
             );
         }
-        // The three two-source tables get both halves.
-        assert_eq!(body.matches("INSERT INTO db.address_history ").count(), 2);
-        assert_eq!(body.matches("INSERT INTO db.utxos_by_address ").count(), 2);
-        assert_eq!(body.matches("INSERT INTO db.address_stats ").count(), 2);
+        // The three two-source tables each get a *single* `INSERT` whose
+        // `UNION ALL` carries both halves — one statement, so one set of parts
+        // for ClickHouse to merge rather than two.
+        for table in ["address_history", "utxos_by_address", "address_stats"] {
+            assert_eq!(
+                body.matches(&format!("INSERT INTO db.{table} ")).count(),
+                1,
+                "{table} must be written in a single UNION ALL insert"
+            );
+            assert!(
+                body.contains(&format!("INSERT INTO db.{table} "))
+                    && body[body.find(&format!("INSERT INTO db.{table} ")).unwrap()..]
+                        .contains("UNION ALL"),
+                "{table} must union its fund and spend halves"
+            );
+        }
         // scripthash_map uses DISTINCT (unlike the per-row MV) and the same
         // reconstruction expression.
         assert!(body.contains("INSERT INTO db.scripthash_map "));
