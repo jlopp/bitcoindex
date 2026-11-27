@@ -1030,3 +1030,56 @@ this only removes the intermediate L0 write. The policy lives in the pure
 `bidx-store`, and `rust-performance.mdc` asks for a `bidx bench --mode full`
 comparison; record it here once measured.
 
+## 16. The benchmark that threw away its own data
+
+A mainnet bench that died at height 435000 produced **no metrics at all**. The
+cause was in the harness, not the pipeline: `run_bench` collected every trial
+into a `Vec` and wrote `--csv` (really pretty JSON) exactly once, *after* the
+loop, via `run_trial(...)?`. A watchdog abort propagated that `?` straight out
+of `run_bench` and skipped the write entirely, so a 13-hour run left nothing on
+disk — and the death point is precisely the data point worth having.
+
+### Flush per trial, and report on abort
+
+Two changes, both in `crates/bidx-cli/src/bench/mod.rs`:
+
+1. **Per-trial flush.** `write_report(path, &trials)` runs after *every* trial.
+   A `--repeat` run that dies on trial 2 now leaves trial 1's completed numbers
+   on disk instead of nothing. The `-` (stdout) target is still written once,
+   after the loop, so a multi-trial run does not spew N JSON blobs.
+
+2. **Report on abort.** `run_trial` no longer propagates a mid-pipeline abort.
+   The worker pool's `Result` and the consumer's are captured rather than
+   `?`-ed, and `resolve_results` picks the root cause (the worker's error wins —
+   a parse failure is what starved the consumer). The trial is still assembled
+   with the live counters — `blocks_done`, the stage sums, the db/pending/cache
+   lookup breakdown, the RSS peak, and (with `--rocksdb-stats`) the RocksDB
+   property snapshot *at the point of death* — and marked `complete: false` with
+   the `error` string set.
+
+`run_bench` then fails loudly *after* the flush: the first aborted trial is
+re-raised as `bench did not complete: <cause>`, so a non-zero exit still means
+"did not finish" while the JSON holds the partial numbers. The cold-store guard
+is folded into the same `error` field rather than returned early, so its report
+is flushed too.
+
+### New report fields
+
+`TrialReport` gains `complete` (bool), `error` (omitted when clean),
+`last_height` (the first height *not* applied — the abort point), and
+`planned_blocks` (the intended range). `print_trial` prints an `!! INCOMPLETE`
+banner naming the height and the cause, and flags that the throughput below
+covers only the completed blocks.
+
+### Tests
+
+`run_bench_flushes_an_incomplete_trial_report_then_fails` drives a real
+mid-pipeline abort (a synthetic chain whose block 1 has a corrupt body — the
+header pass reads headers only, so it still builds the index, and the failure
+lands in the parse workers) and asserts the file exists, carries
+`"complete": false`, and that `run_bench` still returns the loud error.
+`run_bench_flushes_a_completed_trial_before_a_later_one_aborts` proves the
+per-trial flush survives a later failure. `resolve_results` covers all four
+`(worker, consumer)` outcomes directly, and `run_bench_cold_store_still_flushes_the_report`
+covers the cold-store path. Per-file coverage is at 100%.
+

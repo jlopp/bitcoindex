@@ -254,12 +254,40 @@ struct TrialReport {
     utxo_latency: LatencyReport,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rocksdb: Vec<RocksDbProperty>,
+    /// Whether the trial ran to completion. A run that aborts mid-pipeline
+    /// (the RSS watchdog, a parse failure) still produces a report — with
+    /// `complete: false` and `error` set — so the live counters from the run
+    /// that died are not lost. See `run_bench`'s per-trial flush.
+    complete: bool,
+    /// The abort reason when `complete` is false, omitted on a clean run so a
+    /// healthy report never carries a stray `error: null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Height the pipeline had reached (exclusive) when it stopped. Equals
+    /// `blocks` on a clean run (every block was applied), and is the first
+    /// block *not* applied on an aborted one.
+    last_height: u32,
+    /// Total blocks the trial intended to process. `last_height - start` is
+    /// the completed count, so progress through the range is explicit even
+    /// for a trial that never finished.
+    planned_blocks: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct RocksDbProperty {
     name: String,
     value: String,
+}
+
+/// Serialize the trials completed so far to `path` (pretty JSON).
+///
+/// Called after every trial so a run that dies part-way still leaves the
+/// trials that did finish on disk. `std::fs::write` truncates and rewrites,
+/// so each call replaces the previous snapshot rather than appending.
+fn write_report(path: &Path, trials: &[TrialReport]) -> Result<()> {
+    let json = serde_json::to_string_pretty(trials)?;
+    std::fs::write(path, json).with_context(|| format!("writing report to {}", path.display()))?;
+    Ok(())
 }
 
 pub fn run_bench(cfg: BenchConfig) -> Result<()> {
@@ -296,9 +324,26 @@ pub fn run_bench(cfg: BenchConfig) -> Result<()> {
 
     let mut trials = Vec::with_capacity(cfg.repeat as usize);
     for trial in 0..cfg.repeat {
+        // `run_trial` never propagates an abort as `Err`: it captures the
+        // failure into a `complete: false` report so a run that dies (the RSS
+        // watchdog, a parse error) still yields the live counters from the
+        // point it died. Only a pre-pipeline failure (header pass, empty
+        // range) is fatal, and that has no counters to report.
         let report = run_trial(&cfg, &utxo_path, trial)?;
         print_trial(&report);
         trials.push(report);
+        // Flush after every trial so a later trial's abort cannot discard an
+        // earlier trial's completed numbers. Overwrites the file each time
+        // with the trials so far — a `--repeat` run that dies on trial 2
+        // leaves trial 1's numbers on disk rather than nothing at all.
+        //
+        // The "-" (stdout) target is written once, after the loop, so a
+        // multi-trial run does not spew N JSON blobs to the terminal.
+        if let Some(path) = &cfg.csv {
+            if path.as_os_str() != "-" {
+                write_report(path, &trials)?;
+            }
+        }
         // NOTE: between trials on the same data, RocksDB UTXO state carries
         // forward, so apply_block cost changes (fewer "missing" spends on
         // later trials). For pipelines == trial count > 1 we recommend
@@ -310,16 +355,21 @@ pub fn run_bench(cfg: BenchConfig) -> Result<()> {
     }
 
     if let Some(path) = &cfg.csv {
-        let json = serde_json::to_string_pretty(&trials)?;
         if path.as_os_str() == "-" {
-            println!("{}", json);
-        } else {
-            std::fs::write(path, json)?;
+            println!("{}", serde_json::to_string_pretty(&trials)?);
         }
     }
 
     if let Some(p) = utxo_cleanup {
         let _ = std::fs::remove_dir_all(&p);
+    }
+
+    // Surface the first aborted trial as the process error, *after* the report
+    // has been flushed. This keeps `bidx bench` failing loudly on an aborted
+    // run (a non-zero exit still means "did not complete") while the JSON on
+    // disk holds the partial numbers — the whole point of the per-trial flush.
+    if let Some(e) = trials.iter().find_map(|t| t.error.as_deref()) {
+        anyhow::bail!("bench did not complete: {e}");
     }
 
     Ok(())
@@ -442,6 +492,12 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
             parse_latency: LatencyReport::default(),
             utxo_latency: LatencyReport::default(),
             rocksdb: Vec::new(),
+            // The header pass is the whole trial in this mode, so it is
+            // complete by construction.
+            complete: true,
+            error: None,
+            last_height: tip + 1,
+            planned_blocks: tip as u64 + 1,
         });
     }
 
@@ -496,7 +552,10 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     // consumer thread, so a plain Vec behind a mutex would do; we keep them
     // in the closure and return them with the join handle.
     let mut parse_samples: Vec<u64> = Vec::new();
-    let utxo_samples: Vec<u64>;
+    // Filled from the consumer on a clean join; left empty when the trial
+    // aborts before the consumer returns its samples, so the report always
+    // has a value to serialize.
+    let mut utxo_samples: Vec<u64> = Vec::new();
 
     // UTXO store, opened before parse so workers don't wait on consumer.
     //
@@ -534,7 +593,9 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     let next_height = Arc::new(AtomicU32::new(start));
     let watchdog = Arc::new(crate::bench::OomWatchdog::start(plan.ceiling_kb));
     let file_cache = ThreadFileCache::with_capacity(&cfg.blocks_dir, plan.file_cache_files);
-    let consumer_handle = if do_parse_stages {
+    // `Some(abort)` when a consumer ran, carrying the captured failure (if
+    // any); `None` when this mode spawns no consumer thread at all.
+    let abort: Option<anyhow::Error> = if do_parse_stages {
         let (tx, rx) = crossbeam_channel::bounded::<WorkItem>(tuning.channel_depth);
         let parsed = Arc::clone(&blocks_done);
         let missing = Arc::clone(&missing_utxos);
@@ -612,7 +673,11 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cfg.threads.unwrap_or(0))
             .build()?;
-        parse_samples = pool.install(|| {
+        // The worker pool's result is captured, not propagated: an abort here
+        // (a parse failure, or the watchdog tripping a worker's spin loop) must
+        // still leave a report with the live counters. `map_init` collects into
+        // a `Result`, so a worker error is a value rather than a panic.
+        let worker_result = pool.install(|| {
             heights
                 .par_iter()
                 .map_init(
@@ -635,7 +700,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // allowed to run, or no block can ever unblock the
                         // consumer and the whole pipeline deadlocks.
                         //
-                        // coverage-exempt: 646, 648-651 — mirror of the production
+                        // coverage-exempt: 711, 713-714, 716 — mirror of the production
                         // spin in `pipeline::run_parse`. The body (and the
                         // second `&&` clause, which short-circuits) only runs
                         // when the consumer is `reorder_high` blocks behind
@@ -664,7 +729,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // consumer is gone, which is usually the RSS watchdog
                         // having aborted it. Surface the real cause.
                         //
-                        // coverage-exempt: 673-677 — the map_err closure body
+                        // coverage-exempt: 738-739, 741 — the map_err closure body
                         // only runs when a send to the consumer fails, which
                         // needs the consumer thread to have aborted mid-run;
                         // the fixtures never provoke that. The closure's
@@ -680,22 +745,31 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                     },
                 )
                 .collect::<anyhow::Result<Vec<u64>>>()
-        })?;
+        });
+        // Close the channel so the consumer drains what is buffered and then
+        // exits its `recv` loop, even after a worker error. This is what lets
+        // the join below return the consumer's own result (or a clean exit)
+        // rather than blocking on a channel that no worker will ever feed.
         drop(tx);
-        Some(consumer)
+        let us = match consumer.join() {
+            Ok(r) => r,
+            // coverage-exempt: consumer only returns Err by panicking (not in fixtures)
+            Err(_) => Err(anyhow::anyhow!("consumer panicked")),
+        };
+        // Capture whichever failed: the workers first (a parse error is the
+        // root cause), then the consumer (a watchdog trip, a sink error). A
+        // clean run has both `Ok` and this yields `None`.
+        match resolve_results(worker_result, us) {
+            Ok((p, u)) => {
+                parse_samples = p;
+                utxo_samples = u;
+                None
+            }
+            Err(e) => Some(e),
+        }
     } else {
         None // coverage-exempt: unreachable — every mode that reaches here spawns the consumer (do_parse_stages is true; Headers returns early)
     };
-
-    if let Some(h) = consumer_handle {
-        let us = h
-            .join()
-            // coverage-exempt: consumer only returns Err by panicking (not in fixtures)
-            .map_err(|_| anyhow::anyhow!("consumer panicked"))??;
-        utxo_samples = us;
-    } else {
-        utxo_samples = Vec::new(); // coverage-exempt: unreachable — every mode that reaches here spawns the consumer (do_parse_stages is true; Headers returns early)
-    }
     let pipeline_wall = pipeline_start.elapsed();
     let pipeline_end_res = ResourceSample::now();
 
@@ -764,10 +838,17 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     let _ = stats.files_scanned;
 
     // A cold UTXO store makes apply_block look free, which is the single most
-    // misleading result this tool can produce. Fail loudly instead.
-    if let Some(e) = cold_store_error(trial, do_utxo, missing, cfg.allow_missing_utxos) {
-        return Err(e); // coverage-exempt: 769 — the guard is fully branch-tested via cold_store_error; this is its trivial propagation
-    }
+    // misleading result this tool can produce. It is detected here and folded
+    // into the report's `error` rather than returned immediately, so the trial
+    // is still flushed before `run_bench` fails it.
+    let cold = cold_store_error(trial, do_utxo, missing, cfg.allow_missing_utxos);
+
+    // An abort anywhere in the pipeline still yields a report: the live
+    // counters at the point of death are exactly what a post-mortem needs, and
+    // they are reachable nowhere else. `complete` marks the throughput numbers
+    // as not covering the full range; `error` carries the root cause.
+    let complete = abort.is_none();
+    let error = abort.or(cold).map(|e| e.to_string());
 
     let rocksdb = if cfg.rocksdb_stats {
         utxo.as_ref()
@@ -813,6 +894,10 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         parse_latency: LatencyReport::from_samples(parse_samples),
         utxo_latency: LatencyReport::from_samples(utxo_samples),
         rocksdb,
+        complete,
+        error,
+        last_height: next_height.load(Ordering::Relaxed),
+        planned_blocks: total,
     })
 }
 
@@ -945,7 +1030,7 @@ fn recover_rss_kb(max_rss_kb: u64) -> u64 {
 /// process.
 fn rss_trips(rss_kb: u64, max_rss_kb: u64) -> bool {
     if rss_kb > max_rss_kb {
-        // coverage-exempt: 953-956 — the `tracing::error!` field expressions
+        // coverage-exempt: 1038-1040 — the `tracing::error!` field expressions
         // are only evaluated when a subscriber is installed; the unit tests
         // run without one, so only the macro's target line is instrumented.
         // The branch itself is covered by `rss_trips_logs_and_trips_only_over_the_limit`.
@@ -1247,6 +1332,24 @@ fn finalize_consume(next: u32, end: u32) -> Result<()> {
     Ok(())
 }
 
+/// Combine the worker pool's result with the consumer's, returning the samples
+/// on a clean run or the root-cause error on an abort.
+///
+/// The worker error wins when both failed: a parse failure is what stopped the
+/// workers from feeding the consumer, so it is the cause and the consumer's
+/// error (usually a downstream symptom) is the effect. Split out so all four
+/// `(worker, consumer)` combinations are unit-testable without provoking a
+/// real mid-run abort.
+fn resolve_results(
+    worker: Result<Vec<u64>>,
+    consumer: Result<Vec<u64>>,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    match (worker, consumer) {
+        (Ok(p), Ok(u)) => Ok((p, u)),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
 /// The db/pending share of UTXO lookups, as a percentage. Zero when there were
 /// no lookups at all, so the report never divides by zero.
 fn db_share(db_lookups: u64, pending_hits: u64) -> f64 {
@@ -1270,6 +1373,16 @@ fn cache_hits_line(cache_hits: u64) -> Option<String> {
 
 fn print_trial(r: &TrialReport) {
     println!("\n=== trial {} ({}) ===", r.trial, r.mode);
+    if !r.complete {
+        println!(
+            "!! INCOMPLETE — stopped at height {} ({} of {} planned blocks done)",
+            r.last_height, r.blocks, r.planned_blocks
+        );
+        if let Some(e) = &r.error {
+            println!("   cause: {e}");
+        }
+        println!("   throughput below covers only the completed blocks");
+    }
     println!("blocks: {}", r.blocks);
     println!("blocks/s: {:.1}", r.blocks_per_sec);
     println!(
@@ -1655,9 +1768,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The body a synthetic block record carries.
+    #[derive(Clone, Copy)]
+    enum Body {
+        /// A single coinbase tx: applies cleanly, resolves every input.
+        Coinbase,
+        /// A coinbase tx plus one non-coinbase tx spending an outpoint that
+        /// does not exist, so `apply_block` reports `missing == 1`.
+        MissingSpend,
+        /// A declared tx count of 255 with no txs behind it, so the *body*
+        /// fails to parse while the 80-byte header (all the header pass reads)
+        /// stays valid.
+        Corrupt,
+    }
+
+    /// The coinbase tx used by every synthetic record.
+    fn coinbase_tx() -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(1u8);
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(1u8);
+        tx.extend_from_slice(&100u64.to_le_bytes());
+        tx.push(0u8);
+        // Non-zero locktime: `BlkFile::open` trims trailing zero padding,
+        // so a synthetic record ending in 0 would lose its final bytes and
+        // the header pass would then reject it as a bad record length.
+        tx.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        tx
+    }
+
+    /// A non-coinbase tx spending a non-existent outpoint (`prev_txid` all
+    /// `0xAB`, vout 0). `is_coinbase` is false because neither the prev txid is
+    /// zero nor the vout is `0xffff_ffff`, so `apply_block` looks the outpoint
+    /// up, misses, and counts one `missing_utxos`.
+    fn missing_spend_tx() -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes()); // version
+        tx.push(1u8); // input count
+        tx.extend_from_slice(&[0xABu8; 32]); // prev txid (non-zero)
+        tx.extend_from_slice(&0u32.to_le_bytes()); // prev vout (not 0xffff_ffff)
+        tx.push(0u8); // script_sig_len
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+        tx.push(1u8); // output count
+        tx.extend_from_slice(&100u64.to_le_bytes()); // value
+        tx.push(0u8); // script_pubkey_len
+        tx.extend_from_slice(&0x1122_3344u32.to_le_bytes()); // locktime
+        tx
+    }
+
+    /// Append one synthetic block record (`magic || len || header || tx_count
+    /// || txs`) for block `i`, chained to `prev`. Returns the block hash
+    /// (dsha256 of the header).
+    fn push_record(
+        data: &mut Vec<u8>,
+        i: u32,
+        prev: bidx_core::Hash32,
+        body: Body,
+    ) -> bidx_core::Hash32 {
+        let mut hdr = [0u8; bidx_core::BLOCK_HEADER_LEN];
+        hdr[0] = (1 + i) as u8;
+        hdr[4..36].copy_from_slice(prev.as_bytes());
+        for j in 0..32 {
+            hdr[36 + j] = (i as u8).wrapping_add(j as u8);
+        }
+        hdr[68..72].copy_from_slice(&(1000u32 + i).to_le_bytes());
+        hdr[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes());
+        hdr[76..80].copy_from_slice(&i.to_le_bytes());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&hdr);
+        match body {
+            Body::Coinbase => {
+                payload.push(1u8); // tx count
+                payload.extend_from_slice(&coinbase_tx());
+            }
+            Body::MissingSpend => {
+                payload.push(2u8); // tx count
+                payload.extend_from_slice(&coinbase_tx());
+                payload.extend_from_slice(&missing_spend_tx());
+            }
+            Body::Corrupt => {
+                payload.push(0xFF); // 255 txs that are not present
+                payload.extend_from_slice(&coinbase_tx());
+            }
+        }
+
+        let payload_len = payload.len() as u32;
+        data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
+        data.extend_from_slice(&payload_len.to_le_bytes());
+        data.extend_from_slice(&payload);
+        bidx_core::dsha256(&hdr)
+    }
+
     /// Build a synthetic blocks dir with a single blk file containing N
     /// coinbase-only blocks, mirroring the pipeline test helper.
     fn make_chain(n: u32) -> (PathBuf, Vec<bidx_core::Hash32>) {
+        make_chain_with(n, |_| Body::Coinbase)
+    }
+
+    /// Like `make_chain`, but the block at `bad_height` carries a body that
+    /// `parse_block_full` rejects. The header pass still sees a well-formed
+    /// chain (it reads headers only), so `run_trial` gets far enough to spawn
+    /// the parse workers and the consumer — the abort happens mid-pipeline,
+    /// which is exactly the "died part-way" case the report must survive.
+    fn make_chain_with_bad_body(n: u32, bad_height: u32) -> (PathBuf, Vec<bidx_core::Hash32>) {
+        make_chain_with(n, move |i| {
+            if i == bad_height {
+                Body::Corrupt
+            } else {
+                Body::Coinbase
+            }
+        })
+    }
+
+    /// Like `make_chain`, but every block carries a non-coinbase spend of a
+    /// missing outpoint, so `apply_block` reports `missing > 0` and the
+    /// cold-store guard fires.
+    fn make_chain_with_missing_spends(n: u32) -> (PathBuf, Vec<bidx_core::Hash32>) {
+        make_chain_with(n, |_| Body::MissingSpend)
+    }
+
+    fn make_chain_with(
+        n: u32,
+        body_for: impl Fn(u32) -> Body,
+    ) -> (PathBuf, Vec<bidx_core::Hash32>) {
         let tmp = std::env::temp_dir().join(format!(
             "bidx-bench-chain-{}-{}",
             std::process::id(),
@@ -1674,38 +1912,7 @@ mod tests {
         let mut prev = bidx_core::Hash32::ZERO;
         let mut hashes = Vec::new();
         for i in 0..n {
-            let mut hdr = [0u8; bidx_core::BLOCK_HEADER_LEN];
-            hdr[0] = (1 + i) as u8;
-            hdr[4..36].copy_from_slice(prev.as_bytes());
-            for j in 0..32 {
-                hdr[36 + j] = (i as u8).wrapping_add(j as u8);
-            }
-            hdr[68..72].copy_from_slice(&(1000u32 + i).to_le_bytes());
-            hdr[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes());
-            hdr[76..80].copy_from_slice(&i.to_le_bytes());
-
-            let mut tx = Vec::new();
-            tx.extend_from_slice(&1i32.to_le_bytes());
-            tx.push(1u8);
-            tx.extend_from_slice(&[0u8; 32]);
-            tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-            tx.push(0u8);
-            tx.extend_from_slice(&0u32.to_le_bytes());
-            tx.push(1u8);
-            tx.extend_from_slice(&100u64.to_le_bytes());
-            tx.push(0u8);
-            // Non-zero locktime: `BlkFile::open` trims trailing zero padding,
-            // so a synthetic record ending in 0 would lose its final bytes and
-            // the header pass would then reject it as a bad record length.
-            tx.extend_from_slice(&0x1122_3344u32.to_le_bytes());
-
-            let payload_len = (bidx_core::BLOCK_HEADER_LEN + 1 + tx.len()) as u32;
-            data.extend_from_slice(&bidx_core::BLOCK_MAGIC.to_le_bytes());
-            data.extend_from_slice(&payload_len.to_le_bytes());
-            data.extend_from_slice(&hdr);
-            data.push(1u8);
-            data.extend_from_slice(&tx);
-            prev = bidx_core::dsha256(&hdr);
+            prev = push_record(&mut data, i, prev, body_for(i));
             hashes.push(prev);
         }
         std::fs::write(&blk_path, &data).unwrap();
@@ -2413,6 +2620,201 @@ mod tests {
     }
 
     #[test]
+    fn run_bench_flushes_an_incomplete_trial_report_then_fails() {
+        // The regression this guards: a run that dies mid-pipeline used to
+        // write *nothing* to --csv, because the write happened only after the
+        // whole loop succeeded. Now the report is flushed with the live
+        // counters and `complete: false`, and the process still exits non-zero.
+        let (dir, _) = make_chain_with_bad_body(3, 1);
+        let report =
+            std::env::temp_dir().join(format!("bidx-bench-partial-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&report);
+        let mut cfg = test_cfg(BenchMode::Parse);
+        cfg.blocks_dir = dir.clone();
+        cfg.threads = Some(1);
+        cfg.csv = Some(report.clone());
+
+        // Still an error — the run did not complete — but the file exists.
+        let e = run_bench(cfg).unwrap_err();
+        assert!(e.to_string().contains("did not complete"), "got {e}");
+
+        let body = std::fs::read_to_string(&report).unwrap();
+        assert!(body.contains("\"complete\": false"), "got {body}");
+        assert!(body.contains("\"error\":"), "got {body}");
+        assert!(body.contains("\"planned_blocks\": 3"), "got {body}");
+        // The completed-block count must be below the planned range, and the
+        // throughput fields must still be present (not a bare error object).
+        assert!(body.contains("\"blocks_per_sec\""), "got {body}");
+
+        let _ = std::fs::remove_file(&report);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_bench_flushes_a_completed_trial_before_a_later_one_aborts() {
+        // With --repeat 2 the first trial succeeds and the second aborts. The
+        // per-trial flush must leave trial 0's numbers on disk, proving a later
+        // failure cannot discard an earlier success.
+        let (dir, _) = make_chain_with_bad_body(3, 1);
+        let report =
+            std::env::temp_dir().join(format!("bidx-bench-prefix-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&report);
+        let mut cfg = test_cfg(BenchMode::Parse);
+        cfg.blocks_dir = dir.clone();
+        cfg.threads = Some(1);
+        cfg.repeat = 2;
+        cfg.csv = Some(report.clone());
+
+        let e = run_bench(cfg).unwrap_err();
+        assert!(e.to_string().contains("did not complete"), "got {e}");
+
+        let body = std::fs::read_to_string(&report).unwrap();
+        // Both trials are present: the clean one and the aborted one.
+        assert!(body.contains("\"trial\": 0"), "got {body}");
+        assert!(body.contains("\"trial\": 1"), "got {body}");
+        assert!(body.contains("\"complete\": false"), "got {body}");
+
+        let _ = std::fs::remove_file(&report);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_bench_cold_store_still_flushes_the_report() {
+        // A cold-store failure is detected *after* the pipeline finishes, so
+        // the trial reaches the report-assembly tail rather than aborting
+        // mid-pipeline. The report must still be written (with `error` set to
+        // the cold-store message) before the process fails.
+        let (dir, _) = make_chain_with_missing_spends(2);
+        let utxo = std::env::temp_dir().join(format!("bidx-bench-cold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+        let report =
+            std::env::temp_dir().join(format!("bidx-bench-coldrep-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&report);
+        let mut cfg = test_cfg(BenchMode::Utxo);
+        cfg.blocks_dir = dir.clone();
+        cfg.utxo = Some(utxo.clone());
+        cfg.threads = Some(1);
+        cfg.csv = Some(report.clone());
+
+        let e = run_bench(cfg).unwrap_err();
+        assert!(e.to_string().contains("did not complete"), "got {e}");
+
+        let body = std::fs::read_to_string(&report).unwrap();
+        assert!(body.contains("\"planned_blocks\""), "got {body}");
+        // The captured error is the cold-store guard's message, not a generic
+        // "did not complete".
+        assert!(body.contains("cold store"), "got {body}");
+
+        let _ = std::fs::remove_file(&report);
+        let _ = std::fs::remove_dir_all(&utxo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_trial_marks_an_incomplete_report() {
+        // The INCOMPLETE banner and its cause line are the human-readable half
+        // of the partial-report change; assert both branches run without panic
+        // and that a clean report prints neither.
+        let mut t = TrialReport {
+            trial: 7,
+            mode: BenchMode::Parse,
+            blocks: 4,
+            blocks_per_sec: 2.0,
+            blocks_per_sec_ex_header: 1.5,
+            user_cpu_secs: 0.2,
+            peak_rss_mb: 16.0,
+            missing_utxos: 0,
+            db_lookups: 0,
+            db_nanos: 0,
+            pending_hits: 0,
+            cache_hits: 0,
+            stages: vec![],
+            parse_latency: LatencyReport::default(),
+            utxo_latency: LatencyReport::default(),
+            rocksdb: Vec::new(),
+            complete: false,
+            error: Some("boom".to_string()),
+            last_height: 4,
+            planned_blocks: 10,
+        };
+        print_trial(&t);
+        // The clean variant prints no banner; the `error: None` branch must be
+        // reachable too (it is the `if let Some` miss).
+        t.complete = true;
+        t.error = None;
+        print_trial(&t);
+    }
+
+    #[test]
+    fn resolve_results_prefers_the_worker_error_and_returns_samples_clean() {
+        // Clean: both sides yield their samples, paired.
+        let (p, u) = resolve_results(Ok(vec![1, 2]), Ok(vec![3])).unwrap();
+        assert_eq!(p, vec![1, 2]);
+        assert_eq!(u, vec![3]);
+        // Worker fails: its (root-cause) error wins even if the consumer also
+        // failed, because a parse failure is what starved the consumer.
+        let e = resolve_results(
+            Err(anyhow::anyhow!("parse boom")),
+            Err(anyhow::anyhow!("consumer boom")),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("parse boom"), "got {e}");
+        // Consumer fails, worker clean: the consumer's error surfaces (this is
+        // the watchdog-trip / sink-error shape).
+        let e = resolve_results(Ok(vec![]), Err(anyhow::anyhow!("watchdog trip"))).unwrap_err();
+        assert!(e.to_string().contains("watchdog trip"), "got {e}");
+        // Worker fails, consumer clean: the worker error still surfaces.
+        let e = resolve_results(Err(anyhow::anyhow!("worker only")), Ok(vec![])).unwrap_err();
+        assert!(e.to_string().contains("worker only"), "got {e}");
+    }
+
+    #[test]
+    fn write_report_serializes_the_trials_it_is_given() {
+        let path = std::env::temp_dir().join(format!("bidx-bench-wr-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let t = TrialReport {
+            trial: 0,
+            mode: BenchMode::Headers,
+            blocks: 1,
+            blocks_per_sec: 1.0,
+            blocks_per_sec_ex_header: 1.0,
+            user_cpu_secs: 0.0,
+            peak_rss_mb: 1.0,
+            missing_utxos: 0,
+            db_lookups: 0,
+            db_nanos: 0,
+            pending_hits: 0,
+            cache_hits: 0,
+            stages: vec![],
+            parse_latency: LatencyReport::default(),
+            utxo_latency: LatencyReport::default(),
+            rocksdb: Vec::new(),
+            complete: true,
+            error: None,
+            last_height: 1,
+            planned_blocks: 1,
+        };
+        write_report(&path, std::slice::from_ref(&t)).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("\"complete\": true"), "got {first}");
+        // A second call with two trials overwrites (not appends).
+        write_report(&path, &[t.clone(), t]).unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(second.matches("\"trial\": 0").count(), 2, "got {second}");
+        let _ = std::fs::remove_file(&path);
+
+        // Writing to a path that is a directory fails; the error must carry the
+        // path context rather than being a bare io error.
+        let dir = std::env::temp_dir().join(format!("bidx-bench-wr-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = write_report(&dir, &[]).unwrap_err();
+        assert!(e.to_string().contains("writing report to"), "got {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_bench_utxo_dir_override_controls_throwaway_location() {
         // With --utxo-dir set and no explicit --utxo, the throwaway store is
         // created under that dir and removed afterwards.
@@ -2517,6 +2919,10 @@ mod tests {
                 name: "stall_micros".into(),
                 value: "0".into(),
             }],
+            complete: true,
+            error: None,
+            last_height: 100,
+            planned_blocks: 100,
         };
         let mut t1 = t0.clone();
         t1.trial = 1;
@@ -2553,6 +2959,10 @@ mod tests {
             parse_latency: LatencyReport::default(),
             utxo_latency: LatencyReport::default(),
             rocksdb: Vec::new(),
+            complete: true,
+            error: None,
+            last_height: 10,
+            planned_blocks: 10,
         };
         print_trial(&t);
     }
@@ -2814,6 +3224,10 @@ mod tests {
             parse_latency: LatencyReport::default(),
             utxo_latency: LatencyReport::default(),
             rocksdb: Vec::new(),
+            complete: true,
+            error: None,
+            last_height: 10,
+            planned_blocks: 10,
         };
         print_trial(&t);
     }
