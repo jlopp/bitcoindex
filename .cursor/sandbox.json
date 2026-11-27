@@ -1,0 +1,8 @@
+{
+  "type": "workspace_readwrite",
+  "disableTmpWrite": true,
+  "enableSharedBuildCache": false,
+  "additionalReadwritePaths": [
+    "~/.cargo"
+  ]
+}

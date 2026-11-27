@@ -64,4 +64,9 @@ unset _gcc_major
 unset CFLAGS
 unset CARGO_TARGET_DIR
 
+mkdir -p "${REPO_ROOT}/.tmp"
+export TMPDIR="${REPO_ROOT}/.tmp"
+export TMP="${REPO_ROOT}/.tmp"
+export TEMP="${REPO_ROOT}/.tmp"
+
 set +a

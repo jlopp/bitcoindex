@@ -1,0 +1,11 @@
+[build]
+# Keep build artifacts inside the repository rather than /tmp caches.
+target-dir = "target"
+
+[env]
+# Force temporary files (rustc, linkers, build scripts, and std::env::temp_dir()
+# in tests) into the repository instead of /tmp (which is often a small tmpfs
+# and is write-disabled by .cursor/sandbox.json).
+TMPDIR = { value = ".tmp", relative = true, force = true }
+TMP = { value = ".tmp", relative = true, force = true }
+TEMP = { value = ".tmp", relative = true, force = true }

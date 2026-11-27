@@ -3,6 +3,10 @@
 debug
 target
 
+# Repository-local temp and sandbox scratch directories (used instead of /tmp)
+.tmp/
+.sandbox-cache/
+
 # Local bindgen header shim (created per-machine from gcc builtins)
 .build-shim/
 
