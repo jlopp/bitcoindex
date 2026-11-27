@@ -875,3 +875,72 @@ eviction), `relieve_pressure_stops_the_block_cache_at_its_floor`,
 `thread_file_cache_shrink_to_lowers_the_bound_and_evicts`. Per-file coverage is
 at 100% for every touched file.
 
+## 14. Cutting disk I/O during initial ingestion
+
+The initial bulk index is disk-bound, but not on the reads one might expect:
+non-XOR `blk*.dat` is a zero-copy `mmap` served from page cache, so the block
+reads are cheap. The I/O is dominated by the *write* side — RocksDB leveled
+compaction rewrites the same data through every level, so bytes-to-NVMe are many
+times the logical UTXO size — plus the point-lookup *reads* for spent outpoints
+that miss the recent-UTXO cache and the block cache. Four changes, all in
+`bidx-store` plus a `run_parse` hook:
+
+### Write amplification
+
+- **Deferred compaction for the load.** `UtxoStore::open_planned_bulk` opens the
+  store with `disable_auto_compactions` (set on both the DB-level and the
+  per-CF options — per-CF is what takes effect, §6). Writes pile up in L0 with
+  no interleaved rewrites; `run_parse` calls `UtxoStore::finalize_bulk_load`
+  after the last block, which re-enables compaction and issues one
+  `compact_range` over the UTXO family. The I/O is paid once at the end instead
+  of smeared across the whole run.
+- **The L0 throttle is neutralized while deferred.** With compaction off, L0
+  only grows, so RocksDB's default `level_zero_stop_writes_trigger` (30) would
+  *halt all writes* with nothing coming to relieve it — a deadlock on a long
+  load. `disable_l0_write_throttle` raises both triggers to `i32::MAX` for the
+  deferral, and `finalize_bulk_load` restores the tuned values from the same
+  consts (`L0_SLOWDOWN_TRIGGER` / `L0_STOP_TRIGGER`), so the two cannot drift.
+- **`set_level_compaction_dynamic_level_bytes(true)`** in bulk mode: levels are
+  sized so the bulk lands in the bottommost level instead of being rewritten on
+  the way down.
+- **Compaction readahead (2 MiB) and a 2 GiB/s rate limiter** so compaction
+  reads sequentially and cannot monopolize the device queue the foreground
+  lookups share.
+
+### Reads
+
+- **HyperClockCache instead of LRU** for the shared block cache. A dozen parse
+  workers plus the consumer hit one cache; the LRU's per-hit mutex is a
+  contention point, HyperClock is lock-free on the read path. It stays mutable
+  (HyperClockCache implements `SetCapacity`), so `relieve_pressure`'s shedding
+  still works.
+
+### Parquet sink
+
+- **`BufWriter` around every part file.** `ArrowWriter` issues one write per
+  encoded page, so an unbuffered part file is a syscall storm on the single sink
+  thread. A 1 MiB buffer collapses those into large sequential writes; Parquet's
+  `finish` flushes through to the inner writer, so nothing is stranded on close.
+
+### What is *not* done here
+
+The batched `multi_get` prefetch stays unimplemented — §9 measured it as noise
+once the block cache made the working set resident, and the note in `utxo.rs`
+flags mainnet as the case to re-ask. No benchmark before/after is recorded yet:
+this lands the mechanism, and `bidx bench --mode full` on mainnet is the
+measurement that decides whether the compaction profile is a win or a loss
+(deferral trades peak read amplification during the load for less total write
+I/O; if L0 grows enough to slow the point lookups more than the write saving is
+worth, `open_planned` — the non-deferred path — remains the fallback).
+
+### Tests
+
+`utxo.rs` adds `open_planned_bulk_routes_the_plan_caches` (the caches reach the
+CF), `bulk_load_defers_compaction_then_finalize_compacts` (a write survives the
+finalize compaction and still resolves), and
+`finalize_bulk_load_is_a_noop_for_non_deferred_stores` (a live store and a plain
+bulk store are never compacted out from under themselves).
+`parquet_writers.rs` adds `bufwriter_part_survives_multiple_row_groups` (five
+rows across three row groups read back intact through the buffer). Per-file
+coverage is at 100% for every touched file.
+

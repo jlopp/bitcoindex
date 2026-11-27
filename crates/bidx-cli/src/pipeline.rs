@@ -259,7 +259,13 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         ceiling_mb = planned.ceiling_kb / 1024,
         "opening UTXO store"
     );
-    let utxo = Arc::new(UtxoStore::open_planned(&cfg.utxo, &planned)?);
+    // Defer background compaction for the duration of the load. An initial
+    // index is write-dominated, and leveled compaction rewrites the same data
+    // through every level; deferring turns that interleaved write I/O into a
+    // single compaction in `finalize_bulk_load` after the last block. Writes
+    // pile up in L0 meanwhile, which is fine because nothing reads the store
+    // heavily until the load finishes. See `UtxoStore::open_planned_bulk`.
+    let utxo = Arc::new(UtxoStore::open_planned_bulk(&cfg.utxo, &planned)?);
 
     // Channel carries parsed blocks from workers to the ordered consumer.
     // Bound it to keep memory in check if the consumer (RocksDB) lags.
@@ -318,6 +324,10 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         let next_height = Arc::clone(&next_height);
         let watchdog = Arc::clone(&watchdog);
         let file_cache = file_cache.clone();
+        // The consumer borrows the store; the original `utxo` binding is kept
+        // for the post-run `finalize_bulk_load` call, so the thread gets a
+        // clone rather than the only handle.
+        let utxo = Arc::clone(&utxo);
         move || -> Result<()> {
             consume_ordered(
                 rx,
@@ -378,7 +388,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // holding the height the consumer is waiting for must run, or
                 // no block ever arrives to let the consumer drain.
                 //
-                // coverage-exempt: 387-392 — the spin body only runs when the
+                // coverage-exempt: 397-402 — the spin body only runs when the
                 // consumer is >REORDER_HIGH blocks behind *and* the worker's
                 // height is not the one being awaited, i.e. under real memory
                 // pressure the unit fixtures never create. The first clause of
@@ -404,7 +414,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // A send failure means the consumer is gone. That is either a
                 // real bug or the RSS watchdog having aborted it; report the
                 // actual cause rather than a generic "consumer dropped".
-                // coverage-exempt: 411-415, 426, 432 — the closure body and the
+                // coverage-exempt: 421-425, 436, 442 — the closure body and the
                 // two `map_err` closures only run when a send to the consumer
                 // fails (consumer aborted mid-run via the RSS watchdog); not
                 // reachable in the unit fixtures. Construction is covered.
@@ -442,6 +452,13 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         .join()
         // coverage-exempt: consumer only returns Err by panicking (not in fixtures)
         .map_err(|_| anyhow::anyhow!("consumer panicked"))??;
+
+    // The load is done: re-enable compaction and compact the UTXO family once,
+    // paying the deferred write I/O in a single pass instead of interleaving it
+    // with the parse. Runs after the consumer has stopped writing.
+    if utxo.finalize_bulk_load()? {
+        info!("finalized bulk load: compacted UTXO store");
+    }
 
     progress.finish_with_message("parse complete");
     println!("parsed {} blocks", parsed.load(Ordering::Relaxed));
@@ -744,7 +761,7 @@ fn consume_ordered(
                     &mut file_cache_bound,
                 );
                 was_pressured = pressured;
-                // coverage-exempt: 750-751 — `consume_ordered` is only driven by the
+                // coverage-exempt: 768 — `consume_ordered` is only driven by the
                 // end-to-end `run_parse` tests, none of which trip the watchdog
                 // mid-run; the bench consumer's equivalent abort is directly tested.
                 if w.is_tripped() {
@@ -787,7 +804,7 @@ fn consume_ordered(
             // Hand the fully-enriched block to the sink thread. A send error
             // means the sink already failed; surface its error, not a generic
             // "channel closed".
-            // coverage-exempt: 796-806 — only runs when the sink thread has
+            // coverage-exempt: 817-820 — only runs when the sink thread has
             // already died (a Parquet write error mid-run), which the fixtures
             // do not provoke; the normal send is covered.
             if sink_tx
@@ -825,7 +842,7 @@ fn consume_ordered(
 
     if next < end {
         // Channel closed before we saw every height: that's an error.
-        // coverage-exempt: 826-836 — reached only when the producer's channel
+        // coverage-exempt: 851-852 — reached only when the producer's channel
         // closes before every height was delivered (a parse/worker abort). The
         // fixtures always complete the range and return via the `break
         // 'consume` exit, so this defensive tail is not exercised; it exists so

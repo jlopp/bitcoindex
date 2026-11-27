@@ -347,6 +347,10 @@ pub struct UtxoStore {
     /// far `relieve_pressure` can shrink it. Atomic (not `Cell`) because the
     /// store is shared across threads via `Arc`.
     block_cache_bytes: std::sync::atomic::AtomicUsize,
+    /// True when this store is a bulk-index store (no undo) *and* the caller
+    /// asked to defer background compaction. Only then does `finalize_bulk_load`
+    /// re-enable compaction and run the single end-of-run `compact_range`.
+    bulk_deferred_compaction: bool,
 }
 
 pub struct SpendResult {
@@ -427,6 +431,33 @@ impl CacheStats {
 /// `open()` on a small host cannot allocate an outsized cache.
 pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 1 << 30; // 1 GiB
 
+/// Compaction input readahead in bulk mode: 2 MiB runs instead of one read per
+/// data block. Large enough to turn the compaction's read pattern sequential,
+/// small enough not to waste NVMe bandwidth on read-ahead the compaction skips.
+const COMPACTION_READAHEAD_BYTES: usize = 2 << 20;
+
+/// Ceiling on background compaction/flush throughput in bulk mode, in bytes per
+/// second (2 GiB/s). The point is not to slow compaction but to stop it from
+/// monopolizing the device queue the *foreground* point lookups and `blk*.dat`
+/// reads share: an unthrottled compaction burst on a fast NVMe can stall the
+/// apply path for as long as it runs. Set well above what a typical NVMe
+/// sustains so a fast device is never artificially capped in steady state.
+const COMPACTION_RATE_LIMIT_BYTES: i64 = 2 << 30;
+
+/// `estimated_entry_charge` for the HyperClockCache: the fixed charge reserved
+/// per cached entry. RocksDB recommends the larger of the data-block and
+/// metadata-block size; 16 KiB is a conservative value for a block cache whose
+/// blocks are mostly small UTXO entries. Erring low costs a little metadata
+/// space, which is the safe direction (erring high forces evictions).
+const CACHE_ENTRY_CHARGE: usize = 16 << 10;
+
+/// Default L0 write-throttle triggers. Named consts because a deferred-
+/// compaction load raises them (`disable_l0_write_throttle`) and then
+/// `finalize_bulk_load` restores them; sharing the values is what keeps the
+/// deferral and the restore from drifting apart.
+const L0_SLOWDOWN_TRIGGER: i32 = 20;
+const L0_STOP_TRIGGER: i32 = 30;
+
 /// Write-path tuning that does not depend on the block cache. Applied to the
 /// database *and* to every column family (see [`tuned_options`]).
 ///
@@ -435,7 +466,21 @@ pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 1 << 30; // 1 GiB
 /// 16-core machine leaving cores idle during L0/L1 compaction is free
 /// throughput left on the table. `subcompactions` in particular lets a single
 /// large compaction use multiple cores.
-fn apply_write_tuning(opts: &mut Options) {
+///
+/// `bulk` selects the bulk-ingest profile. It changes *write* I/O, which is the
+/// dominant disk cost of an initial index: leveled compaction rewrites the same
+/// data through every level, so the bytes that hit NVMe are many times the
+/// logical UTXO size. Two settings attack that:
+///
+/// * `set_level_compaction_dynamic_level_bytes(true)` sizes the levels so the
+///   bulk of the data lands in the bottommost level instead of being rewritten
+///   on the way down, cutting write amplification.
+/// * `set_compaction_readahead_size` prefetches input SSTs for a compaction in
+///   large reads, so the compaction does not issue one small read per block.
+///
+/// Live mode leaves both at RocksDB's defaults: it writes little per block and
+/// values the steady-state read behaviour dynamic levels can change.
+fn apply_write_tuning(opts: &mut Options, bulk: bool) {
     // A 512 MiB buffer means a flush every ~8s at the observed write rate
     // rather than every second; with 4 buffers we can absorb a burst while a
     // flush is in flight.
@@ -443,8 +488,8 @@ fn apply_write_tuning(opts: &mut Options) {
     opts.set_max_write_buffer_number(4);
     opts.set_target_file_size_base(256 << 20);
     opts.set_level_zero_file_num_compaction_trigger(8);
-    opts.set_level_zero_slowdown_writes_trigger(20);
-    opts.set_level_zero_stop_writes_trigger(30);
+    opts.set_level_zero_slowdown_writes_trigger(L0_SLOWDOWN_TRIGGER);
+    opts.set_level_zero_stop_writes_trigger(L0_STOP_TRIGGER);
     let jobs = default_background_jobs();
     opts.set_max_background_jobs(jobs);
     opts.increase_parallelism(jobs);
@@ -454,6 +499,31 @@ fn apply_write_tuning(opts: &mut Options) {
     opts.set_max_subcompactions(default_subcompactions());
     opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
     opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+
+    if bulk {
+        // Let the bottommost level absorb the bulk of the data instead of
+        // rewriting it down every level. This is the single biggest write-amp
+        // reduction available to an append-heavy load.
+        opts.set_level_compaction_dynamic_level_bytes(true);
+        // Read compaction inputs in 2 MiB runs rather than block-at-a-time.
+        opts.set_compaction_readahead_size(COMPACTION_READAHEAD_BYTES);
+        // Cap compaction/IO background traffic so it cannot saturate the same
+        // NVMe queue the point lookups and blk reads share.
+        opts.set_ratelimiter(COMPACTION_RATE_LIMIT_BYTES, 100_000, 10);
+    }
+}
+
+/// Neutralize the L0 write throttle for a deferred-compaction bulk load.
+///
+/// With auto-compaction off, L0 only grows: nothing ever merges it. RocksDB's
+/// default `level_zero_slowdown_writes_trigger` (20) and
+/// `level_zero_stop_writes_trigger` (30) would then *stop all writes* once L0
+/// crossed 30 files — with no compaction coming to relieve the pressure, the
+/// load deadlocks. Raising both to the maximum keeps the write path open; the
+/// pile-up is exactly what `finalize_bulk_load` is for.
+fn disable_l0_write_throttle(opts: &mut Options) {
+    opts.set_level_zero_slowdown_writes_trigger(i32::MAX);
+    opts.set_level_zero_stop_writes_trigger(i32::MAX);
 }
 
 /// Background jobs for the write path: one per core, clamped to a sane range.
@@ -498,11 +568,11 @@ fn default_subcompactions() -> u32 {
 /// handle to every column family. Constructing a fresh cache per CF (as this
 /// used to) both tripled the memory and fragmented it, so a lookup in the UTXO
 /// family could not benefit from blocks the undo family had already read.
-fn tuned_options(statistics: bool, block_cache: &rocksdb::Cache) -> Options {
+fn tuned_options(statistics: bool, block_cache: &rocksdb::Cache, bulk: bool) -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
-    apply_write_tuning(&mut opts);
+    apply_write_tuning(&mut opts, bulk);
     // A real block cache, plus a Bloom filter so a lookup for a spent outpoint
     // can reject a missing key without touching a data block. Both are
     // attached per-CF, which is the only place they take effect.
@@ -539,6 +609,7 @@ impl UtxoStore {
             DEFAULT_BLOCK_CACHE_BYTES,
             0,
             DEFAULT_MEMTABLE_BUDGET_BYTES,
+            false,
         )
     }
 
@@ -552,6 +623,7 @@ impl UtxoStore {
             DEFAULT_BLOCK_CACHE_BYTES,
             0,
             DEFAULT_MEMTABLE_BUDGET_BYTES,
+            false,
         )
     }
 
@@ -568,6 +640,7 @@ impl UtxoStore {
             DEFAULT_BLOCK_CACHE_BYTES,
             0,
             DEFAULT_MEMTABLE_BUDGET_BYTES,
+            false,
         )
     }
 
@@ -587,6 +660,7 @@ impl UtxoStore {
             DEFAULT_BLOCK_CACHE_BYTES,
             cache_bytes,
             DEFAULT_MEMTABLE_BUDGET_BYTES,
+            false,
         )
     }
 
@@ -600,6 +674,7 @@ impl UtxoStore {
             DEFAULT_BLOCK_CACHE_BYTES,
             cache_bytes,
             DEFAULT_MEMTABLE_BUDGET_BYTES,
+            false,
         )
     }
 
@@ -624,6 +699,7 @@ impl UtxoStore {
             block_cache_bytes,
             recent_cache_bytes,
             DEFAULT_MEMTABLE_BUDGET_BYTES,
+            false,
         )
     }
 
@@ -641,6 +717,7 @@ impl UtxoStore {
             block_cache_bytes,
             recent_cache_bytes,
             DEFAULT_MEMTABLE_BUDGET_BYTES,
+            false,
         )
     }
 
@@ -662,6 +739,7 @@ impl UtxoStore {
             plan.block_cache_bytes,
             plan.recent_cache_bytes,
             plan.memtable_budget_bytes,
+            false,
         )
     }
 
@@ -678,6 +756,38 @@ impl UtxoStore {
             plan.block_cache_bytes,
             plan.recent_cache_bytes,
             plan.memtable_budget_bytes,
+            false,
+        )
+    }
+
+    /// Like [`UtxoStore::open_planned`], but defers background compaction for
+    /// the duration of a bulk load: writes accumulate without the leveled
+    /// rewrites that otherwise dominate disk I/O during an initial index.
+    ///
+    /// The caller **must** call [`UtxoStore::finalize_bulk_load`] when the load
+    /// is done, before the store is used for anything else. Until then L0 holds
+    /// an ever-growing pile of un-compacted files, so reads scan more of them —
+    /// fine while writing, not fine for steady state. `finalize_bulk_load`
+    /// re-enables compaction and compacts once, paying the I/O a single time
+    /// instead of interleaving it with the load.
+    ///
+    /// Deferral trades peak read amplification during the load for far less
+    /// total write I/O. It is the right default only when the load is
+    /// write-dominated and the store is not read heavily until it finishes,
+    /// which is exactly an initial bulk index.
+    pub fn open_planned_bulk(
+        path: &Path,
+        plan: &bidx_core::MemoryPlan,
+    ) -> Result<Self, UtxoError> {
+        Self::open_with(
+            path,
+            false,
+            false,
+            false,
+            plan.block_cache_bytes,
+            plan.recent_cache_bytes,
+            plan.memtable_budget_bytes,
+            true,
         )
     }
 
@@ -690,16 +800,32 @@ impl UtxoStore {
         block_cache_bytes: usize,
         recent_cache_bytes: usize,
         memtable_budget_bytes: usize,
+        auto_compaction_disabled: bool,
     ) -> Result<Self, UtxoError> {
+        // Bulk-load tuning follows undo, which is exactly the split between an
+        // initial index (no undo) and live tracking (undo). Deriving it here
+        // rather than threading another flag keeps the two from drifting: a
+        // store without undo *is* a bulk store.
+        let bulk = !undo_enabled;
+
         // One block cache, shared by every column family. Allocating it here
         // (rather than inside `tuned_options`) is what makes the sharing real:
         // the same handle is cloned into each CF descriptor below, so a block
         // read for the undo family can be reused by the UTXO family and the
         // total is bounded by one budget instead of three.
-        let block_cache = rocksdb::Cache::new_lru_cache(block_cache_bytes.max(1));
+        //
+        // A HyperClockCache rather than an LRU: on the apply path a dozen parse
+        // workers plus the consumer thread hit this one shared cache, and the
+        // LRU's per-hit mutex becomes a contention point. HyperClock is
+        // lock-free on the read path. `estimated_entry_charge` is a conservative
+        // per-entry reservation (see `CACHE_ENTRY_CHARGE`); the cache stays
+        // mutable so `relieve_pressure` can shrink it — HyperClockCache
+        // implements `SetCapacity`, so shedding works as it does for the LRU.
+        let block_cache =
+            rocksdb::Cache::new_hyper_clock_cache(block_cache_bytes.max(1), CACHE_ENTRY_CHARGE);
 
         // DB-level options: create flags, background threads, statistics.
-        let mut opts = tuned_options(statistics, &block_cache);
+        let mut opts = tuned_options(statistics, &block_cache, bulk);
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         // Cap the total memtable memory across all families. Without this each
@@ -711,12 +837,24 @@ impl UtxoStore {
         if memtable_budget_bytes > 0 {
             opts.set_db_write_buffer_size(memtable_budget_bytes);
         }
+        // Optionally defer background compaction entirely for the run. The
+        // caller re-enables it and compacts once via `finalize_bulk_load`.
+        opts.set_disable_auto_compactions(auto_compaction_disabled);
+        if auto_compaction_disabled {
+            disable_l0_write_throttle(&mut opts);
+        }
 
         // Per-CF options: this is where the storage tuning actually lands.
         // The undo and meta families share the same table factory and cache;
         // they do not need a large write buffer, since they are tiny next to
         // the UTXO family, but they must still point at the *shared* cache.
-        let utxo_cf_opts = tuned_options(statistics, &block_cache);
+        let mut utxo_cf_opts = tuned_options(statistics, &block_cache, bulk);
+        // Per-CF options are what actually take effect (see `tuned_options`), so
+        // the deferral must be set here too, not only on the DB-level options.
+        utxo_cf_opts.set_disable_auto_compactions(auto_compaction_disabled);
+        if auto_compaction_disabled {
+            disable_l0_write_throttle(&mut utxo_cf_opts);
+        }
         let mut aux_cf_opts = Options::default();
         let mut aux_block_opts = rocksdb::BlockBasedOptions::default();
         aux_block_opts.set_block_cache(&block_cache);
@@ -743,9 +881,15 @@ impl UtxoStore {
             statistics,
             block_cache: Some(block_cache),
             block_cache_bytes: std::sync::atomic::AtomicUsize::new(block_cache_bytes),
+            bulk_deferred_compaction: bulk && auto_compaction_disabled,
         })
     }
 
+    fn cf_utxo(&self) -> &rocksdb::ColumnFamily {
+        self.db
+            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .expect("default cf")
+    }
     fn cf_undo(&self) -> &rocksdb::ColumnFamily {
         self.db.cf_handle(CF_UNDO).expect("undo cf")
     }
@@ -992,6 +1136,47 @@ impl UtxoStore {
     pub fn flush(&self) -> Result<(), UtxoError> {
         self.db.flush()?;
         Ok(())
+    }
+
+    /// Close out a deferred-compaction bulk load: re-enable background
+    /// compaction and compact the UTXO column family once, so the L0 pile that
+    /// accumulated during the load is merged in a single pass.
+    ///
+    /// A no-op (returns `false`) for any store not opened via
+    /// [`UtxoStore::open_planned_bulk`] — a live store, or a bulk store whose
+    /// compaction was never deferred, must not be compacted out from under
+    /// itself here. Returns `true` when it actually compacted.
+    ///
+    /// Both steps precede the `compact_range`: the memtable is flushed so the
+    /// final batch of writes is part of the compaction, and compaction is
+    /// re-enabled first so a flush triggered by the compaction is not blocked.
+    pub fn finalize_bulk_load(&self) -> Result<bool, UtxoError> {
+        if !self.bulk_deferred_compaction {
+            return Ok(false);
+        }
+        // Re-enable background compaction on the UTXO family and restore the
+        // L0 triggers the deferral had raised (see `disable_l0_write_throttle`),
+        // so the store returns to its standard tuned configuration once the
+        // load is over. Per-CF options are what took effect at open (see
+        // `tuned_options`), so the toggles must be per-CF here too. The trigger
+        // values come from the same consts `apply_write_tuning` uses, so the
+        // two cannot drift.
+        let slowdown = L0_SLOWDOWN_TRIGGER.to_string();
+        let stop = L0_STOP_TRIGGER.to_string();
+        self.db.set_options_cf(
+            self.cf_utxo(),
+            &[
+                ("disable_auto_compactions", "false"),
+                ("level0_slowdown_writes_trigger", &slowdown),
+                ("level0_stop_writes_trigger", &stop),
+            ],
+        )?;
+        // Push any buffered writes into an SST so the compaction below covers
+        // them, then compact the whole key range in one go.
+        self.db.flush()?;
+        self.db
+            .compact_range_cf(self.cf_utxo(), None::<&[u8]>, None::<&[u8]>);
+        Ok(true)
     }
 
     /// Shed memory under pressure, without failing the run.
@@ -1737,6 +1922,95 @@ mod tests {
         };
         let db2 = UtxoStore::open_planned(&dir2, &zero).unwrap();
         assert!(db2.cache_stats().is_none(), "zero recent cache must disable it");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    fn bulk_test_plan() -> bidx_core::MemoryPlan {
+        bidx_core::MemoryPlan {
+            ceiling_kb: 16 * 1024 * 1024,
+            block_cache_bytes: 64 << 20,
+            recent_cache_bytes: 16 << 20,
+            memtable_budget_bytes: 64 << 20,
+            file_cache_files: 4,
+        }
+    }
+
+    /// `open_planned_bulk` must route the plan's caches into the store exactly
+    /// like `open_planned`, so the bulk entry point is not a silently different
+    /// configuration. The deferred-compaction half is asserted by the finalize
+    /// tests below; here we only pin the caches.
+    #[test]
+    fn open_planned_bulk_routes_the_plan_caches() {
+        let dir = tmp_path("bulkcaches");
+        let plan = bulk_test_plan();
+        let db = UtxoStore::open_planned_bulk(&dir, &plan).unwrap();
+        let props: std::collections::HashMap<String, String> =
+            db.perf_properties().into_iter().collect();
+        assert_eq!(
+            props
+                .get("block_cache_capacity")
+                .expect("block_cache_capacity present")
+                .parse::<usize>()
+                .expect("numeric"),
+            plan.block_cache_bytes,
+            "bulk entry point must route the plan's block cache"
+        );
+        assert_eq!(
+            db.cache_stats().unwrap().budget_bytes,
+            plan.recent_cache_bytes,
+            "bulk entry point must route the plan's recent cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deferred-compaction bulk store must accept writes while compaction is
+    /// off, then `finalize_bulk_load` re-enables compaction, compacts once, and
+    /// leaves the data intact. Asserting the post-compaction spend resolves
+    /// checks the compaction did not drop or corrupt a live key — the failure
+    /// mode a naive `compact_range` after a re-enable could hide.
+    #[test]
+    fn bulk_load_defers_compaction_then_finalize_compacts() {
+        let dir = tmp_path("bulkfinalize");
+        let db = UtxoStore::open_planned_bulk(&dir, &bulk_test_plan()).unwrap();
+        // A write under deferred compaction: no auto-compaction runs, so this
+        // lands in the memtable/L0 pile the finalize below must merge.
+        let a = [0x61u8; 32];
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 5_000)])
+            .unwrap();
+        assert!(
+            db.finalize_bulk_load().unwrap(),
+            "a deferred bulk store must report that it compacted"
+        );
+        // The output survived the compaction: a spend of it still resolves.
+        let t1 = [0x62u8; 32];
+        let inp = inp_row(1, 0, 0, t1, a, 0, false);
+        let r = db.apply_block(1, &[tx_row(1, 0, t1)], &[inp], &[]).unwrap();
+        assert_eq!(r.spends.len(), 1);
+        assert_eq!(r.spends[0].spent_value_sat, 5_000);
+        assert_eq!(r.missing, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `finalize_bulk_load` must be a no-op for a store that did not defer
+    /// compaction: a live store (undo enabled) must never be compacted out from
+    /// under its reorg path, and a plain bulk store never accumulated the L0
+    /// pile that needs merging.
+    #[test]
+    fn finalize_bulk_load_is_a_noop_for_non_deferred_stores() {
+        let dir = tmp_path("livefinalize");
+        let live = UtxoStore::open_live(&dir).unwrap();
+        assert!(
+            !live.finalize_bulk_load().unwrap(),
+            "a live store must not compact on finalize"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir2 = tmp_path("plainfinalize");
+        let plain = UtxoStore::open_planned(&dir2, &bulk_test_plan()).unwrap();
+        assert!(
+            !plain.finalize_bulk_load().unwrap(),
+            "a bulk store that never deferred must be a finalize no-op"
+        );
         let _ = std::fs::remove_dir_all(&dir2);
     }
 

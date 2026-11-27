@@ -16,6 +16,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
@@ -55,6 +56,21 @@ fn writer_props() -> WriterProperties {
         .set_write_batch_size(8192)
         .build()
 }
+
+/// Write-back buffer for one Parquet part file.
+///
+/// `ArrowWriter` issues a `write` syscall for every encoded page, so an
+/// unbuffered part file pays hundreds of small syscalls per row group — a
+/// syscall storm on the single sink thread that serializes the whole write
+/// path. A 1 MiB buffer collapses those into large sequential writes. The
+/// buffer is flushed on `finish()`, which `ArrowWriter::close` routes to the
+/// inner writer (parquet's `SerializedFileWriter::finish` calls `buf.flush`),
+/// so no data is stranded when a part is closed.
+const PARQUET_WRITE_BUF_BYTES: usize = 1 << 20;
+
+/// The writer every entity table uses: Parquet over a buffered file. Aliased so
+/// the six `ArrowWriter<...>` fields below stay in lockstep with `create_writer`.
+type EntityWriter = ArrowWriter<BufWriter<File>>;
 
 fn fbin32(name: &str) -> Field {
     Field::new(name, DataType::FixedSizeBinary(32), false)
@@ -252,13 +268,13 @@ pub struct ParquetSink {
     #[allow(dead_code)]
     part: u32,
 
-    blocks_w: ArrowWriter<File>,
-    txs_w: ArrowWriter<File>,
-    inputs_w: ArrowWriter<File>,
-    outputs_w: ArrowWriter<File>,
-    spends_w: ArrowWriter<File>,
+    blocks_w: EntityWriter,
+    txs_w: EntityWriter,
+    inputs_w: EntityWriter,
+    outputs_w: EntityWriter,
+    spends_w: EntityWriter,
     /// Only present when `cfg.capture_witness` is set.
-    witnesses_w: Option<ArrowWriter<File>>,
+    witnesses_w: Option<EntityWriter>,
 
     blocks: EntityTable,
     txs: EntityTable,
@@ -273,11 +289,14 @@ fn create_writer(
     entity: &str,
     part: u32,
     schema: SchemaRef,
-) -> Result<ArrowWriter<File>, SinkError> {
+) -> Result<EntityWriter, SinkError> {
     let pdir = dir.join(entity);
     std::fs::create_dir_all(&pdir)?;
     let file = File::create(pdir.join(format!("part-{part:05}.parquet")))?;
-    Ok(ArrowWriter::try_new(file, schema, Some(writer_props()))?)
+    // Buffer the file: Parquet emits one write per page, so an unbuffered part
+    // file is a syscall storm on the sink thread. See `PARQUET_WRITE_BUF_BYTES`.
+    let buffered = BufWriter::with_capacity(PARQUET_WRITE_BUF_BYTES, file);
+    Ok(ArrowWriter::try_new(buffered, schema, Some(writer_props()))?)
 }
 
 impl ParquetSink {
@@ -637,6 +656,54 @@ mod tests {
         assert_eq!(value.value(0), 100);
         assert_eq!(value.value(1), 101);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Part files are written through a `BufWriter`, so a part with more than
+    /// one row group exercises the buffer being flushed across a row-group
+    /// boundary *and* at close. If the buffer were dropped without flushing —
+    /// the failure mode this guards — the reader would see truncated data or a
+    /// corrupt footer rather than the full row set.
+    #[test]
+    fn bufwriter_part_survives_multiple_row_groups() {
+        let dir = tmp_dir("bufw");
+        let mut sink = ParquetSink::create(
+            &dir,
+            0,
+            SinkConfig {
+                batch_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // 5 rows at batch_size 2 → row groups of 2, 2, 1: the partial final
+        // group forces a flush at `finish()` on top of the two full ones.
+        for h in 0..5u32 {
+            sink.push_block(&block_row(h)).unwrap();
+        }
+        sink.finish().unwrap();
+
+        let f = File::open(dir.join("blocks/part-00000.parquet")).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
+        let reader = builder.build().unwrap();
+        let mut heights = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let col = batch
+                .column_by_name("height")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                heights.push(col.value(i));
+            }
+        }
+        assert_eq!(
+            heights,
+            vec![0, 1, 2, 3, 4],
+            "every row must survive the buffered write"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
