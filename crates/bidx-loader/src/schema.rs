@@ -176,7 +176,7 @@ pub fn index_catalog() -> Vec<IndexSpec> {
 /// in dependency order (base tables -> base-table indexes -> index tables ->
 /// materialized views). All statements are idempotent.
 pub fn all_ddl(db: &str) -> Vec<String> {
-    vec![
+    let mut out = vec![
         // --- base entity tables ---
         blocks(db),
         transactions(db),
@@ -207,21 +207,12 @@ pub fn all_ddl(db: &str) -> Vec<String> {
         blocks_by_miner(db),          // 17
         address_prefix(db),           // 18
         scripthash_map(db),           // 19
-        // --- materialized views (source + target both exist by now) ---
-        mv_transactions_by_txid(db), // 2
-        mv_inputs_by_prev_output(db),
-        mv_outputs_by_address(db),       // 4
-        mv_spends_by_spent_outpoint(db), // 3
-        mv_spends_by_address(db),        // 5
-        mv_address_history_fund(db),     // 6
-        mv_address_history_spend(db),    // 6
-        mv_utxos_fund(db),               // 7
-        mv_utxos_spend(db),              // 7
-        mv_address_stats_fund(db),       // 15
-        mv_address_stats_spend(db),      // 15
-        mv_blocks_by_miner(db),          // 17
-        mv_scripthash_map(db),           // 19
-    ]
+    ];
+    // --- materialized views (source + target both exist by now) ---
+    // Kept in `materialized_views` so the bulk-load path can drop and recreate
+    // exactly the same set around a deferred backfill.
+    out.extend(materialized_views(db));
+    out
 }
 
 /// Names of every table `all_ddl` creates (base + index tables, not the
@@ -804,6 +795,176 @@ fn mv_scripthash_map(db: &str) -> String {
     )
 }
 
+/// Every materialized view `all_ddl` creates, in the same order. Exposed so
+/// the bulk-load path can drop and recreate exactly the set the schema
+/// defines, without a second hardcoded list drifting out of sync.
+pub fn materialized_views(db: &str) -> Vec<String> {
+    vec![
+        mv_transactions_by_txid(db), // 2
+        mv_inputs_by_prev_output(db),
+        mv_outputs_by_address(db),       // 4
+        mv_spends_by_spent_outpoint(db), // 3
+        mv_spends_by_address(db),        // 5
+        mv_address_history_fund(db),     // 6
+        mv_address_history_spend(db),    // 6
+        mv_utxos_fund(db),               // 7
+        mv_utxos_spend(db),              // 7
+        mv_address_stats_fund(db),       // 15
+        mv_address_stats_spend(db),      // 15
+        mv_blocks_by_miner(db),          // 17
+        mv_scripthash_map(db),           // 19
+    ]
+}
+
+/// The materialized-view *names*, in creation order, so the bulk-load path can
+/// `DROP VIEW IF EXISTS` each one by name before a deferred load. Each entry
+/// pairs the view with the base table whose inserts it consumes, which is what
+/// the backfill queries below read from.
+pub fn materialized_view_names() -> Vec<&'static str> {
+    vec![
+        "transactions_by_txid_mv",
+        "inputs_by_prev_output_mv",
+        "outputs_by_address_mv",
+        "spends_by_spent_outpoint_mv",
+        "spends_by_address_mv",
+        "address_history_fund_mv",
+        "address_history_spend_mv",
+        "utxos_fund_mv",
+        "utxos_spend_mv",
+        "address_stats_fund_mv",
+        "address_stats_spend_mv",
+        "blocks_by_miner_mv",
+        "scripthash_map_mv",
+    ]
+}
+
+/// `DROP VIEW IF EXISTS` for every materialized view, so a bulk load can turn
+/// the derived-write fan-out off for the duration of the load. `DROP VIEW` (not
+/// `DROP TABLE`) is correct: these are views, and the target index tables are
+/// left intact (they are truncated and refilled by [`backfill_derived_indexes`]
+/// after the base load).
+pub fn drop_materialized_views(db: &str) -> Vec<String> {
+    materialized_view_names()
+        .iter()
+        .map(|name| format!("DROP VIEW IF EXISTS {db}.{name}"))
+        .collect()
+}
+
+/// Backfill every derived index table in one pass from the base tables, using
+/// the exact `SELECT` each materialized view would have run per row.
+///
+/// This is what makes a deferred bulk load cheaper than loading with the MVs
+/// live: instead of each base insert fanning out into up to six derived writes,
+/// the base entities load as plain appends and each derived table is filled
+/// once with a single `INSERT ... SELECT`. Each statement `TRUNCATE`s its
+/// target first, so the sequence is idempotent and safe to re-run.
+///
+/// Ordering within a statement list does not matter (the targets are disjoint),
+/// but the order here mirrors `materialized_views` for readability. The
+/// `scripthash_map` entry is not the raw MV body: it `SELECT DISTINCT`s, so it
+/// writes one row per distinct script rather than one per output, which is a
+/// large reduction on a full chain.
+pub fn backfill_derived_indexes(db: &str) -> Vec<String> {
+    vec![
+        // 2. transactions_by_txid
+        format!("TRUNCATE TABLE {db}.transactions_by_txid"),
+        format!(
+            "INSERT INTO {db}.transactions_by_txid (txid, height, tx_index) \
+             SELECT txid, height, tx_index FROM {db}.transactions"
+        ),
+        // 3. inputs_by_prev_output
+        format!("TRUNCATE TABLE {db}.inputs_by_prev_output"),
+        format!(
+            "INSERT INTO {db}.inputs_by_prev_output (prev_txid, prev_vout, height, tx_index, input_index, txid) \
+             SELECT prev_txid, prev_vout, height, tx_index, input_index, txid FROM {db}.inputs"
+        ),
+        // 4. outputs_by_address
+        format!("TRUNCATE TABLE {db}.outputs_by_address"),
+        format!(
+            "INSERT INTO {db}.outputs_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat) \
+             SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat FROM {db}.outputs"
+        ),
+        // 5. spends_by_spent_outpoint
+        format!("TRUNCATE TABLE {db}.spends_by_spent_outpoint"),
+        format!(
+            "INSERT INTO {db}.spends_by_spent_outpoint (spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid) \
+             SELECT spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid FROM {db}.spends"
+        ),
+        // 6. spends_by_address
+        format!("TRUNCATE TABLE {db}.spends_by_address"),
+        format!(
+            "INSERT INTO {db}.spends_by_address (spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height) \
+             SELECT spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height FROM {db}.spends"
+        ),
+        // 6. address_history (fund + spend)
+        format!("TRUNCATE TABLE {db}.address_history"),
+        format!(
+            "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
+             SELECT address_hash, height, tx_index, txid, toInt64(value_sat) AS value_sat, toUInt8(0) AS kind \
+             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+        format!(
+            "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
+             SELECT spent_address_hash AS address_hash, height, spending_tx_index AS tx_index, \
+                    spending_txid AS txid, toInt64(-spent_value_sat) AS value_sat, toUInt8(1) AS kind \
+             FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+        // 7. utxos_by_address (fund + spend)
+        format!("TRUNCATE TABLE {db}.utxos_by_address"),
+        format!(
+            "INSERT INTO {db}.utxos_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign) \
+             SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat, toInt8(1) AS sign \
+             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+        format!(
+            "INSERT INTO {db}.utxos_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign) \
+             SELECT spent_address_hash AS address_hash, spent_script_type AS script_type, height, \
+                    spending_tx_index AS tx_index, spent_vout AS output_index, spent_txid AS txid, \
+                    spent_value_sat AS value_sat, toInt8(-1) AS sign \
+             FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+        // 15. address_stats (fund + spend)
+        format!("TRUNCATE TABLE {db}.address_stats"),
+        format!(
+            "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
+             SELECT address_hash, toUInt64(1) AS funded_count, value_sat AS funded_sum, \
+                    toUInt64(0) AS spent_count, toUInt64(0) AS spent_sum, toUInt64(1) AS history_count \
+             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+        format!(
+            "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
+             SELECT spent_address_hash AS address_hash, toUInt64(0) AS funded_count, \
+                    toUInt64(0) AS funded_sum, toUInt64(1) AS spent_count, \
+                    spent_value_sat AS spent_sum, toUInt64(1) AS history_count \
+             FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+        // 17. blocks_by_miner
+        format!("TRUNCATE TABLE {db}.blocks_by_miner"),
+        format!(
+            "INSERT INTO {db}.blocks_by_miner (miner_hash, height, tx_index, coinbase_value) \
+             SELECT address_hash AS miner_hash, height, tx_index, value_sat AS coinbase_value \
+             FROM {db}.outputs WHERE tx_index = 0 AND script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+        // 19. scripthash_map — DISTINCT, unlike the per-row MV, so it writes one
+        // row per distinct script instead of one per output.
+        format!("TRUNCATE TABLE {db}.scripthash_map"),
+        format!(
+            "INSERT INTO {db}.scripthash_map (scripthash, script_type, address_hash) \
+             SELECT DISTINCT \
+               SHA256(multiIf( \
+                 script_type = 2, concat(unhex('76a914'), substring(address_hash, 1, 20), unhex('88ac')), \
+                 script_type = 3, concat(unhex('a914'), substring(address_hash, 1, 20), unhex('87')), \
+                 script_type = 4, concat(unhex('0014'), substring(address_hash, 1, 20)), \
+                 script_type = 5, concat(unhex('0020'), substring(address_hash, 1, 32)), \
+                 script_type = 6, concat(unhex('5120'), substring(address_hash, 1, 32)), \
+                 unhex(''))) AS scripthash, \
+               script_type, address_hash \
+             FROM {db}.outputs \
+             WHERE script_type IN (2, 3, 4, 5, 6)"
+        ),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Backfill queries (not DDL, but the SQL `bidx index rebuild` runs)
 // ---------------------------------------------------------------------------
@@ -1355,6 +1516,84 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `all_ddl` must build its MV section from the shared `materialized_views`
+    /// list, so the bulk-load path (which drops and recreates that exact list)
+    /// can never drift from the schema.
+    #[test]
+    fn all_ddl_materialized_views_match_the_shared_list() {
+        let ddls = all_ddl("db");
+        let mvs = materialized_views("db");
+        for mv in &mvs {
+            assert!(ddls.contains(mv), "all_ddl must include {mv}");
+        }
+        // Every MV name has a corresponding entry in the name list, and the
+        // count matches, so the two lists cannot silently diverge.
+        assert_eq!(mvs.len(), materialized_view_names().len());
+        for name in materialized_view_names() {
+            assert!(
+                mvs.iter().any(|mv| mv.contains(name)),
+                "materialized_views must contain a view named {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_materialized_views_drops_every_view_by_name() {
+        let drops = drop_materialized_views("db");
+        assert_eq!(drops.len(), materialized_view_names().len());
+        for (stmt, name) in drops.iter().zip(materialized_view_names()) {
+            assert_eq!(stmt, &format!("DROP VIEW IF EXISTS db.{name}"));
+        }
+        // Dropping a *view* leaves the target index table intact.
+        assert!(drops.iter().all(|s| !s.contains("DROP TABLE")));
+    }
+
+    /// Every derived index table fed by an MV must be truncated and refilled by
+    /// the deferred backfill, or a bulk load would leave it empty. Assert each
+    /// target appears exactly once as a `TRUNCATE` and at least once as an
+    /// `INSERT`, and that the two MV-fed-into-one-table pairs (address_history,
+    /// utxos_by_address, address_stats) get both their fund and spend inserts.
+    #[test]
+    fn backfill_derived_indexes_covers_every_mv_target() {
+        let stmts = backfill_derived_indexes("db");
+        let body = stmts.join("\n");
+        for table in [
+            "transactions_by_txid",
+            "inputs_by_prev_output",
+            "outputs_by_address",
+            "spends_by_spent_outpoint",
+            "spends_by_address",
+            "address_history",
+            "utxos_by_address",
+            "address_stats",
+            "blocks_by_miner",
+            "scripthash_map",
+        ] {
+            assert_eq!(
+                stmts
+                    .iter()
+                    .filter(|s| **s == format!("TRUNCATE TABLE db.{table}"))
+                    .count(),
+                1,
+                "{table} must be truncated exactly once"
+            );
+            assert!(
+                body.contains(&format!("INSERT INTO db.{table} ")),
+                "{table} must have a backfill insert"
+            );
+        }
+        // The three two-source tables get both halves.
+        assert_eq!(body.matches("INSERT INTO db.address_history ").count(), 2);
+        assert_eq!(body.matches("INSERT INTO db.utxos_by_address ").count(), 2);
+        assert_eq!(body.matches("INSERT INTO db.address_stats ").count(), 2);
+        // scripthash_map uses DISTINCT (unlike the per-row MV) and the same
+        // reconstruction expression.
+        assert!(body.contains("INSERT INTO db.scripthash_map "));
+        assert!(body.contains("SELECT DISTINCT"));
+        assert!(body.contains("unhex('76a914')"));
+        assert!(body.contains("WHERE script_type IN (2, 3, 4, 5, 6)"));
     }
 
     #[test]

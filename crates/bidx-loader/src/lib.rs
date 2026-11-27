@@ -310,7 +310,21 @@ impl ChLoader {
         self.load_all_with(parquet_dir, LoadMode::ServerFile)
     }
 
-    /// Load every base entity (plus the optional witness table) using `mode`.
+    /// Load every base entity (plus the optional witness table) using `mode`,
+    /// with the derived index tables built once at the end rather than row by
+    /// row.
+    ///
+    /// The materialized views are dropped for the duration of the load so the
+    /// base inserts are plain appends: with the views live, each base row fans
+    /// out into up to six derived-table writes, so a full-chain load performs
+    /// many times the base row count in independent insert operations. The
+    /// views are recreated and the derived tables refilled by
+    /// [`schema::backfill_derived_indexes`] after the base entities are in.
+    ///
+    /// This is valid because a bulk load starts from an empty database: the
+    /// derived tables are truncated and rebuilt from the base tables, so any
+    /// pre-existing content in them would be discarded. Live mode never calls
+    /// this path — it keeps the views live and appends through `live_insert`.
     pub fn load_all_with(&self, parquet_dir: &Path, mode: LoadMode) -> Result<(), LoadError> {
         let load = |entity: &str| -> Result<(), LoadError> {
             match mode {
@@ -322,6 +336,13 @@ impl ChLoader {
                 }
             }
         };
+
+        // Turn the derived-write fan-out off for the load (see the doc comment).
+        tracing::info!("dropping materialized views for a deferred derived-index build");
+        for stmt in schema::drop_materialized_views(&self.cfg.database) {
+            self.run_query(&stmt)?;
+        }
+
         for entity in schema::ENTITIES {
             tracing::info!(entity, "loading into ClickHouse");
             load(entity)?;
@@ -330,13 +351,20 @@ impl ChLoader {
         // produce it, so only load it when the directory is present.
         let wit_dir = parquet_dir.join(schema::WITNESS_ENTITY);
         if wit_dir.is_dir() {
-            tracing::info!(
-                entity = schema::WITNESS_ENTITY,
-                "loading optional witness payload table"
-            );
-            load(schema::WITNESS_ENTITY)?;
+            let entity = schema::WITNESS_ENTITY;
+            tracing::info!(entity, "loading optional witness payload table");
+            load(entity)?;
         } else {
             tracing::info!("no witness payload output present; skipping witnesses table");
+        }
+
+        // Build every derived index table in one pass from the base tables,
+        // then restore the views so live tracking keeps them up to date.
+        tracing::info!("building derived index tables from the base tables");
+        self.run_multiquery(&schema::backfill_derived_indexes(&self.cfg.database))?;
+        tracing::info!("recreating materialized views for live tracking");
+        for stmt in schema::materialized_views(&self.cfg.database) {
+            self.run_query(&stmt)?;
         }
         Ok(())
     }
@@ -517,6 +545,27 @@ mod tests {
             Err(LoadError::NoClient) => { /* acceptable in sandbox */ }
             Err(other) => panic!("unexpected new() error: {:?}", other),
         }
+    }
+
+    /// `ChLoader::new` must resolve a real client and build the loader when one
+    /// is available. The sandbox has no `clickhouse-client` on `PATH`, so point
+    /// `BIDX_CLICKHOUSE_CLIENT` at a fake one and assert the success arm. Holds
+    /// the fork guard because it mutates the process environment and spawns a
+    /// child.
+    #[test]
+    fn new_loader_succeeds_with_a_resolvable_client() {
+        let _g = fork_guard();
+        let client = fake_client("new-ok", false);
+        let saved = std::env::var_os("BIDX_CLICKHOUSE_CLIENT");
+        std::env::set_var("BIDX_CLICKHOUSE_CLIENT", &client);
+        let result = ChLoader::new(ChConfig::default());
+        match saved {
+            Some(v) => std::env::set_var("BIDX_CLICKHOUSE_CLIENT", v),
+            None => std::env::remove_var("BIDX_CLICKHOUSE_CLIENT"),
+        }
+        let loader = result.expect("a resolvable client must construct the loader");
+        assert_eq!(loader.client_path(), client);
+        let _ = std::fs::remove_file(&client);
     }
 
     #[test]
@@ -831,15 +880,86 @@ mod tests {
             log.contains("INSERT INTO db.witnesses FORMAT Parquet|wit-0"),
             "{log}"
         );
-        // ServerFile never streams stdin: every line is a file() query.
+        // The deferred derived-index build brackets the load: views dropped
+        // first, recreated last.
+        assert!(
+            log.contains("DROP VIEW IF EXISTS db.outputs_by_address_mv"),
+            "{log}"
+        );
+        assert!(
+            log.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS db.outputs_by_address_mv"),
+            "{log}"
+        );
+        // ServerFile never streams stdin: every base entity is loaded via a
+        // file() table function and nothing is sent as a Parquet upload.
         let _ = std::fs::remove_file(format!("{}.log", client.display()));
         loader.load_all_with(&root, LoadMode::ServerFile).unwrap();
         let log = read_log(&client);
+        for entity in schema::ENTITIES {
+            assert!(
+                log.contains(&format!("INSERT INTO db.{entity} SELECT * FROM file(")),
+                "ServerFile must load {entity} via file(): {log}"
+            );
+        }
         assert!(
-            log.lines()
-                .all(|l| l.contains("FROM file(") && l.ends_with('|')),
-            "{log}"
+            !log.contains("FORMAT Parquet"),
+            "ServerFile must not stream Parquet over stdin: {log}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+        let _ = std::fs::remove_file(&client);
+    }
+
+    /// The deferred build must bracket the base load in the right order:
+    /// drop views → load base entities → backfill derived → recreate views.
+    /// A load with the views still live would fan every row out, defeating the
+    /// whole point, so the ordering is asserted on the real client log.
+    #[test]
+    fn load_all_defers_derived_indexes_in_order() {
+        let _g = fork_guard();
+        let client = logging_client("defer-order", false);
+        let loader = loader_with(client.clone());
+        let root = parquet_tree("defer-order", false);
+        loader.load_all_with(&root, LoadMode::ServerFile).unwrap();
+        let log = read_log(&client);
+
+        let at = |needle: &str| {
+            log.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+        };
+        let drop_at = at("DROP VIEW IF EXISTS db.scripthash_map_mv");
+        let load_at = at("INSERT INTO db.outputs SELECT * FROM file(");
+        let backfill_at = at("INSERT INTO db.outputs_by_address ");
+        let recreate_at = at("CREATE MATERIALIZED VIEW IF NOT EXISTS db.scripthash_map_mv");
+        assert!(drop_at < load_at, "views must be dropped before the load");
+        assert!(
+            load_at < backfill_at,
+            "derived tables must be built after the base load"
+        );
+        assert!(
+            backfill_at < recreate_at,
+            "views must be recreated after the backfill"
+        );
+        // Every MV is dropped and recreated, and every backfill target is hit.
+        for name in schema::materialized_view_names() {
+            assert!(
+                log.contains(&format!("DROP VIEW IF EXISTS db.{name}")),
+                "{name}"
+            );
+            assert!(
+                log.contains(&format!("CREATE MATERIALIZED VIEW IF NOT EXISTS db.{name}")),
+                "{name}"
+            );
+        }
+        for stmt in schema::backfill_derived_indexes("db") {
+            if let Some(rest) = stmt.strip_prefix("INSERT INTO db.") {
+                let table = rest.split(' ').next().unwrap();
+                assert!(
+                    log.contains(&format!("TRUNCATE TABLE db.{table}")),
+                    "{table}"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(format!("{}.log", client.display()));
         let _ = std::fs::remove_file(&client);

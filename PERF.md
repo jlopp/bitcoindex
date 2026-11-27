@@ -944,3 +944,62 @@ bulk store are never compacted out from under themselves).
 rows across three row groups read back intact through the buffer). Per-file
 coverage is at 100% for every touched file.
 
+## 15. Deferring ClickHouse materialized views during the bulk load
+
+§14 cut the RocksDB/Parquet write I/O. The other half of the initial load is the
+ClickHouse side, and there the cost is *write amplification by fan-out*: thirteen
+materialized views turn each base-table insert into several derived-table
+inserts. An `outputs` row alone fires the `outputs_by_address`, `address_history`
+(fund), `utxos_by_address` (fund), `address_stats` (fund), `blocks_by_miner`, and
+`scripthash_map` views — six synchronous writes for one base row — and a `spends`
+row fires five more. On a full chain that is many times the base row count in
+independent insert operations, each its own part to merge.
+
+### Drop the views, load flat, rebuild once
+
+`ChLoader::load_all_with` now brackets the base load with the derived-index
+build, unconditionally (no flag — this is the bulk path, and a bulk path starts
+from an empty database):
+
+1. **Drop every materialized view** (`schema::drop_materialized_views`). `DROP
+   VIEW`, not `DROP TABLE`: the target index tables stay, and `all_ddl` recreates
+   the same set from the single `schema::materialized_views` list, so the schema
+   and the loader cannot drift.
+2. **Load the base entities** — `blocks`, `transactions`, `inputs`, `outputs`,
+   `spends`, and the optional `witnesses` — as plain appends. No view fires, so
+   each entity is one `INSERT` per part file with no fan-out.
+3. **Build each derived table once** from the base tables
+   (`schema::backfill_derived_indexes`): one `INSERT ... SELECT` per target,
+   `TRUNCATE`d first so the sequence is idempotent. The `SELECT` bodies are the
+   exact expressions the views used, so the result is identical to what the live
+   views would have produced.
+4. **Recreate the views** (`schema::materialized_views`) so live mode and any
+   later append keep the derived tables current.
+
+The only place the backfill intentionally differs from a view body is
+`scripthash_map`: the view inserts every output row and leans on
+`ReplacingMergeTree` to dedup, while the backfill `SELECT DISTINCT`s — one row
+per distinct script instead of one per output, dropping the redundant `SHA256`
+work and most of the rows before they are written.
+
+### Scope
+
+This is the `bidx load` path only. Live mode never calls `load_all_with`; it
+keeps the views live and appends through `live_insert`, and `bidx index rebuild`
+still uses the existing per-index backfills (`backfill_coinstats`,
+`backfill_scripthash_map`). Because a bulk load truncates and rebuilds the
+derived tables, this is only valid against a database whose derived tables are
+disposable — which is exactly the "load a fresh chain" case it targets.
+
+### Tests
+
+`schema.rs` adds `all_ddl_materialized_views_match_the_shared_list` (the schema
+and the drop/recreate list are the same set),
+`drop_materialized_views_drops_every_view_by_name`, and
+`backfill_derived_indexes_covers_every_mv_target` (every target is truncated
+once and refilled, with both halves for the two-source tables). `lib.rs` adds
+`load_all_defers_derived_indexes_in_order`, which asserts on a fake client's log
+that the views are dropped *before* the base load, the backfill runs *after* it,
+and the views are recreated *last* — the ordering is the whole point. Per-file
+coverage is at 100% for both touched files.
+
