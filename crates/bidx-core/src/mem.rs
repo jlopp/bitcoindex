@@ -85,11 +85,12 @@ pub const SOFT_PCT: u64 = 80;
 /// drops back below this band.
 pub const RECOVER_PCT: u64 = 72;
 
-/// Percentage of the *cache* budget given to the recent-UTXO cache. It gets the
-/// larger share because a hit there removes the RocksDB lookup entirely (no
-/// bloom check, no memtable/SST search, no `PinnableSlice`), whereas a block
-/// cache hit still pays the per-key lookup work — see `PERF.md` §9.
-pub const RECENT_SHARE_PCT: u64 = 60;
+/// Percentage of the *cache* budget given to the recent-UTXO cache. It gets
+/// 70% because in bulk mode `RecentUtxoCache` is a selective write-back cache
+/// (holding only economically spendable UTXOs and cancelling ephemeral outputs
+/// in RAM with zero RocksDB writes), while `optimize_filters_for_hits` and
+/// hybrid Ribbon filters shrink the RocksDB block-cache filter footprint.
+pub const RECENT_SHARE_PCT: u64 = 70;
 
 /// Smallest ceiling we will ever hand out. Below this the process cannot make
 /// useful progress, so clamping here (rather than returning a near-zero limit
@@ -318,7 +319,7 @@ mod tests {
         // 32 GiB available, 32 GiB total: ceiling = 32 - 4 - 2 = 26 GiB,
         // file LRU = clamp(26/16 GiB / 128 MiB, 1, 8) = 8 files = 1 GiB,
         // overhead = 2 + 2 + 1 = 5 GiB, cache = (26 - 5) * 75% = 15.75 GiB,
-        // recent = 60% = 9.45 GiB, block = 6.30 GiB. Assert the exact
+        // recent = 70% = 11.025 GiB, block = 4.725 GiB. Assert the exact
         // arithmetic rather than a range so a change to any constant is caught.
         let avail = 32 * 1024 * 1024; // KiB
         let total = 32 * 1024 * 1024;

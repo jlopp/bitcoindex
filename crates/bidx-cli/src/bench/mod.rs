@@ -2999,8 +2999,8 @@ mod tests {
                 output_index: 0,
                 txid: txid0,
                 value_sat: 1000,
-                script_pubkey_len: 0,
-                script_type: 0,
+                script_pubkey_len: 25,
+                script_type: bidx_core::ScriptType::P2PKH as u8,
                 address_hash: [0u8; 32],
             };
             store.apply_block(0, &[tx0], &[], &[out0]).unwrap();

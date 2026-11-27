@@ -1307,6 +1307,80 @@ allocations, and ClickHouse ingestion:
    separate `bidx load` pass and avoids keeping a duplicate Parquet copy of the
    chain on disk.
 
+---
+
+## 20. Write-back selective `RecentUtxoCache`, bounded bulk L0 compaction, & partitioned Ribbon SSTs
+
+Mainnet bulk-load profiling past height ~400,000 identified why `blocks/sec`
+degraded progressively in the second half of the chain:
+
+- Once `RecentUtxoCache` filled around height ~400,000, disabling auto-compaction
+  completely (`disable_auto_compactions = true`, `slowdown/stop = i32::MAX`) let
+  L0 accumulate **400+ overlapping SST files**, turning every cache miss into an
+  \(O(N_{\text{L0}})\) probe across hundreds of files and thrashing `block_cache`.
+- `RecentUtxoCache` was **write-through** rather than **write-back**, so ~75–85%
+  of outputs spent shortly after creation still wrote both a `batch.put` AND a
+  `batch.delete` into RocksDB memtables and L0 SSTs.
+- Nearly half of modern non-`OP_RETURN` outputs are permanently cold dust or
+  data-carrier outputs (`<= 546` sat Ordinals/Runes postage, `BareMultisig`
+  Counterparty/Stamps fake-pubkey outputs, `Unknown`/`WitnessUnknown` scripts,
+  and high-fanout mass-dusting outputs), polluting `RecentUtxoCache` and evicting
+  hot spendable UTXOs.
+
+Six coordinated changes eliminate this post-400k slowdown (`crates/bidx-store/src/utxo.rs`,
+`crates/bidx-core/src/mem.rs`):
+
+1. **Write-back `RecentUtxoCache` with pure in-RAM spend cancellation.**
+   Hot outputs entering `RecentUtxoCache` are no longer written to RocksDB on
+   creation (`batch.put` is skipped), and spending a cached output removes it in
+   RAM without writing a tombstone (`batch.delete` is skipped). Only unspent
+   outputs evicted from the FIFO head at capacity spill to RocksDB, eliminating
+   ~75–85% of all RocksDB memtable/SST writes across mainnet. When every output
+   and input in a block resolves in RAM, `self.db.write_opt` is skipped entirely.
+   Chunked eviction (`evict_recent_to` in `32,768`-entry / ~2.6 MiB `WriteBatch`
+   chunks with the cache mutex released during I/O) drains dirty entries cleanly
+   on `relieve_pressure`, `flush`, `finalize_bulk_load`, and `Drop`.
+2. **Selective UTXO cache admission (`should_cache_utxo`).**
+   Outputs with `value_sat <= 546` (`DUST_UTXO_THRESHOLD_SAT`, covering `0`-sat
+   outputs, `330`-sat P2TR inscription/Runes postage, and `546`-sat P2PKH/P2WPKH
+   dust), non-standard/data-carrier script types (`Unknown`, `OpReturn`,
+   `BareMultisig`, `WitnessUnknown`), or high-fanout dust (`tx_output_count >= 64`
+   and `value_sat <= 1_000` sat) bypass `RecentUtxoCache` directly into RocksDB,
+   nearly doubling the effective block-window coverage of `RecentUtxoCache` for
+   genuinely spendable outputs while preserving 100% spend correctness via DB
+   fallback if any bypassed output is ever spent.
+3. **92-byte packed `CacheEntry` (`CACHE_ENTRY_COST = 120`) & 70/30 memory split
+   (`RECENT_SHARE_PCT = 70`).**
+   Packing `value_sat` as `[u8; 8]` removes 4-byte struct alignment padding on
+   `CacheEntry` (`96 B -> 92 B`, lowering `CACHE_ENTRY_COST` from `128 B` to a
+   strict upper bound of `120 B`), and raising `RECENT_SHARE_PCT` from `60%` to
+   `70%` expands a 32 GiB host's `RecentUtxoCache` from ~74.0M slots to **~98.6M
+   hot UTXO slots** (+33.3% raw slots, ~2.5× effective spendable window with
+   selective admission) before releasing its multi-GiB backing vectors ahead of
+   the final compaction in `finalize_bulk_load`.
+4. **Coarse bounded bulk L0 compaction (`apply_bulk_l0_batching`: trigger `16`,
+   slowdown `48`, stop `64`).**
+   `UtxoStore::open_planned_bulk` keeps background auto-compaction active at a
+   coarse 16-file L0 batch trigger instead of disabling compaction completely,
+   merging ~8 GiB waves of L0 SSTs into disjoint base-level files (continuously
+   purging cancelled `put`+`delete` pairs) while bounding L0 read depth for the
+   entire chain run. `finalize_bulk_load` restores steady-state triggers
+   (`8`/`20`/`30`) and runs the final compaction pass.
+5. **Partitioned two-level SST indexes, hybrid Ribbon filters, &
+   `optimize_filters_for_hits(true)`.**
+   `tuned_options` configures `TwoLevelIndexSearch` + `partition_filters(true)` +
+   `pin_top_level_index_and_filter(true)` (keeping top-level partition directories
+   pinned in a few MiB while 4 KiB index/filter partitions evict cleanly under
+   `block_cache.set_capacity`), `hybrid_ribbon_filter(10.0, 2)` (fast Bloom on
+   L0/L1, ~30% smaller Ribbon filters on L2+), and
+   `set_optimize_filters_for_hits(true)` (skipping bottommost-level filters since
+   every valid Bitcoin input hits an existing UTXO).
+6. **Whole-key memtable Bloom filters (`memtable_prefix_bloom_ratio = 0.05`,
+   `memtable_whole_key_filtering = true`).**
+   Cache misses probe an in-RAM Bloom filter on each 512 MiB active/immutable
+   memtable instead of performing skiplist binary searches before checking SSTs.
+
+
 
 
 

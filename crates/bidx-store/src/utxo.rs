@@ -92,30 +92,118 @@ fn make_key(txid: &[u8; 32], vout: u32) -> [u8; 36] {
 
 /// Approximate in-memory cost of one cache entry, used for eviction accounting.
 ///
-/// Upper bound on total heap bytes per resident entry in [`RecentUtxoCache`]:
-/// 96 bytes for [`CacheEntry`] (36B key + 48B [`UtxoValue`] + 8B intrusive FIFO
-/// links + alignment) plus at most 32 bytes for the `u64` open-addressed hash
-/// index (`<= 4` buckets/entry, `< 2.67` buckets/entry for any capacity >= 3).
-/// Because `entries` reserves with `reserve_exact` capped at `max_entries`, the
-/// heap allocated by the cache never exceeds `budget_bytes`.
-const CACHE_ENTRY_COST: usize = 128;
+/// Strict upper bound on total heap bytes per resident entry in
+/// [`RecentUtxoCache`]: 92 bytes for [`CacheEntry`] (36B key + 44B packed UTXO
+/// fields + 8B intrusive FIFO links + alignment) plus `< 21.4` bytes (`<= 2.67`
+/// `u64` buckets/entry) for the open-addressed hash index (`<= 114` B/entry
+/// for every capacity `>= 2`). Because `entries` reserves with `reserve_exact`
+/// capped at `max_entries`, the heap allocated by the cache never exceeds
+/// `budget_bytes`.
+const CACHE_ENTRY_COST: usize = 120;
 
 const SLOT_NONE: u32 = u32::MAX;
 const SLOT_FREE_MARKER: u32 = u32::MAX - 1;
 
+/// Entries flushed per `WriteBatch` (~2.6 MiB) when draining or shrinking the
+/// write-back [`RecentUtxoCache`] into RocksDB, avoiding multi-gigabyte batch
+/// allocations under memory pressure.
+const CACHE_FLUSH_BATCH_ENTRIES: usize = 32_768;
+
+/// Dust / inscription-postage value ceiling (satoshis) at or below which
+/// outputs bypass [`RecentUtxoCache`] and write directly to RocksDB (`0`-sat
+/// burns, `330`-sat P2TR Ordinals/Runes postage, `546`-sat P2PKH/P2WPKH dust).
+pub const DUST_UTXO_THRESHOLD_SAT: u64 = 546;
+
+/// Output-count threshold identifying mass-dusting / airdrop transactions.
+pub const HIGH_FANOUT_OUTPUT_THRESHOLD: u32 = 64;
+
+/// Value ceiling (satoshis) treated as cold dust on high-fanout transactions.
+pub const HIGH_FANOUT_DUST_SAT: u64 = 1_000;
+
+/// Decide whether an unspent output surviving same-block resolution should
+/// enter [`RecentUtxoCache`] (`true`) or bypass it directly to RocksDB
+/// (`false`).
+///
+/// Cold outputs (`<= 546` sat dust/inscriptions, `BareMultisig`
+/// Counterparty/Stamps data, `Unknown`/`WitnessUnknown` non-standard scripts,
+/// and high-fanout dust) have near-zero spend probability; bypassing the cache
+/// keeps 100% of `RecentUtxoCache` slots dedicated to high-turnover UTXOs that
+/// cancel in RAM without ever touching RocksDB.
+#[inline]
+pub(crate) fn should_cache_utxo(val: &UtxoValue, tx_output_count: u32) -> bool {
+    if val.value_sat <= DUST_UTXO_THRESHOLD_SAT {
+        return false;
+    }
+    if matches!(
+        val.script_type,
+        x if x == bidx_core::ScriptType::Unknown as u8
+            || x == bidx_core::ScriptType::OpReturn as u8
+            || x == bidx_core::ScriptType::BareMultisig as u8
+            || x == bidx_core::ScriptType::WitnessUnknown as u8
+    ) {
+        return false;
+    }
+    if tx_output_count >= HIGH_FANOUT_OUTPUT_THRESHOLD && val.value_sat <= HIGH_FANOUT_DUST_SAT {
+        return false;
+    }
+    true
+}
+
 #[derive(Clone, Copy)]
 struct CacheEntry {
-    key: [u8; 36],
-    val: UtxoValue,
     /// Previous (older) slot in FIFO creation order, `SLOT_NONE` at `head`, or
     /// `SLOT_FREE_MARKER` while this slot sits on the free list.
     prev: u32,
     /// Next (newer) slot in FIFO order (`SLOT_NONE` at `tail`), or the next
     /// free slot when `prev == SLOT_FREE_MARKER`.
     next: u32,
+    height: u32,
+    value_sat_le: [u8; 8],
+    key: [u8; 36],
+    address_hash: [u8; 32],
+    script_type: u8,
 }
 
-const _: () = assert!(std::mem::size_of::<CacheEntry>() <= 96);
+impl CacheEntry {
+    #[inline]
+    fn new(key: [u8; 36], val: UtxoValue) -> Self {
+        Self {
+            prev: SLOT_NONE,
+            next: SLOT_NONE,
+            height: val.height,
+            value_sat_le: val.value_sat.to_le_bytes(),
+            key,
+            address_hash: val.address_hash,
+            script_type: val.script_type,
+        }
+    }
+
+    #[inline]
+    fn set_kv(&mut self, key: [u8; 36], val: UtxoValue) {
+        self.key = key;
+        self.set_val(val);
+    }
+
+    #[inline]
+    fn set_val(&mut self, val: UtxoValue) {
+        self.height = val.height;
+        self.value_sat_le = val.value_sat.to_le_bytes();
+        self.address_hash = val.address_hash;
+        self.script_type = val.script_type;
+    }
+
+    #[inline]
+    fn value(&self) -> UtxoValue {
+        UtxoValue {
+            value_sat: u64::from_le_bytes(self.value_sat_le),
+            script_type: self.script_type,
+            height: self.height,
+            address_hash: self.address_hash,
+        }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<CacheEntry>() == 92);
 
 /// Fast 64-bit hash of a 36-byte outpoint with a SplitMix64 avalanche tail so
 /// both the lower-32 bucket index and upper-32 tag bits distribute uniformly
@@ -315,33 +403,36 @@ impl RecentUtxoCache {
         self.tail = slot;
     }
 
-    /// Insert a newly created outpoint. If already present, refreshes in place
-    /// without altering creation-order recency.
-    fn insert(&mut self, key: [u8; 36], val: UtxoValue) {
+    /// Insert a newly created outpoint into the write-back cache, returning
+    /// `Some((evicted_key, evicted_val))` whenever an unspent entry must be
+    /// spilled to RocksDB (either because the cache is at `max_entries` and
+    /// evicted the oldest FIFO entry, or because `max_entries == 0`). If `key`
+    /// is already present, refreshes in place without altering FIFO recency.
+    fn insert(&mut self, key: [u8; 36], val: UtxoValue) -> Option<([u8; 36], UtxoValue)> {
         if self.max_entries == 0 {
-            return;
+            return Some((key, val));
         }
         let h = hash_outpoint(&key);
         if let Some((_, slot)) = self.find(&key, h) {
-            self.entries[slot as usize].val = val;
-            return;
+            self.entries[slot as usize].set_val(val);
+            return None;
         }
         if self.len == self.max_entries {
-            // At capacity: evict the oldest FIFO entry (`head`) in place and
-            // reuse its slot directly without growing `entries` or `buckets`.
+            // At capacity: evict the oldest FIFO entry (`head`) in place,
+            // reuse its slot directly without growing `entries` or `buckets`,
+            // and return the evicted entry so the caller flushes it to RocksDB.
             let victim = self.head;
             let victim_key = self.entries[victim as usize].key;
+            let victim_val = self.entries[victim as usize].value();
             let victim_h = hash_outpoint(&victim_key);
-            let (victim_pos, _) = self
-                .find(&victim_key, victim_h)
-                .expect("FIFO head must exist in bucket index");
-            self.remove_bucket(victim_pos);
+            if let Some((victim_pos, _)) = self.find(&victim_key, victim_h) {
+                self.remove_bucket(victim_pos);
+            }
             self.unlink_fifo(victim);
-            self.entries[victim as usize].key = key;
-            self.entries[victim as usize].val = val;
+            self.entries[victim as usize].set_kv(key, val);
             self.push_back_fifo(victim);
             self.insert_bucket(victim, h);
-            return;
+            return Some((victim_key, victim_val));
         }
         if (self.len + 1) * 4 > self.buckets.len() * 3 {
             self.ensure_bucket_capacity();
@@ -349,12 +440,11 @@ impl RecentUtxoCache {
         let slot = if self.free_head != SLOT_NONE {
             let s = self.free_head;
             self.free_head = self.entries[s as usize].next;
-            self.entries[s as usize].key = key;
-            self.entries[s as usize].val = val;
+            self.entries[s as usize].set_kv(key, val);
             s
         } else {
             if self.entries.len() == self.entries.capacity() {
-                // Grow in bounded steps (at most 4M entries ≈ 384 MiB per step)
+                // Grow in bounded steps (at most 4M entries ≈ 368 MiB per step)
                 // and clamp strictly to `max_entries` so `Vec` doubling never
                 // overshoots the byte budget.
                 let cur = self.entries.capacity();
@@ -363,17 +453,13 @@ impl RecentUtxoCache {
                 self.entries.reserve_exact(next_cap - self.entries.len());
             }
             let s = self.entries.len() as u32;
-            self.entries.push(CacheEntry {
-                key,
-                val,
-                prev: SLOT_NONE,
-                next: SLOT_NONE,
-            });
+            self.entries.push(CacheEntry::new(key, val));
             s
         };
         self.push_back_fifo(slot);
         self.insert_bucket(slot, h);
         self.len += 1;
+        None
     }
 
     /// Look up a spent outpoint, unlinking it and recycling its slot on a hit.
@@ -387,12 +473,53 @@ impl RecentUtxoCache {
         self.remove_bucket(pos);
         self.unlink_fifo(slot);
         let e = &mut self.entries[slot as usize];
-        let val = e.val;
+        let val = e.value();
         e.prev = SLOT_FREE_MARKER;
         e.next = self.free_head;
         self.free_head = slot;
         self.len -= 1;
         Some(val)
+    }
+
+    /// Pop up to `max_batch` oldest FIFO entries while `self.len > target_len`,
+    /// appending each dirty UTXO into `batch` so `flush_recent_cache` and
+    /// `relieve_pressure` stream write-back evictions to RocksDB in bounded
+    /// ~2.6 MiB chunks without holding the cache mutex across I/O.
+    fn evict_oldest_to_batch(
+        &mut self,
+        target_len: usize,
+        max_batch: usize,
+        batch: &mut WriteBatch,
+    ) -> usize {
+        let mut n = 0usize;
+        while self.len > target_len && n < max_batch {
+            let victim = self.head;
+            let victim_key = self.entries[victim as usize].key;
+            let victim_h = hash_outpoint(&victim_key);
+            if let Some((victim_pos, _)) = self.find(&victim_key, victim_h) {
+                self.remove_bucket(victim_pos);
+            }
+            self.unlink_fifo(victim);
+            let e = &mut self.entries[victim as usize];
+            batch.put(victim_key, e.value().encode());
+            e.prev = SLOT_FREE_MARKER;
+            e.next = self.free_head;
+            self.free_head = victim;
+            self.len -= 1;
+            n += 1;
+        }
+        n
+    }
+
+    /// Release backing vectors once completely drained.
+    fn release_if_empty(&mut self) {
+        if self.len == 0 {
+            self.entries = Vec::new();
+            self.buckets = Vec::new();
+            self.head = SLOT_NONE;
+            self.tail = SLOT_NONE;
+            self.free_head = SLOT_NONE;
+        }
     }
 
     /// Lower the byte budget, evict oldest entries down to it, and release
@@ -450,16 +577,6 @@ impl RecentUtxoCache {
                 self.insert_bucket(slot, h);
             }
         }
-    }
-
-    #[cfg(test)]
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.buckets.clear();
-        self.len = 0;
-        self.head = SLOT_NONE;
-        self.tail = SLOT_NONE;
-        self.free_head = SLOT_NONE;
     }
 
     fn len(&self) -> usize {
@@ -582,7 +699,8 @@ fn read_varint(b: &mut &[u8]) -> Option<u64> {
 
 #[derive(Default)]
 struct ApplyScratch {
-    pending: FxHashMap<[u8; 36], UtxoValue>,
+    /// Unspent outputs created in the current block (`key -> (val, tx_output_count)`).
+    pending: FxHashMap<[u8; 36], (UtxoValue, u32)>,
     misses: Vec<(usize, [u8; 36])>,
     resolved: Vec<Option<(UtxoValue, bool)>>,
     same_block: FxHashSet<[u8; 36]>,
@@ -717,12 +835,22 @@ const COMPACTION_RATE_LIMIT_BYTES: i64 = 2 << 30;
 /// space, which is the safe direction (erring high forces evictions).
 const CACHE_ENTRY_CHARGE: usize = 16 << 10;
 
-/// Default L0 write-throttle triggers. Named consts because a deferred-
-/// compaction load raises them (`disable_l0_write_throttle`) and then
-/// `finalize_bulk_load` restores them; sharing the values is what keeps the
-/// deferral and the restore from drifting apart.
+/// Steady-state L0 compaction and write-throttle triggers.
+const L0_COMPACTION_TRIGGER: i32 = 8;
 const L0_SLOWDOWN_TRIGGER: i32 = 20;
 const L0_STOP_TRIGGER: i32 = 30;
+
+/// Coarse L0 batching triggers used during [`UtxoStore::open_planned_bulk`].
+///
+/// Disabling auto-compaction completely let L0 accumulate 400+ overlapping SSTs
+/// past mainnet height ~400,000, turning every cache miss into an \(O(N_{L0})\)
+/// probe across hundreds of files. Keeping background auto-compaction active at
+/// a coarse 16-file batch trigger merges ~8 GiB of L0 SSTs at a time into
+/// disjoint base-level files (purging cancelled `put`+`delete` pairs) while
+/// bounding L0 read amplification to <= ~16 files for the entire bulk load.
+const BULK_L0_COMPACTION_TRIGGER: i32 = 16;
+const BULK_L0_SLOWDOWN_TRIGGER: i32 = 48;
+const BULK_L0_STOP_TRIGGER: i32 = 64;
 
 /// Write-path tuning that does not depend on the block cache. Applied to the
 /// database *and* to every column family (see [`tuned_options`]).
@@ -767,7 +895,7 @@ fn apply_write_tuning(opts: &mut Options, bulk: bool, memtable_budget_bytes: usi
     opts.set_write_buffer_size(write_buffer_bytes_for(memtable_budget_bytes));
     opts.set_max_write_buffer_number(4);
     opts.set_target_file_size_base(256 << 20);
-    opts.set_level_zero_file_num_compaction_trigger(8);
+    opts.set_level_zero_file_num_compaction_trigger(L0_COMPACTION_TRIGGER);
     opts.set_level_zero_slowdown_writes_trigger(L0_SLOWDOWN_TRIGGER);
     opts.set_level_zero_stop_writes_trigger(L0_STOP_TRIGGER);
     let jobs = default_background_jobs();
@@ -782,6 +910,17 @@ fn apply_write_tuning(opts: &mut Options, bulk: bool, memtable_budget_bytes: usi
     // Merge memtables in memory before flushing (bulk: two, live: one). See
     // `memtables_to_merge` for why a bulk load wants this.
     opts.set_min_write_buffer_number_to_merge(memtables_to_merge(bulk));
+    // Every valid Bitcoin input spends an existing UTXO, so any point lookup
+    // that reaches the bottommost LSM level is guaranteed to hit. Skipping
+    // filter generation on the bottommost level saves ~10 bits/key of filter
+    // RAM across ~80–170M cold UTXOs while upper levels keep Ribbon/Bloom
+    // filters to reject misses before reaching the bottom level.
+    opts.set_optimize_filters_for_hits(true);
+    // Enable whole-key Bloom filtering inside the 512 MiB active/immutable
+    // memtables so cache misses skip memtable skiplist binary searches when
+    // the outpoint is in an older SST.
+    opts.set_memtable_prefix_bloom_ratio(0.05);
+    opts.set_memtable_whole_key_filtering(true);
 
     if bulk {
         // Let the bottommost level absorb the bulk of the data instead of
@@ -796,17 +935,18 @@ fn apply_write_tuning(opts: &mut Options, bulk: bool, memtable_budget_bytes: usi
     }
 }
 
-/// Neutralize the L0 write throttle for a deferred-compaction bulk load.
+/// Coarse L0 batching for [`UtxoStore::open_planned_bulk`]: let L0 accumulate
+/// up to 16 SSTs before triggering background compaction (with slowdown/stop
+/// raised to 48/64) instead of disabling compaction completely.
 ///
-/// With auto-compaction off, L0 only grows: nothing ever merges it. RocksDB's
-/// default `level_zero_slowdown_writes_trigger` (20) and
-/// `level_zero_stop_writes_trigger` (30) would then *stop all writes* once L0
-/// crossed 30 files — with no compaction coming to relieve the pressure, the
-/// load deadlocks. Raising both to the maximum keeps the write path open; the
-/// pile-up is exactly what `finalize_bulk_load` is for.
-fn disable_l0_write_throttle(opts: &mut Options) {
-    opts.set_level_zero_slowdown_writes_trigger(i32::MAX);
-    opts.set_level_zero_stop_writes_trigger(i32::MAX);
+/// Disabling auto-compactions caused L0 to pile up 400+ overlapping SST files
+/// once `RecentUtxoCache` filled past height ~400,000, degrading every DB point
+/// lookup to \(O(N_{L0})\). Batching L0 in 16-file waves caps L0 depth while
+/// still amortizing compaction writes and purging tombstones continuously.
+fn apply_bulk_l0_batching(opts: &mut Options) {
+    opts.set_level_zero_file_num_compaction_trigger(BULK_L0_COMPACTION_TRIGGER);
+    opts.set_level_zero_slowdown_writes_trigger(BULK_L0_SLOWDOWN_TRIGGER);
+    opts.set_level_zero_stop_writes_trigger(BULK_L0_STOP_TRIGGER);
 }
 
 /// Background jobs for the write path: one per core, clamped to a sane range.
@@ -885,17 +1025,23 @@ fn tuned_options(
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
     apply_write_tuning(&mut opts, bulk, memtable_budget_bytes);
-    // A real block cache, plus a Bloom filter so a lookup for a spent outpoint
-    // can reject a missing key without touching a data block. Index and filter
-    // blocks are cached with high priority inside `block_cache` rather than
-    // pinned unconditionally: in deferred-compaction bulk mode L0 accumulates
-    // hundreds of SSTs, and pinning all of them prevented `set_capacity` from
-    // shrinking the cache under memory pressure.
+    // Shared HyperClock block cache + partitioned two-level indexes + hybrid
+    // Ribbon/Bloom filters:
+    // - `TwoLevelIndexSearch` + `partition_filters` splits giant 256 MiB SST
+    //   index and filter blocks into 4 KiB partitions, pinning only the tiny
+    //   top-level index (~few MiB total) so `block_cache.set_capacity()` can
+    //   still shrink cleanly under memory pressure while hot partitions stay
+    //   resident.
+    // - `hybrid_ribbon_filter(10.0, 2)` keeps fast Bloom filters on L0/L1 and
+    //   uses ~30% smaller Ribbon filters on L2+ for the same ~1% FPR.
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     block_opts.set_format_version(5);
     block_opts.set_block_cache(block_cache);
+    block_opts.set_index_type(rocksdb::BlockBasedIndexType::TwoLevelIndexSearch);
+    block_opts.set_partition_filters(true);
     block_opts.set_cache_index_and_filter_blocks(true);
-    block_opts.set_bloom_filter(10.0, false);
+    block_opts.set_pin_top_level_index_and_filter(true);
+    block_opts.set_hybrid_ribbon_filter(10.0, 2);
     block_opts.set_whole_key_filtering(true);
     opts.set_block_based_table_factory(&block_opts);
     if statistics {
@@ -1072,21 +1218,16 @@ impl UtxoStore {
         )
     }
 
-    /// Like [`UtxoStore::open_planned`], but defers background compaction for
-    /// the duration of a bulk load: writes accumulate without the leveled
-    /// rewrites that otherwise dominate disk I/O during an initial index.
+    /// Like [`UtxoStore::open_planned`], but uses coarse L0 batching
+    /// (`BULK_L0_COMPACTION_TRIGGER = 16`, slowdown `48`, stop `64`) for the
+    /// duration of a bulk load so background compactions merge ~8 GiB waves of
+    /// L0 SSTs while keeping L0 depth bounded for cache-miss point lookups.
     ///
     /// The caller **must** call [`UtxoStore::finalize_bulk_load`] when the load
-    /// is done, before the store is used for anything else. Until then L0 holds
-    /// an ever-growing pile of un-compacted files, so reads scan more of them —
-    /// fine while writing, not fine for steady state. `finalize_bulk_load`
-    /// re-enables compaction and compacts once, paying the I/O a single time
-    /// instead of interleaving it with the load.
-    ///
-    /// Deferral trades peak read amplification during the load for far less
-    /// total write I/O. It is the right default only when the load is
-    /// write-dominated and the store is not read heavily until it finishes,
-    /// which is exactly an initial bulk index.
+    /// is done, before the store is used for steady-state queries or reopened
+    /// in live mode: `finalize_bulk_load` drains the write-back
+    /// `RecentUtxoCache`, restores steady-state L0 triggers (`8`/`20`/`30`),
+    /// flushes memtables, and runs a final compaction pass.
     pub fn open_planned_bulk(path: &Path, plan: &bidx_core::MemoryPlan) -> Result<Self, UtxoError> {
         Self::open_with(
             path,
@@ -1109,7 +1250,7 @@ impl UtxoStore {
         block_cache_bytes: usize,
         recent_cache_bytes: usize,
         memtable_budget_bytes: usize,
-        auto_compaction_disabled: bool,
+        bulk_l0_batching: bool,
     ) -> Result<Self, UtxoError> {
         // Bulk-load tuning follows undo, which is exactly the split between an
         // initial index (no undo) and live tracking (undo). Deriving it here
@@ -1146,11 +1287,8 @@ impl UtxoStore {
         if memtable_budget_bytes > 0 {
             opts.set_db_write_buffer_size(memtable_budget_bytes);
         }
-        // Optionally defer background compaction entirely for the run. The
-        // caller re-enables it and compacts once via `finalize_bulk_load`.
-        opts.set_disable_auto_compactions(auto_compaction_disabled);
-        if auto_compaction_disabled {
-            disable_l0_write_throttle(&mut opts);
+        if bulk_l0_batching {
+            apply_bulk_l0_batching(&mut opts);
         }
 
         // Per-CF options: this is where the storage tuning actually lands.
@@ -1158,11 +1296,8 @@ impl UtxoStore {
         // they do not need a large write buffer, since they are tiny next to
         // the UTXO family, but they must still point at the *shared* cache.
         let mut utxo_cf_opts = tuned_options(statistics, &block_cache, bulk, memtable_budget_bytes);
-        // Per-CF options are what actually take effect (see `tuned_options`), so
-        // the deferral must be set here too, not only on the DB-level options.
-        utxo_cf_opts.set_disable_auto_compactions(auto_compaction_disabled);
-        if auto_compaction_disabled {
-            disable_l0_write_throttle(&mut utxo_cf_opts);
+        if bulk_l0_batching {
+            apply_bulk_l0_batching(&mut utxo_cf_opts);
         }
         let mut aux_cf_opts = Options::default();
         let mut aux_block_opts = rocksdb::BlockBasedOptions::default();
@@ -1191,7 +1326,7 @@ impl UtxoStore {
             statistics,
             block_cache: Some(block_cache),
             block_cache_bytes: std::sync::atomic::AtomicUsize::new(block_cache_bytes),
-            bulk_deferred_compaction: bulk && auto_compaction_disabled,
+            bulk_deferred_compaction: bulk && bulk_l0_batching,
         })
     }
 
@@ -1247,14 +1382,18 @@ impl UtxoStore {
                 continue;
             }
             let key = make_key(&out.txid, out.output_index);
+            let tx_out_cnt = txs.get(out.tx_index as usize).map_or(1, |t| t.output_count);
             pending.insert(
                 key,
-                UtxoValue {
-                    value_sat: out.value_sat,
-                    script_type: out.script_type,
-                    height,
-                    address_hash: out.address_hash,
-                },
+                (
+                    UtxoValue {
+                        value_sat: out.value_sat,
+                        script_type: out.script_type,
+                        height,
+                        address_hash: out.address_hash,
+                    },
+                    tx_out_cnt,
+                ),
             );
             if self.undo_enabled {
                 undo.created.push(key);
@@ -1266,8 +1405,10 @@ impl UtxoStore {
         let mut pending_hits = 0u64;
         let mut cache_hits = 0u64;
 
-        // Pass 1: resolve same-block (`pending`) and recent-cache hits under a
-        // single cache lock acquisition, collecting only genuine DB misses.
+        // Pass 1: resolve same-block (`pending`) and write-back `RecentUtxoCache`
+        // hits under a single cache lock acquisition, collecting only genuine DB
+        // misses. Because `RecentUtxoCache` is write-back, a cache hit removes
+        // an entry that was never written to RocksDB — no `batch.delete` needed!
         {
             let mut recent_guard = self.recent.as_ref().map(|c| c.lock());
             for (idx, inp) in inputs.iter().enumerate() {
@@ -1275,7 +1416,7 @@ impl UtxoStore {
                     continue;
                 }
                 let key = make_key(&inp.prev_txid, inp.prev_vout);
-                if let Some(v) = pending.remove(&key) {
+                if let Some((v, _)) = pending.remove(&key) {
                     if self.undo_enabled {
                         same_block.insert(key);
                     }
@@ -1283,7 +1424,6 @@ impl UtxoStore {
                     resolved[idx] = Some((v, false));
                 } else if let Some(v) = recent_guard.as_mut().and_then(|c| c.remove(&key)) {
                     cache_hits += 1;
-                    batch.delete(key);
                     resolved[idx] = Some((v, false));
                 } else {
                     misses.push((idx, key));
@@ -1297,7 +1437,7 @@ impl UtxoStore {
         // and dispatch high-queue-depth reads across L0/bottommost files.
         if !misses.is_empty() {
             db_lookups = misses.len() as u64;
-            misses.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            misses.sort_unstable_by_key(|a| a.1);
             let sorted_unique = misses.windows(2).all(|w| w[0].1 < w[1].1);
             let cf = self.cf_utxo();
             let t0 = std::time::Instant::now();
@@ -1330,26 +1470,6 @@ impl UtxoStore {
             }
         }
 
-        // Publish this block's outputs into the cache once the block is done.
-        //
-        // Deliberately not interleaved with the input loop. `pending` is seeded
-        // with every output before the loop starts, so a same-block spend is
-        // resolved from `pending` and never reaches the cache anyway; inserting
-        // earlier would only risk the cache holding an outpoint that this same
-        // block is about to spend, which would make the cache and `pending`
-        // disagree. At block end, `pending` holds exactly the outputs that
-        // survived — the true new UTXOs — so it is both correct and minimal.
-        //
-        // Only reachable when the cache is enabled, which is bulk (non-undo)
-        // mode; `undo_enabled` is false here by construction, so no undo entry
-        // is needed for these.
-        if let Some(ref cache) = self.recent {
-            let mut c = cache.lock();
-            for (key, val) in pending.iter() {
-                c.insert(*key, *val);
-            }
-        }
-
         // Reconcile same-block spends into `undo.created` in one pass. Any
         // outpoint created in this block and also spent in it must not be
         // deleted on disconnect, because the deletion of `created` outpoints
@@ -1363,23 +1483,48 @@ impl UtxoStore {
             *f = f.saturating_sub(out.value_sat);
         }
 
-        for (key, val) in pending.drain() {
-            batch.put(key, val.encode());
+        // Publish surviving outputs from `pending`:
+        // - When the write-back `RecentUtxoCache` is enabled (bulk mode), hot
+        //   spendable outputs (`should_cache_utxo`) enter RAM and only Spill to
+        //   RocksDB if FIFO eviction displaces an older unspent entry (or if
+        //   `max_entries == 0`). Cold/unlikely-to-be-spent outputs bypass RAM
+        //   and go directly into `batch.put` so they never evict hot UTXOs.
+        // - When the cache is disabled (`open` / `open_live`), all surviving
+        //   outputs go into `batch.put`.
+        if let Some(ref cache) = self.recent {
+            let mut c = cache.lock();
+            for (key, (val, tx_out_cnt)) in pending.drain() {
+                if should_cache_utxo(&val, tx_out_cnt) {
+                    if let Some((ev_k, ev_v)) = c.insert(key, val) {
+                        batch.put(ev_k, ev_v.encode());
+                    }
+                } else {
+                    batch.put(key, val.encode());
+                }
+            }
+        } else {
+            for (key, (val, _)) in pending.drain() {
+                batch.put(key, val.encode());
+            }
         }
 
         if self.undo_enabled {
             batch.put_cf(&self.cf_undo(), undo_key(height), undo.encode());
         }
 
-        // Bulk mode: skip WAL for throughput (reproducible from source).
+        // Bulk mode: skip WAL for throughput (reproducible from source) and
+        // elide the RocksDB write entirely when every output stayed in the
+        // write-back cache and every input hit `pending` or `RecentUtxoCache`.
         // Live mode: sync WAL so per-block state survives a crash.
-        let mut wo = rocksdb::WriteOptions::default();
-        if self.undo_enabled {
-            wo.set_sync(true);
-        } else {
-            wo.disable_wal(true);
+        if !batch.is_empty() {
+            let mut wo = rocksdb::WriteOptions::default();
+            if self.undo_enabled {
+                wo.set_sync(true);
+            } else {
+                wo.disable_wal(true);
+            }
+            self.db.write_opt(batch, &wo)?;
         }
-        self.db.write_opt(batch, &wo)?;
 
         Ok(SpendResult {
             spends,
@@ -1465,46 +1610,68 @@ impl UtxoStore {
         })
     }
 
+    /// Evict oldest dirty write-back entries from `RecentUtxoCache` down to
+    /// `target_entries` in bounded `CACHE_FLUSH_BATCH_ENTRIES` (~2.6 MiB)
+    /// `WriteBatch` chunks, dropping the cache mutex across every `write_opt`
+    /// so no lock is held during RocksDB I/O.
+    fn evict_recent_to(&self, target_entries: usize) -> Result<usize, UtxoError> {
+        let Some(ref recent) = self.recent else {
+            return Ok(0);
+        };
+        let mut total = 0usize;
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.disable_wal(true);
+        loop {
+            let mut batch = WriteBatch::default();
+            let n = {
+                let mut c = recent.lock();
+                let n =
+                    c.evict_oldest_to_batch(target_entries, CACHE_FLUSH_BATCH_ENTRIES, &mut batch);
+                if target_entries == 0 && n == 0 {
+                    c.release_if_empty();
+                }
+                n
+            };
+            if n == 0 {
+                break;
+            }
+            self.db.write_opt(batch, &wo)?;
+            total += n;
+        }
+        Ok(total)
+    }
+
     pub fn flush(&self) -> Result<(), UtxoError> {
+        self.evict_recent_to(0)?;
         self.db.flush()?;
         Ok(())
     }
 
-    /// Close out a deferred-compaction bulk load: re-enable background
-    /// compaction and compact the UTXO column family once, so the L0 pile that
-    /// accumulated during the load is merged in a single pass.
+    /// Close out a bulk load opened via [`UtxoStore::open_planned_bulk`]:
+    /// drain all remaining unspent entries from the write-back
+    /// `RecentUtxoCache` into RocksDB, release its multi-GiB backing vectors,
+    /// restore steady-state L0 triggers (`8`/`20`/`30`), flush memtables, and
+    /// run a final full-range compaction.
     ///
     /// A no-op (returns `false`) for any store not opened via
-    /// [`UtxoStore::open_planned_bulk`] — a live store, or a bulk store whose
-    /// compaction was never deferred, must not be compacted out from under
-    /// itself here. Returns `true` when it actually compacted.
-    ///
-    /// Both steps precede the `compact_range`: the memtable is flushed so the
-    /// final batch of writes is part of the compaction, and compaction is
-    /// re-enabled first so a flush triggered by the compaction is not blocked.
+    /// [`UtxoStore::open_planned_bulk`]. Returns `true` when it finalized.
     pub fn finalize_bulk_load(&self) -> Result<bool, UtxoError> {
         if !self.bulk_deferred_compaction {
             return Ok(false);
         }
-        // Re-enable background compaction on the UTXO family and restore the
-        // L0 triggers the deferral had raised (see `disable_l0_write_throttle`),
-        // so the store returns to its standard tuned configuration once the
-        // load is over. Per-CF options are what took effect at open (see
-        // `tuned_options`), so the toggles must be per-CF here too. The trigger
-        // values come from the same consts `apply_write_tuning` uses, so the
-        // two cannot drift.
+        self.evict_recent_to(0)?;
+        bidx_core::trim_allocator();
+        let trigger = L0_COMPACTION_TRIGGER.to_string();
         let slowdown = L0_SLOWDOWN_TRIGGER.to_string();
         let stop = L0_STOP_TRIGGER.to_string();
         self.db.set_options_cf(
             self.cf_utxo(),
             &[
-                ("disable_auto_compactions", "false"),
+                ("level0_file_num_compaction_trigger", &trigger),
                 ("level0_slowdown_writes_trigger", &slowdown),
                 ("level0_stop_writes_trigger", &stop),
             ],
         )?;
-        // Push any buffered writes into an SST so the compaction below covers
-        // them, then compact the whole key range in one go.
         self.db.flush()?;
         self.db
             .compact_range_cf(self.cf_utxo(), None::<&[u8]>, None::<&[u8]>);
@@ -1517,25 +1684,27 @@ impl UtxoStore {
     /// — i.e. before the hard ceiling that aborts the pipeline. Two levers, both
     /// safe and both reversible by the workload:
     ///
-    /// 1. **Shrink the recent-UTXO cache.** Its entries are a pure cache of the
-    ///    UTXO set, so dropping some costs hit rate, never correctness. The
-    ///    cache keeps functioning at the smaller budget and re-fills if pressure
-    ///    passes.
+    /// 1. **Shrink the write-back recent-UTXO cache.** Dirty victims above the
+    ///    halved target are flushed to RocksDB in bounded 32K-entry batches
+    ///    first (never losing unspent UTXOs), then the backing `entries` and
+    ///    `buckets` vectors are compacted and shrunk in place.
     /// 2. **Halve the shared block cache.** RocksDB evicts to the new capacity
     ///    on its own; a smaller block cache costs lookups, not correctness.
     ///
-    /// Deliberately *not* done here: flushing memtables (`flush` is an I/O and
-    /// compaction burst, and the write buffer is already bounded by
-    /// `set_db_write_buffer_size`). Returns the bytes of cache capacity removed,
-    /// so a caller can log the effect.
+    /// Returns the bytes of cache capacity removed, so a caller can log the
+    /// effect.
     pub fn relieve_pressure(&self) -> usize {
         let mut freed = 0usize;
-        if let Some(ref c) = self.recent {
-            let mut c = c.lock();
+        if let Some(ref recent) = self.recent {
+            let target = {
+                let c = recent.lock();
+                // Never below one entry's worth, so the cache cannot be shrunk
+                // into a state where it holds nothing yet reports as enabled.
+                (c.budget_bytes / 2).max(CACHE_ENTRY_COST)
+            };
+            let _ = self.evict_recent_to(max_entries_for(target));
+            let mut c = recent.lock();
             let before = c.budget_bytes;
-            // Never below one entry's worth, so the cache cannot be shrunk into
-            // a state where it holds nothing but still reports as enabled.
-            let target = (before / 2).max(CACHE_ENTRY_COST);
             if target < before {
                 c.set_budget(target);
                 freed += before - target;
@@ -1563,13 +1732,12 @@ impl UtxoStore {
         freed
     }
 
-    /// Test-only: empty the in-memory cache so a subsequent spend is forced to
-    /// the database. Used to exercise the DB fallback without a second store.
+    /// Test-only: flush and empty the in-memory write-back cache into RocksDB
+    /// so a subsequent spend is forced through the database lookup path.
     #[cfg(test)]
     fn cache_clear_for_test(&self) {
-        if let Some(ref c) = self.recent {
-            c.lock().clear();
-        }
+        self.evict_recent_to(0)
+            .expect("flush recent cache for test");
     }
 
     pub fn approx_size_on_disk(&self) -> u64 {
@@ -1711,6 +1879,21 @@ impl UtxoStore {
     /// Total bytes consumed by this UTXO db on disk, including WAL and MANIFEST.
     pub fn disk_size_bytes(&self) -> u64 {
         bidx_core::dir_size_bytes(&self.path)
+    }
+}
+
+impl Drop for UtxoStore {
+    fn drop(&mut self) {
+        // Bulk stores write with `disable_wal(true)` and hold hot unspent
+        // UTXOs exclusively in `RecentUtxoCache` until evicted or finalized.
+        // Draining `RecentUtxoCache` and flushing unlogged memtables on drop
+        // ensures reopening the store (e.g. `open_live` after a bulk load)
+        // never loses UTXOs even if the caller did not call `flush` or
+        // `finalize_bulk_load` explicitly.
+        if !self.undo_enabled {
+            let _ = self.evict_recent_to(0);
+            let _ = self.db.flush();
+        }
     }
 }
 
@@ -2368,7 +2551,7 @@ mod tests {
         let stats = db.cache_stats().expect("recent cache enabled by budget");
         assert_eq!(stats.budget_bytes, 8 << 20);
         let a = [0x51u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 123)])
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 10_000)])
             .unwrap();
         let t1 = [0x52u8; 32];
         let r = db
@@ -2566,7 +2749,7 @@ mod tests {
         // 40 more single-output blocks, each evicting older entries.
         for h in 1..41u32 {
             let t = [h as u8; 32];
-            db.apply_block(h, &[tx_row(h, 0, t)], &[], &[out_row(h, 0, 0, t, 10)])
+            db.apply_block(h, &[tx_row(h, 0, t)], &[], &[out_row(h, 0, 0, t, 1_000)])
                 .unwrap();
         }
         let stats = db.cache_stats().expect("cache enabled");
@@ -2602,15 +2785,15 @@ mod tests {
         let db = UtxoStore::open_cached(&dir, 8 << 20).unwrap();
         // Fund A:0 in block 0 (cached).
         let a = [0xE7u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 100)])
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 10_000)])
             .unwrap();
 
         // Block 1: creates B:0 and spends it same-block (pending), spends A:0
         // (cache), and spends an outpoint that exists only in the database.
         let d = [0xE8u8; 32];
-        db.apply_block(1, &[tx_row(1, 0, d)], &[], &[out_row(1, 0, 0, d, 77)])
+        db.apply_block(1, &[tx_row(1, 0, d)], &[], &[out_row(1, 0, 0, d, 7_700)])
             .unwrap();
-        // Drop the cache so D:0 must come from RocksDB.
+        // Flush the cache so D:0 and A:0 must come from RocksDB.
         db.cache_clear_for_test();
 
         let b = [0xE9u8; 32];
@@ -2622,7 +2805,7 @@ mod tests {
             inp_row(2, 2, 0, tx2, a, 0, false), // in DB (cache cleared)
             inp_row(2, 3, 0, tx3, d, 0, false), // in DB
         ];
-        let outputs = [out_row(2, 0, 0, b, 5)];
+        let outputs = [out_row(2, 0, 0, b, 5_000)];
         let txs = [
             tx_row(2, 0, b),
             tx_row(2, 1, tx1),
@@ -2656,7 +2839,7 @@ mod tests {
 
         // Create and spend, then miss once.
         let a = [0xF1u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 1)])
+        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 1_000)])
             .unwrap();
         let t1 = [0xF2u8; 32];
         db.apply_block(
@@ -2779,7 +2962,7 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c.bytes(), 2 * CACHE_ENTRY_COST);
         // Verify refreshed value before testing FIFO eviction order.
-        assert_eq!(c.entries[c.head as usize].val.value_sat, 2);
+        assert_eq!(c.entries[c.head as usize].value().value_sat, 2);
         // Inserting `k3` at capacity=2 must evict `k1` (still `head`), keeping `k2`.
         c.insert(k3, v1);
         assert!(
@@ -3172,20 +3355,9 @@ mod tests {
         assert_eq!(db.cache_stats().unwrap().entries, 2);
         assert!(db.db.get_pinned(make_key(&tx_high, 2)).unwrap().is_none());
 
-        // Evict the recent cache down to 1 entry and insert a dummy block so
-        // both `tx_high:0` and `tx_low:0` must be fetched via `batched_multi_get_cf`.
-        {
-            let mut c = db.recent.as_ref().unwrap().lock();
-            c.set_budget(CACHE_ENTRY_COST);
-        }
-        let dummy_tx = [0x55u8; 32];
-        db.apply_block(
-            1,
-            &[tx_row(1, 0, dummy_tx)],
-            &[],
-            &[out_row(1, 0, 0, dummy_tx, 1_000)],
-        )
-        .unwrap();
+        // Flush the write-back recent cache into RocksDB so both `tx_high:0`
+        // and `tx_low:0` must be fetched via `batched_multi_get_cf`.
+        db.cache_clear_for_test();
 
         // Block 2 spends `tx_high:0` at input 0 and `tx_low:0` at input 1
         // (unsorted key order!), creating one spendable 25_000-sat output and
@@ -3214,5 +3386,181 @@ mod tests {
         assert_eq!(res.spends[1].spent_txid, tx_low);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_cache_utxo_filters_dust_nonstandard_and_high_fanout_dust() {
+        use bidx_core::ScriptType;
+        let mk = |value_sat: u64, st: ScriptType| UtxoValue {
+            value_sat,
+            script_type: st as u8,
+            height: 840_000,
+            address_hash: [0x11; 32],
+        };
+
+        // Dust boundary (`<= 546` sat rejected, `>= 547` sat admitted).
+        assert!(!should_cache_utxo(&mk(0, ScriptType::P2WPKH), 2));
+        assert!(!should_cache_utxo(&mk(330, ScriptType::P2TR), 2));
+        assert!(!should_cache_utxo(
+            &mk(DUST_UTXO_THRESHOLD_SAT, ScriptType::P2PKH),
+            2
+        ));
+        assert!(should_cache_utxo(
+            &mk(DUST_UTXO_THRESHOLD_SAT + 1, ScriptType::P2PKH),
+            2
+        ));
+
+        // Standard spendable script types above dust are admitted.
+        for st in [
+            ScriptType::P2PKH,
+            ScriptType::P2SH,
+            ScriptType::P2WPKH,
+            ScriptType::P2WSH,
+            ScriptType::P2TR,
+            ScriptType::P2PK,
+        ] {
+            assert!(should_cache_utxo(&mk(10_000, st), 2));
+        }
+
+        // Data-carrier / non-standard types bypass the cache regardless of value.
+        for st in [
+            ScriptType::Unknown,
+            ScriptType::OpReturn,
+            ScriptType::BareMultisig,
+            ScriptType::WitnessUnknown,
+        ] {
+            assert!(!should_cache_utxo(&mk(100_000, st), 2));
+        }
+
+        // High-fanout mass-dusting outputs (`>= 64` outputs and `<= 1_000` sat)
+        // bypass the cache while normal payouts in the same tx still enter it.
+        assert!(should_cache_utxo(
+            &mk(HIGH_FANOUT_DUST_SAT, ScriptType::P2WPKH),
+            HIGH_FANOUT_OUTPUT_THRESHOLD - 1
+        ));
+        assert!(!should_cache_utxo(
+            &mk(HIGH_FANOUT_DUST_SAT, ScriptType::P2WPKH),
+            HIGH_FANOUT_OUTPUT_THRESHOLD
+        ));
+        assert!(should_cache_utxo(
+            &mk(HIGH_FANOUT_DUST_SAT + 1, ScriptType::P2WPKH),
+            HIGH_FANOUT_OUTPUT_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn writeback_cache_cancels_ephemeral_utxos_and_bypasses_cold_outputs() {
+        let dir = tmp_path("wb_selective");
+        let db = UtxoStore::open_cached(&dir, 16 * CACHE_ENTRY_COST).unwrap();
+
+        let tx_hot = [0xA1u8; 32];
+        let tx_cold = [0xB2u8; 32];
+        let hot_out = out_row(0, 0, 0, tx_hot, 50_000);
+        let mut dust_out = out_row(0, 1, 0, tx_cold, 330);
+        dust_out.script_type = bidx_core::ScriptType::P2TR as u8;
+        let mut msig_out = out_row(0, 1, 1, tx_cold, 20_000);
+        msig_out.script_type = bidx_core::ScriptType::BareMultisig as u8;
+
+        db.apply_block(
+            0,
+            &[tx_row(0, 0, tx_hot), tx_row(0, 1, tx_cold)],
+            &[],
+            &[hot_out, dust_out, msig_out],
+        )
+        .unwrap();
+
+        // Only `tx_hot:0` entered `RecentUtxoCache`, and because the cache is
+        // write-back, `tx_hot:0` has NOT been written to RocksDB! Meanwhile
+        // both cold outputs bypassed RAM straight into RocksDB.
+        assert_eq!(db.cache_stats().unwrap().entries, 1);
+        assert!(db.db.get_pinned(make_key(&tx_hot, 0)).unwrap().is_none());
+        assert!(db.db.get_pinned(make_key(&tx_cold, 0)).unwrap().is_some());
+        assert!(db.db.get_pinned(make_key(&tx_cold, 1)).unwrap().is_some());
+
+        // Block 1 spends all three: `tx_hot:0` cancels purely in RAM (never
+        // touching RocksDB!), while `tx_cold:0` and `tx_cold:1` resolve via DB.
+        let spend_tx = [0xC3u8; 32];
+        let r = db
+            .apply_block(
+                1,
+                &[tx_row(1, 0, spend_tx)],
+                &[
+                    inp_row(1, 0, 0, spend_tx, tx_hot, 0, false),
+                    inp_row(1, 0, 1, spend_tx, tx_cold, 0, false),
+                    inp_row(1, 0, 2, spend_tx, tx_cold, 1, false),
+                ],
+                &[out_row(1, 0, 0, spend_tx, 70_000)],
+            )
+            .unwrap();
+        assert_eq!(r.cache_hits, 1);
+        assert_eq!(r.db_lookups, 2);
+        assert_eq!(r.missing, 0);
+        assert_eq!(r.fees, vec![330]);
+        assert_eq!(db.cache_stats().unwrap().entries, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sub_entry_cache_spills_to_db_and_drop_persists_writeback_for_live_reopen() {
+        // 1. Sub-entry budget (`16 < CACHE_ENTRY_COST`, `max_entries == 0`):
+        //    `c.insert` immediately returns `Some((key, val))` so the output
+        //    spills directly into RocksDB without data loss.
+        let dir_tiny = tmp_path("wb_tiny");
+        let tiny = UtxoStore::open_cached(&dir_tiny, 16).unwrap();
+        let t0 = [0x31u8; 32];
+        let t1 = [0x32u8; 32];
+        tiny.apply_block(0, &[tx_row(0, 0, t0)], &[], &[out_row(0, 0, 0, t0, 12_345)])
+            .unwrap();
+        assert_eq!(tiny.cache_stats().unwrap().entries, 0);
+        let r = tiny
+            .apply_block(
+                1,
+                &[tx_row(1, 0, t1)],
+                &[inp_row(1, 0, 0, t1, t0, 0, false)],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(r.db_lookups, 1);
+        assert_eq!(r.missing, 0);
+        assert_eq!(r.spends[0].spent_value_sat, 12_345);
+        drop(tiny);
+        let _ = std::fs::remove_dir_all(&dir_tiny);
+
+        // 2. Dropping a write-back cached store without calling `flush()` must
+        //    drain `RecentUtxoCache` and flush unlogged memtables so reopening
+        //    in live mode sees every unspent UTXO.
+        let dir_reopen = tmp_path("wb_reopen");
+        {
+            let bulk = UtxoStore::open_cached(&dir_reopen, 8 << 20).unwrap();
+            let a = [0x41u8; 32];
+            bulk.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 25_000)])
+                .unwrap();
+            assert_eq!(bulk.cache_stats().unwrap().entries, 1);
+            // Also verify explicit `flush()` drains the write-back cache cleanly,
+            // then add a second cached output to verify `Drop` flushes too.
+            bulk.flush().unwrap();
+            assert_eq!(bulk.cache_stats().unwrap().entries, 0);
+            let b = [0x42u8; 32];
+            bulk.apply_block(1, &[tx_row(1, 0, b)], &[], &[out_row(1, 0, 0, b, 35_000)])
+                .unwrap();
+            assert_eq!(bulk.cache_stats().unwrap().entries, 1);
+        }
+        let live = UtxoStore::open_live(&dir_reopen).unwrap();
+        let spend_tx = [0x43u8; 32];
+        let r = live
+            .apply_block(
+                2,
+                &[tx_row(2, 0, spend_tx)],
+                &[
+                    inp_row(2, 0, 0, spend_tx, [0x41u8; 32], 0, false),
+                    inp_row(2, 0, 1, spend_tx, [0x42u8; 32], 0, false),
+                ],
+                &[out_row(2, 0, 0, spend_tx, 59_000)],
+            )
+            .unwrap();
+        assert_eq!(r.missing, 0);
+        assert_eq!(r.fees, vec![1_000]);
+        live.disconnect_block(2).unwrap();
+        let _ = std::fs::remove_dir_all(&dir_reopen);
     }
 }
