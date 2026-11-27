@@ -49,10 +49,13 @@ impl Default for SinkConfig {
     }
 }
 
-fn writer_props() -> WriterProperties {
+fn writer_props(batch_size: usize) -> WriterProperties {
+    // Match `max_row_group_size` to `batch_size` so each flushed `RecordBatch`
+    // closes out its row group on disk immediately instead of accumulating up
+    // to 1M rows per entity inside `ArrowWriter`'s `InMemoryRowGroup`.
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
-        .set_max_row_group_size(1_000_000)
+        .set_max_row_group_size(batch_size.max(1))
         .set_write_batch_size(8192)
         .build()
 }
@@ -289,6 +292,7 @@ fn create_writer(
     entity: &str,
     part: u32,
     schema: SchemaRef,
+    batch_size: usize,
 ) -> Result<EntityWriter, SinkError> {
     let pdir = dir.join(entity);
     std::fs::create_dir_all(&pdir)?;
@@ -296,24 +300,29 @@ fn create_writer(
     // Buffer the file: Parquet emits one write per page, so an unbuffered part
     // file is a syscall storm on the sink thread. See `PARQUET_WRITE_BUF_BYTES`.
     let buffered = BufWriter::with_capacity(PARQUET_WRITE_BUF_BYTES, file);
-    Ok(ArrowWriter::try_new(buffered, schema, Some(writer_props()))?)
+    Ok(ArrowWriter::try_new(
+        buffered,
+        schema,
+        Some(writer_props(batch_size)),
+    )?)
 }
 
 impl ParquetSink {
     pub fn create(dir: &Path, part: u32, cfg: SinkConfig) -> Result<Self, SinkError> {
+        let bs = cfg.batch_size;
         let witnesses_w = if cfg.capture_witness {
-            Some(create_writer(dir, "witnesses", part, witnesses_schema())?)
+            Some(create_writer(dir, "witnesses", part, witnesses_schema(), bs)?)
         } else {
             None
         };
         Ok(ParquetSink {
             cfg,
             part,
-            blocks_w: create_writer(dir, "blocks", part, blocks_schema())?,
-            txs_w: create_writer(dir, "transactions", part, transactions_schema())?,
-            inputs_w: create_writer(dir, "inputs", part, inputs_schema())?,
-            outputs_w: create_writer(dir, "outputs", part, outputs_schema())?,
-            spends_w: create_writer(dir, "spends", part, spends_schema())?,
+            blocks_w: create_writer(dir, "blocks", part, blocks_schema(), bs)?,
+            txs_w: create_writer(dir, "transactions", part, transactions_schema(), bs)?,
+            inputs_w: create_writer(dir, "inputs", part, inputs_schema(), bs)?,
+            outputs_w: create_writer(dir, "outputs", part, outputs_schema(), bs)?,
+            spends_w: create_writer(dir, "spends", part, spends_schema(), bs)?,
             witnesses_w,
             blocks: EntityTable::new(blocks_schema()),
             txs: EntityTable::new(transactions_schema()),
@@ -780,12 +789,13 @@ mod tests {
         // Pin the Parquet tuning so a change to compression or row-group size is
         // caught here rather than only showing up as a size/throughput shift.
         use parquet::schema::types::ColumnPath;
-        let props = writer_props();
+        let props = writer_props(SinkConfig::default().batch_size);
         assert!(matches!(
             props.compression(&ColumnPath::from("height")),
             Compression::ZSTD(_)
         ));
-        assert_eq!(props.max_row_group_size(), 1_000_000);
+        assert_eq!(props.max_row_group_size(), 250_000);
+        assert_eq!(writer_props(0).max_row_group_size(), 1);
     }
 
     #[test]
@@ -951,6 +961,34 @@ mod tests {
         let f = File::open(&path).unwrap();
         let builder = ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
         assert_eq!(builder.metadata().num_row_groups(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn row_groups_flush_at_configured_batch_size() {
+        // Guard against `ArrowWriter` buffering multiple `RecordBatch`es in
+        // memory up to a larger `max_row_group_size`: pushing 4 rows with
+        // `batch_size = 2` must emit 2 distinct row groups of 2 rows each.
+        let dir = tmp_dir("row-group-bound");
+        let mut sink = ParquetSink::create(
+            &dir,
+            0,
+            SinkConfig {
+                batch_size: 2,
+                capture_witness: false,
+            },
+        )
+        .unwrap();
+        for h in 0..4u32 {
+            sink.push_block(&block_row(h)).unwrap();
+        }
+        sink.finish().unwrap();
+
+        let f = File::open(dir.join("blocks/part-00000.parquet")).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 2);
+        assert_eq!(builder.metadata().row_group(0).num_rows(), 2);
+        assert_eq!(builder.metadata().row_group(1).num_rows(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

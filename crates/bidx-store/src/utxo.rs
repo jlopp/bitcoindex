@@ -92,39 +92,103 @@ fn make_key(txid: &[u8; 32], vout: u32) -> [u8; 36] {
 
 /// Approximate in-memory cost of one cache entry, used for eviction accounting.
 ///
-/// The exact allocator overhead is unknowable, so this is a deliberate fixed
-/// estimate: key 36 + `UtxoValue` 45 = 81 bytes of payload, plus the hash-map
-/// and recency-queue overhead. Budgets are therefore approximate, which is fine
-/// for a cache whose whole purpose is bounded memory.
-const CACHE_ENTRY_COST: usize = 112;
+/// Upper bound on total heap bytes per resident entry in [`RecentUtxoCache`]:
+/// 96 bytes for [`CacheEntry`] (36B key + 48B [`UtxoValue`] + 8B intrusive FIFO
+/// links + alignment) plus at most 32 bytes for the `u64` open-addressed hash
+/// index (`<= 4` buckets/entry, `< 2.67` buckets/entry for any capacity >= 3).
+/// Because `entries` reserves with `reserve_exact` capped at `max_entries`, the
+/// heap allocated by the cache never exceeds `budget_bytes`.
+const CACHE_ENTRY_COST: usize = 128;
 
-/// A bounded cache of the most recently created UTXOs, kept in memory.
+const SLOT_NONE: u32 = u32::MAX;
+const SLOT_FREE_MARKER: u32 = u32::MAX - 1;
+
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    key: [u8; 36],
+    val: UtxoValue,
+    /// Previous (older) slot in FIFO creation order, `SLOT_NONE` at `head`, or
+    /// `SLOT_FREE_MARKER` while this slot sits on the free list.
+    prev: u32,
+    /// Next (newer) slot in FIFO order (`SLOT_NONE` at `tail`), or the next
+    /// free slot when `prev == SLOT_FREE_MARKER`.
+    next: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<CacheEntry>() <= 96);
+
+/// Fast 64-bit hash of a 36-byte outpoint with a SplitMix64 avalanche tail so
+/// both the lower-32 bucket index and upper-32 tag bits distribute uniformly
+/// even on single-byte synthetic keys.
+#[inline]
+fn hash_outpoint(key: &[u8; 36]) -> u64 {
+    const K: u64 = 0x517cc1b727220a95;
+    let vout = u32::from_le_bytes([key[32], key[33], key[34], key[35]]) as u64;
+    let mut h = vout.wrapping_mul(K);
+    let mut i = 0;
+    while i < 32 {
+        let w = u64::from_le_bytes([
+            key[i],
+            key[i + 1],
+            key[i + 2],
+            key[i + 3],
+            key[i + 4],
+            key[i + 5],
+            key[i + 6],
+            key[i + 7],
+        ]);
+        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+        i += 8;
+    }
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d049bb133111eb);
+    h ^ (h >> 31)
+}
+
+#[inline]
+fn max_entries_for(budget_bytes: usize) -> usize {
+    (budget_bytes / CACHE_ENTRY_COST).min((u32::MAX - 2) as usize)
+}
+
+#[inline]
+fn bucket_cap_for(entries: usize) -> usize {
+    (entries.saturating_mul(4) / 3 + 1).next_power_of_two().max(4)
+}
+
+/// A strictly memory-bounded cache of the most recently created UTXOs.
 ///
-/// Why this exists: `apply_block` must read the *previous* output for every
-/// spent input, because a transaction input carries only a pointer (`prev_txid`,
-/// `prev_vout`) — not the value, address, script type, or height. Those four
-/// fields are required by `SpendRow` and by fee computation, and they live only
-/// in the UTXO store. On testnet4 that was 23.7M database lookups costing ~35%
-/// of apply wall time (PERF.md §9), and the cost is per-key RocksDB work rather
-/// than I/O, so batching it did not help.
+/// Why this layout instead of `FxHashMap + VecDeque`:
+/// 1. **Zero tombstones on spend.** Most Bitcoin outputs are spent shortly
+///    after creation. Leaving spent keys in a side `VecDeque` until live count
+///    hits the cap accumulated hundreds of millions of dead 36-byte keys (~19
+///    GiB around mainnet height 435,000, where `VecDeque` growth doubled from
+///    \(2^{28}\) to \(2^{29}\)). An intrusive doubly-linked FIFO list over a
+///    slot array unlinks spent entries in \(O(1)\) and recycles their slots
+///    immediately via `free_head`. And Knuth Algorithm R backward-shift
+///    deletion keeps the `u64` hash index 100% tombstone-free without rehashing.
+/// 2. **Exact byte cap, no power-of-two slab overshoot.** `entries` grows via
+///    `reserve_exact` clamped to `max_entries`, and the hash index stores only
+///    packed `(tag32 << 32) | (slot + 1)` words (8 bytes/bucket), so live +
+///    index heap never exceeds `budget_bytes`.
+/// 3. **Real OS memory reclamation under pressure.** `set_budget` drops the old
+///    index first, compacts live entries in place, and calls `shrink_to` so
+///    glibc's `mremap` unmaps trailing pages without a 2x copy spike.
 ///
-/// This cache removes the RocksDB lookup for the *most recently created*
-/// outputs, which are the ones most likely to be spent soon. It is a plain hash
-/// lookup instead of a block-index search, bloom check and value construction.
-///
-/// Entry size cannot be reduced below `UtxoValue`: `spent_value_sat`,
-/// `spent_script_type`, `spent_address_hash` and `spent_height` are all written
-/// into `SpendRow`, so truncating the address hash (or any other field) would
-/// corrupt the index rather than merely risk a lookup collision. The key cannot
-/// be truncated either — the cache is keyed on the full outpoint, and a false
-/// hit would return the wrong value.
+/// Entry fidelity is unchanged: full 36-byte outpoint keys and full 45-byte
+/// `UtxoValue`s are stored so `SpendRow` fields are exact.
 struct RecentUtxoCache {
-    map: FxHashMap<[u8; 36], UtxoValue>,
-    /// Creation order, oldest at the front. Used to evict the least recently
-    /// created entries once the budget is exceeded. An outpoint is created at
-    /// most once and spent at most once, so this is a faithful recency order.
-    order: std::collections::VecDeque<[u8; 36]>,
+    entries: Vec<CacheEntry>,
+    /// Open-addressed linear-probing index: `0` = empty, else
+    /// `((tag32 as u64) << 32) | ((slot + 1) as u64)`.
+    buckets: Vec<u64>,
+    len: usize,
+    head: u32,
+    tail: u32,
+    free_head: u32,
     budget_bytes: usize,
+    max_entries: usize,
     hits: u64,
     misses: u64,
 }
@@ -132,84 +196,273 @@ struct RecentUtxoCache {
 impl RecentUtxoCache {
     fn new(budget_bytes: usize) -> Self {
         Self {
-            map: FxHashMap::default(),
-            order: std::collections::VecDeque::new(),
+            entries: Vec::new(),
+            buckets: Vec::new(),
+            len: 0,
+            head: SLOT_NONE,
+            tail: SLOT_NONE,
+            free_head: SLOT_NONE,
             budget_bytes,
+            max_entries: max_entries_for(budget_bytes),
             hits: 0,
             misses: 0,
         }
     }
 
-    /// Insert a newly created outpoint. Called for every output of every block.
-    ///
-    /// The caller only invokes this when the cache is enabled and undo is off,
-    /// so there is no "already present" case in practice; if one occurs the
-    /// entry is refreshed without being re-queued, so the recency order stays
-    /// consistent with creation order.
+    #[inline]
+    fn find(&self, key: &[u8; 36], h: u64) -> Option<(usize, u32)> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        let mask = self.buckets.len() - 1;
+        let tag = (h >> 32) as u32;
+        let mut pos = (h as usize) & mask;
+        loop {
+            let b = self.buckets[pos];
+            if b == 0 {
+                return None;
+            }
+            if (b >> 32) as u32 == tag && &self.entries[((b as u32) - 1) as usize].key == key {
+                return Some((pos, (b as u32) - 1));
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn insert_bucket(&mut self, slot: u32, h: u64) {
+        let mask = self.buckets.len() - 1;
+        let tag = (h >> 32) as u32;
+        let word = ((tag as u64) << 32) | ((slot + 1) as u64);
+        let mut pos = (h as usize) & mask;
+        while self.buckets[pos] != 0 {
+            pos = (pos + 1) & mask;
+        }
+        self.buckets[pos] = word;
+    }
+
+    /// Knuth Algorithm R backward-shift deletion: removes `del_pos` leaving
+    /// zero tombstones so probe lengths stay constant across hundreds of
+    /// millions of create/spend cycles.
+    #[inline]
+    fn remove_bucket(&mut self, del_pos: usize) {
+        let mask = self.buckets.len() - 1;
+        let mut empty = del_pos;
+        let mut scan = (empty + 1) & mask;
+        loop {
+            let b = self.buckets[scan];
+            if b == 0 {
+                self.buckets[empty] = 0;
+                break;
+            }
+            let slot = (b as u32) - 1;
+            let ideal = (hash_outpoint(&self.entries[slot as usize].key) as usize) & mask;
+            if ((scan.wrapping_sub(ideal)) & mask) >= ((scan.wrapping_sub(empty)) & mask) {
+                self.buckets[empty] = b;
+                empty = scan;
+            }
+            scan = (scan + 1) & mask;
+        }
+    }
+
+    fn ensure_bucket_capacity(&mut self) {
+        let target_entries = (self.len + 1).saturating_mul(2).max(4).min(self.max_entries);
+        let bcap = bucket_cap_for(target_entries);
+        // Drop the old bucket array before allocating the new one so the two
+        // large buffers do not coexist at peak RSS.
+        self.buckets = Vec::new();
+        self.buckets = vec![0u64; bcap];
+        let mut cur = self.head;
+        while cur != SLOT_NONE {
+            let h = hash_outpoint(&self.entries[cur as usize].key);
+            self.insert_bucket(cur, h);
+            cur = self.entries[cur as usize].next;
+        }
+    }
+
+    #[inline]
+    fn unlink_fifo(&mut self, slot: u32) {
+        let prev = self.entries[slot as usize].prev;
+        let next = self.entries[slot as usize].next;
+        if prev != SLOT_NONE {
+            self.entries[prev as usize].next = next;
+        } else {
+            self.head = next;
+        }
+        if next != SLOT_NONE {
+            self.entries[next as usize].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+    }
+
+    #[inline]
+    fn push_back_fifo(&mut self, slot: u32) {
+        let old_tail = self.tail;
+        let e = &mut self.entries[slot as usize];
+        e.prev = old_tail;
+        e.next = SLOT_NONE;
+        if old_tail != SLOT_NONE {
+            self.entries[old_tail as usize].next = slot;
+        } else {
+            self.head = slot;
+        }
+        self.tail = slot;
+    }
+
+    /// Insert a newly created outpoint. If already present, refreshes in place
+    /// without altering creation-order recency.
     fn insert(&mut self, key: [u8; 36], val: UtxoValue) {
-        if self.map.insert(key, val).is_none() {
-            self.order.push_back(key);
-            self.evict_to_budget();
+        if self.max_entries == 0 {
+            return;
         }
+        let h = hash_outpoint(&key);
+        if let Some((_, slot)) = self.find(&key, h) {
+            self.entries[slot as usize].val = val;
+            return;
+        }
+        if self.len == self.max_entries {
+            // At capacity: evict the oldest FIFO entry (`head`) in place and
+            // reuse its slot directly without growing `entries` or `buckets`.
+            let victim = self.head;
+            let victim_key = self.entries[victim as usize].key;
+            let victim_h = hash_outpoint(&victim_key);
+            let (victim_pos, _) = self
+                .find(&victim_key, victim_h)
+                .expect("FIFO head must exist in bucket index");
+            self.remove_bucket(victim_pos);
+            self.unlink_fifo(victim);
+            self.entries[victim as usize].key = key;
+            self.entries[victim as usize].val = val;
+            self.push_back_fifo(victim);
+            self.insert_bucket(victim, h);
+            return;
+        }
+        if (self.len + 1) * 4 > self.buckets.len() * 3 {
+            self.ensure_bucket_capacity();
+        }
+        let slot = if self.free_head != SLOT_NONE {
+            let s = self.free_head;
+            self.free_head = self.entries[s as usize].next;
+            self.entries[s as usize].key = key;
+            self.entries[s as usize].val = val;
+            s
+        } else {
+            if self.entries.len() == self.entries.capacity() {
+                // Grow in bounded steps (at most 4M entries ≈ 384 MiB per step)
+                // and clamp strictly to `max_entries` so `Vec` doubling never
+                // overshoots the byte budget.
+                let cur = self.entries.capacity();
+                let step = cur.clamp(64, 1 << 22);
+                let next_cap = cur.saturating_add(step).min(self.max_entries);
+                self.entries.reserve_exact(next_cap - self.entries.len());
+            }
+            let s = self.entries.len() as u32;
+            self.entries.push(CacheEntry {
+                key,
+                val,
+                prev: SLOT_NONE,
+                next: SLOT_NONE,
+            });
+            s
+        };
+        self.push_back_fifo(slot);
+        self.insert_bucket(slot, h);
+        self.len += 1;
     }
 
-    /// Look up a spent outpoint, removing it on a hit.
-    ///
-    /// Removal mirrors the store semantics: a spent outpoint leaves the UTXO
-    /// set, so a later block cannot legitimately spend it again. Keeping it
-    /// would risk serving a stale value if the outpoint were somehow recreated.
+    /// Look up a spent outpoint, unlinking it and recycling its slot on a hit.
     fn remove(&mut self, key: &[u8; 36]) -> Option<UtxoValue> {
-        match self.map.remove(key) {
-            Some(v) => {
-                self.hits += 1;
-                // Leave the key in `order`; eviction tolerates a stale key.
-                Some(v)
-            }
-            None => {
-                self.misses += 1;
-                None
-            }
-        }
+        let h = hash_outpoint(key);
+        let Some((pos, slot)) = self.find(key, h) else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
+        self.remove_bucket(pos);
+        self.unlink_fifo(slot);
+        let e = &mut self.entries[slot as usize];
+        let val = e.val;
+        e.prev = SLOT_FREE_MARKER;
+        e.next = self.free_head;
+        self.free_head = slot;
+        self.len -= 1;
+        Some(val)
     }
 
-    /// Drop the least recently created entries until the budget is met.
-    ///
-    /// `order` may contain keys that were already removed by a spend, so
-    /// eviction skips those rather than assuming the front key is resident.
-    fn evict_to_budget(&mut self) {
-        while self.map.len() * CACHE_ENTRY_COST > self.budget_bytes {
-            match self.order.pop_front() {
-                Some(k) => {
-                    self.map.remove(&k);
-                }
-                // coverage-exempt: unreachable — `insert` pushes every key to
-                // `order`, and keys leave `order` only here (where they are
-                // removed from `map` in the same step), so `map.len() <=
-                // order.len()` always holds and the queue cannot run dry while
-                // the map is non-empty. Kept so the loop terminates rather than
-                // spins if that invariant ever changes.
-                None => break,
-            }
-        }
-    }
-
-    /// Lower the byte budget and evict down to it. Used by
-    /// `UtxoStore::relieve_pressure`; a no-op if the new budget is not smaller.
-    /// Eviction is by creation order (see `evict_to_budget`), so the entries
-    /// most likely to be spent again are the ones kept.
+    /// Lower the byte budget, evict oldest entries down to it, and release
+    /// excess backing capacity back to the allocator in place.
     fn set_budget(&mut self, budget_bytes: usize) {
-        if budget_bytes < self.budget_bytes {
-            self.budget_bytes = budget_bytes;
-            self.evict_to_budget();
+        if budget_bytes >= self.budget_bytes {
+            return;
         }
+        self.budget_bytes = budget_bytes;
+        self.max_entries = max_entries_for(budget_bytes);
+        // Free the old bucket array before compacting so peak memory drops
+        // immediately instead of holding old + new allocations together.
+        self.buckets = Vec::new();
+
+        while self.len > self.max_entries {
+            let victim = self.head;
+            self.unlink_fifo(victim);
+            self.entries[victim as usize].prev = SLOT_FREE_MARKER;
+            self.len -= 1;
+        }
+
+        // Compact live slots into `0..self.len` in place, rewriting neighbor
+        // links as each slot shifts left so FIFO creation order is preserved.
+        let mut write_idx = 0usize;
+        for read_idx in 0..self.entries.len() {
+            if self.entries[read_idx].prev == SLOT_FREE_MARKER {
+                continue;
+            }
+            if read_idx != write_idx {
+                let moved = self.entries[read_idx];
+                let new_slot = write_idx as u32;
+                if moved.prev != SLOT_NONE {
+                    self.entries[moved.prev as usize].next = new_slot;
+                } else {
+                    self.head = new_slot;
+                }
+                if moved.next != SLOT_NONE {
+                    self.entries[moved.next as usize].prev = new_slot;
+                } else {
+                    self.tail = new_slot;
+                }
+                self.entries[write_idx] = moved;
+            }
+            write_idx += 1;
+        }
+        self.free_head = SLOT_NONE;
+        self.entries.truncate(write_idx);
+        self.entries.shrink_to(self.max_entries);
+
+        if self.len > 0 {
+            let bcap = bucket_cap_for(self.len.max(4).min(self.max_entries));
+            self.buckets = vec![0u64; bcap];
+            for slot in 0..(write_idx as u32) {
+                let h = hash_outpoint(&self.entries[slot as usize].key);
+                self.insert_bucket(slot, h);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.buckets.clear();
+        self.len = 0;
+        self.head = SLOT_NONE;
+        self.tail = SLOT_NONE;
+        self.free_head = SLOT_NONE;
     }
 
     fn len(&self) -> usize {
-        self.map.len()
+        self.len
     }
 
     fn bytes(&self) -> usize {
-        self.map.len() * CACHE_ENTRY_COST
+        self.len * CACHE_ENTRY_COST
     }
 }
 
@@ -480,11 +733,25 @@ const L0_STOP_TRIGGER: i32 = 30;
 ///
 /// Live mode leaves both at RocksDB's defaults: it writes little per block and
 /// values the steady-state read behaviour dynamic levels can change.
-fn apply_write_tuning(opts: &mut Options, bulk: bool) {
-    // A 512 MiB buffer means a flush every ~8s at the observed write rate
-    // rather than every second; with 4 buffers we can absorb a burst while a
-    // flush is in flight.
-    opts.set_write_buffer_size(512 << 20);
+/// Individual memtable size derived from the DB-wide memtable budget.
+///
+/// With `max_write_buffer_number = 4` and `min_write_buffer_number_to_merge = 2`
+/// in bulk mode, scaling each buffer to `budget / 4` (clamped to `[64 MiB,
+/// 512 MiB]`) guarantees two buffers can merge without exceeding a small host's
+/// `db_write_buffer_size` while keeping the 512 MiB buffer on >= 2 GiB budgets.
+pub(crate) fn write_buffer_bytes_for(memtable_budget_bytes: usize) -> usize {
+    if memtable_budget_bytes == 0 {
+        512 << 20
+    } else {
+        (memtable_budget_bytes / 4).clamp(64 << 20, 512 << 20)
+    }
+}
+
+fn apply_write_tuning(opts: &mut Options, bulk: bool, memtable_budget_bytes: usize) {
+    // Up to 512 MiB per buffer on >= 2 GiB budgets means a flush every ~8s at
+    // the observed write rate rather than every second; on smaller hosts it
+    // scales down with `memtable_budget_bytes` so 4 buffers fit cleanly.
+    opts.set_write_buffer_size(write_buffer_bytes_for(memtable_budget_bytes));
     opts.set_max_write_buffer_number(4);
     opts.set_target_file_size_base(256 << 20);
     opts.set_level_zero_file_num_compaction_trigger(8);
@@ -595,18 +862,25 @@ fn default_subcompactions() -> u32 {
 /// handle to every column family. Constructing a fresh cache per CF (as this
 /// used to) both tripled the memory and fragmented it, so a lookup in the UTXO
 /// family could not benefit from blocks the undo family had already read.
-fn tuned_options(statistics: bool, block_cache: &rocksdb::Cache, bulk: bool) -> Options {
+fn tuned_options(
+    statistics: bool,
+    block_cache: &rocksdb::Cache,
+    bulk: bool,
+    memtable_budget_bytes: usize,
+) -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
-    apply_write_tuning(&mut opts, bulk);
+    apply_write_tuning(&mut opts, bulk, memtable_budget_bytes);
     // A real block cache, plus a Bloom filter so a lookup for a spent outpoint
-    // can reject a missing key without touching a data block. Both are
-    // attached per-CF, which is the only place they take effect.
+    // can reject a missing key without touching a data block. Index and filter
+    // blocks are cached with high priority inside `block_cache` rather than
+    // pinned unconditionally: in deferred-compaction bulk mode L0 accumulates
+    // hundreds of SSTs, and pinning all of them prevented `set_capacity` from
+    // shrinking the cache under memory pressure.
     let mut block_opts = rocksdb::BlockBasedOptions::default();
     block_opts.set_block_cache(block_cache);
     block_opts.set_cache_index_and_filter_blocks(true);
-    block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_bloom_filter(10.0, false);
     block_opts.set_whole_key_filtering(true);
     opts.set_block_based_table_factory(&block_opts);
@@ -852,7 +1126,7 @@ impl UtxoStore {
             rocksdb::Cache::new_hyper_clock_cache(block_cache_bytes.max(1), CACHE_ENTRY_CHARGE);
 
         // DB-level options: create flags, background threads, statistics.
-        let mut opts = tuned_options(statistics, &block_cache, bulk);
+        let mut opts = tuned_options(statistics, &block_cache, bulk, memtable_budget_bytes);
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         // Cap the total memtable memory across all families. Without this each
@@ -875,7 +1149,8 @@ impl UtxoStore {
         // The undo and meta families share the same table factory and cache;
         // they do not need a large write buffer, since they are tiny next to
         // the UTXO family, but they must still point at the *shared* cache.
-        let mut utxo_cf_opts = tuned_options(statistics, &block_cache, bulk);
+        let mut utxo_cf_opts =
+            tuned_options(statistics, &block_cache, bulk, memtable_budget_bytes);
         // Per-CF options are what actually take effect (see `tuned_options`), so
         // the deferral must be set here too, not only on the DB-level options.
         utxo_cf_opts.set_disable_auto_compactions(auto_compaction_disabled);
@@ -885,6 +1160,7 @@ impl UtxoStore {
         let mut aux_cf_opts = Options::default();
         let mut aux_block_opts = rocksdb::BlockBasedOptions::default();
         aux_block_opts.set_block_cache(&block_cache);
+        aux_block_opts.set_cache_index_and_filter_blocks(true);
         aux_cf_opts.set_block_based_table_factory(&aux_block_opts);
         aux_cf_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
@@ -1231,8 +1507,10 @@ impl UtxoStore {
             // Never below one entry's worth, so the cache cannot be shrunk into
             // a state where it holds nothing but still reports as enabled.
             let target = (before / 2).max(CACHE_ENTRY_COST);
-            c.set_budget(target);
-            freed += before.saturating_sub(target);
+            if target < before {
+                c.set_budget(target);
+                freed += before - target;
+            }
         }
         if let Some(ref cache) = self.block_cache {
             let mut cache = cache.clone();
@@ -1247,6 +1525,12 @@ impl UtxoStore {
                 freed += cur - target;
             }
         }
+        if freed > 0 {
+            // Return freed C++ HyperClockCache slabs and shrunk Rust buffers
+            // from per-thread allocator arenas back to the kernel so `VmRSS`
+            // reflects the relief immediately.
+            bidx_core::trim_allocator();
+        }
         freed
     }
 
@@ -1255,9 +1539,7 @@ impl UtxoStore {
     #[cfg(test)]
     fn cache_clear_for_test(&self) {
         if let Some(ref c) = self.recent {
-            let mut c = c.lock();
-            c.map.clear();
-            c.order.clear();
+            c.lock().clear();
         }
     }
 
@@ -2436,10 +2718,12 @@ mod tests {
     #[test]
     fn recent_cache_insert_refresh_does_not_requeue() {
         // The caller only inserts an outpoint once, but the contract says a
-        // re-insert refreshes the value without pushing a second recency entry.
-        // Assert both the refresh and the single queue entry.
-        let mut c = RecentUtxoCache::new(10 * CACHE_ENTRY_COST);
-        let k = [0x11u8; 36];
+        // re-insert refreshes the value without pushing a second recency entry
+        // or promoting `k1` ahead of `k2` in FIFO creation order.
+        let mut c = RecentUtxoCache::new(2 * CACHE_ENTRY_COST);
+        let k1 = [0x11u8; 36];
+        let k2 = [0x22u8; 36];
+        let k3 = [0x33u8; 36];
         let v1 = UtxoValue {
             value_sat: 1,
             script_type: 1,
@@ -2452,34 +2736,196 @@ mod tests {
             height: 2,
             address_hash: [0; 32],
         };
-        c.insert(k, v1);
-        assert_eq!(c.order.len(), 1);
-        c.insert(k, v2); // same key: refresh, no requeue
-        assert_eq!(c.order.len(), 1, "refresh must not requeue");
-        assert_eq!(c.map[&k].value_sat, 2, "value must be refreshed");
-        assert_eq!(c.len(), 1);
-        assert_eq!(c.bytes(), CACHE_ENTRY_COST);
+        c.insert(k1, v1);
+        c.insert(k2, v1);
+        assert_eq!(c.entries.len(), 2);
+        c.insert(k1, v2); // same key: refresh in place, stays oldest (`head`)
+        assert_eq!(c.entries.len(), 2, "refresh must not allocate another slot");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.bytes(), 2 * CACHE_ENTRY_COST);
+        // Verify refreshed value before testing FIFO eviction order.
+        assert_eq!(c.entries[c.head as usize].val.value_sat, 2);
+        // Inserting `k3` at capacity=2 must evict `k1` (still `head`), keeping `k2`.
+        c.insert(k3, v1);
+        assert!(c.remove(&k1).is_none(), "refreshed k1 remained oldest and was evicted");
+        assert_eq!(c.remove(&k2).unwrap().value_sat, 1);
+        assert_eq!(c.remove(&k3).unwrap().value_sat, 1);
     }
 
     #[test]
     fn recent_cache_evict_stops_cleanly_when_budget_below_one_entry() {
-        // A budget smaller than a single entry forces the eviction loop to run
-        // against an empty map. It must terminate (order exhausted → break)
-        // rather than spin, leaving the cache empty.
+        // A budget smaller than a single entry (`max_entries == 0`) must ignore
+        // inserts without allocating or spinning, and shrinking a populated
+        // cache down to 0 must empty and release its backing vectors.
         let mut c = RecentUtxoCache::new(0);
-        c.evict_to_budget();
         assert_eq!(c.len(), 0);
-        // With an entry present but a zero budget, eviction empties it and stops.
-        c.insert(
-            [0x22u8; 36],
-            UtxoValue {
-                value_sat: 1,
-                script_type: 0,
-                height: 0,
-                address_hash: [0; 32],
-            },
+        assert!(c.remove(&[0x99u8; 36]).is_none(), "empty bucket lookup");
+        let val = UtxoValue {
+            value_sat: 1,
+            script_type: 0,
+            height: 0,
+            address_hash: [0; 32],
+        };
+        c.insert([0x22u8; 36], val);
+        assert_eq!(c.len(), 0);
+        assert_eq!(c.entries.capacity(), 0);
+        assert_eq!(c.buckets.capacity(), 0);
+
+        let mut c2 = RecentUtxoCache::new(4 * CACHE_ENTRY_COST);
+        c2.insert([0x33u8; 36], val);
+        assert_eq!(c2.len(), 1);
+        c2.set_budget(0);
+        assert_eq!(c2.len(), 0);
+        assert_eq!(c2.entries.capacity(), 0);
+        assert_eq!(c2.buckets.capacity(), 0);
+    }
+
+    #[test]
+    fn recent_cache_recycles_spent_slots_without_tombstone_growth() {
+        // Regression test for the mainnet height ~435,000 crash: under heavy
+        // create-and-spend churn where live count stays well below capacity,
+        // spent entries must be unlinked and their slots/buckets recycled in
+        // place rather than accumulating tombstones in a side queue.
+        let max_entries = 64usize;
+        let mut c = RecentUtxoCache::new(max_entries * CACHE_ENTRY_COST);
+        let val = UtxoValue {
+            value_sat: 42,
+            script_type: 1,
+            height: 100,
+            address_hash: [0xAB; 32],
+        };
+
+        // Keep 16 long-lived entries while churning 20,000 short-lived outputs.
+        for i in 0..16u64 {
+            let mut k = [0u8; 36];
+            k[..8].copy_from_slice(&i.to_le_bytes());
+            c.insert(k, val);
+        }
+        for i in 16..20_016u64 {
+            let mut k = [0u8; 36];
+            k[..8].copy_from_slice(&i.to_le_bytes());
+            c.insert(k, val);
+            assert_eq!(c.remove(&k).unwrap().value_sat, 42);
+        }
+
+        assert_eq!(c.len(), 16);
+        // Only 17 distinct slots were ever needed simultaneously (16 resident +
+        // 1 transient churn slot recycled 20,000 times via `free_head`).
+        assert_eq!(c.entries.len(), 17, "spent slots must be recycled via free_head");
+        assert!(c.entries.capacity() <= max_entries);
+        assert!(
+            c.entries.capacity() * std::mem::size_of::<CacheEntry>()
+                + c.buckets.capacity() * std::mem::size_of::<u64>()
+                <= max_entries * CACHE_ENTRY_COST,
+            "actual heap must stay within budget_bytes"
         );
+        for i in 0..16u64 {
+            let mut k = [0u8; 36];
+            k[..8].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(c.remove(&k).unwrap().value_sat, 42);
+        }
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn recent_cache_compacts_scrambled_slots_and_preserves_fifo_order() {
+        // Scramble slot indices relative to FIFO creation order (freeing slot 0,
+        // middle slots, and tail slots, then refilling via `free_head`) so
+        // `set_budget`'s in-place compaction exercises both `read_idx == write_idx`
+        // and `read_idx != write_idx` for `head`, interior nodes, and `tail`,
+        // as well as linear-probe collisions and backward-shift deletions.
+        let mut c = RecentUtxoCache::new(128 * CACHE_ENTRY_COST);
+        let mut model: std::collections::VecDeque<([u8; 36], u64)> =
+            std::collections::VecDeque::new();
+
+        let make_k = |id: u64| -> [u8; 36] {
+            let mut k = [0u8; 36];
+            k[..8].copy_from_slice(&id.to_le_bytes());
+            k
+        };
+        let make_v = |v: u64| UtxoValue {
+            value_sat: v,
+            script_type: 1,
+            height: v as u32,
+            address_hash: [0; 32],
+        };
+
+        // Case A: slot 0 stays live (`read_idx == write_idx` at index 0) while
+        // later slots have holes.
+        for id in 1..=20u64 {
+            c.insert(make_k(id), make_v(id));
+        }
+        assert_eq!(c.remove(&make_k(5)).unwrap().value_sat, 5);
+        assert_eq!(c.remove(&make_k(20)).unwrap().value_sat, 20); // unlink tail
+        c.set_budget(64 * CACHE_ENTRY_COST);
+        assert_eq!(c.len(), 18);
+        assert!(c.entries.capacity() <= 64);
+
+        // Case B: rebuild a fresh cache, delete slot 0 and odd slots, refill out
+        // of physical order so `head` and `tail` sit past dead slots, then
+        // shrink via `set_budget` so eviction + compaction both run.
+        let mut c = RecentUtxoCache::new(128 * CACHE_ENTRY_COST);
+        for id in 0..80u64 {
+            let k = make_k(id);
+            c.insert(k, make_v(id));
+            model.push_back((k, id));
+        }
+        // Delete slot 0 (`head`) and every 3rd entry to scramble `free_head` and
+        // exercise backward-shift deletion across probe chains.
+        for id in (0..80u64).step_by(3) {
+            let k = make_k(id);
+            assert_eq!(c.remove(&k).unwrap().value_sat, id);
+            model.retain(|(mk, _)| mk != &k);
+        }
+        // Insert 27 more (refilling all 27 freed slots in LIFO free-list order,
+        // including physical slot 0 at the bottom of the stack), then free
+        // physical slot 0 again so `head` must shift to `new_slot = 0`.
+        for id in 100..127u64 {
+            let k = make_k(id);
+            c.insert(k, make_v(id));
+            model.push_back((k, id));
+        }
+        let slot0_key = c.entries[0].key;
+        assert!(c.remove(&slot0_key).is_some());
+        model.retain(|(mk, _)| mk != &slot0_key);
+
+        // Shrink down to 30 entries: oldest entries in `model` must be evicted
+        // and the 30 newest must remain in exact FIFO order!
+        c.set_budget(30 * CACHE_ENTRY_COST);
+        while model.len() > 30 {
+            let (evicted, _) = model.pop_front().unwrap();
+            assert!(c.remove(&evicted).is_none());
+        }
+        assert_eq!(c.len(), 30);
+        assert_eq!(c.entries.len(), 30);
+        assert!(c.entries.capacity() <= 30);
+        assert!(
+            c.entries.capacity() * std::mem::size_of::<CacheEntry>()
+                + c.buckets.capacity() * std::mem::size_of::<u64>()
+                <= 30 * CACHE_ENTRY_COST
+        );
+
+        // Insert 10 more at capacity=30: the 10 oldest of the remaining 30 must
+        // be evicted in exact FIFO order.
+        for id in 200..210u64 {
+            let k = make_k(id);
+            c.insert(k, make_v(id));
+            let (oldest_k, _) = model.pop_front().unwrap();
+            assert!(c.remove(&oldest_k).is_none(), "FIFO order broken after compaction");
+            model.push_back((k, id));
+        }
+        for (k, expected_val) in model {
+            assert_eq!(c.remove(&k).unwrap().value_sat, expected_val);
+        }
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn write_buffer_bytes_scales_with_memtable_budget() {
+        assert_eq!(write_buffer_bytes_for(0), 512 << 20);
+        assert_eq!(write_buffer_bytes_for(64 << 20), 64 << 20);
+        assert_eq!(write_buffer_bytes_for(1 << 30), 256 << 20);
+        assert_eq!(write_buffer_bytes_for(4 << 30), 512 << 20);
     }
 
     #[test]
@@ -2560,11 +3006,12 @@ mod tests {
     /// than shrinking to zero (a zero-capacity cache is not a smaller cache, it
     /// is a broken one), and report no further freeing once at the floor.
     #[test]
-    fn relieve_pressure_stops_the_block_cache_at_its_floor() {
+    fn relieve_pressure_stops_both_caches_at_their_floors() {
         let dir = tmp_path("relieffloor");
-        // Open with the minimum so one halving reaches the 64 MiB floor.
-        let db = UtxoStore::open_tuned(&dir, 64 << 20, 0).unwrap();
-        assert_eq!(db.relieve_pressure(), 0, "already at the block-cache floor");
+        // Open with both caches at their minimum floor (64 MiB block cache,
+        // 1-entry recent cache) so `relieve_pressure` stops immediately at 0.
+        let db = UtxoStore::open_tuned(&dir, 64 << 20, CACHE_ENTRY_COST).unwrap();
+        assert_eq!(db.relieve_pressure(), 0, "already at both cache floors");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

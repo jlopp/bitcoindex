@@ -105,7 +105,7 @@ pub struct BenchConfig {
     #[arg(long)]
     pub reorder_high: Option<usize>,
 
-    /// Worker -> consumer channel depth. Default 512 (production value).
+    /// Worker -> consumer channel depth. Default 64 (production value).
     #[arg(long)]
     pub channel_depth: Option<usize>,
 
@@ -388,7 +388,7 @@ impl Tuning {
     fn from_cfg(cfg: &BenchConfig) -> Self {
         Tuning {
             reorder_high: cfg.reorder_high.unwrap_or(crate::pipeline::REORDER_HIGH),
-            channel_depth: cfg.channel_depth.unwrap_or(512),
+            channel_depth: cfg.channel_depth.unwrap_or(crate::pipeline::CHANNEL_DEPTH),
             sink_batch_rows: cfg
                 .sink_batch_rows
                 .unwrap_or_else(|| SinkConfig::default().batch_size),
@@ -529,7 +529,6 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     );
 
     let index = Arc::new(index);
-    let heights: Vec<u32> = (start..end).collect();
     let do_utxo = cfg.mode.needs_utxo();
     let do_sink = cfg.mode.needs_sink();
     // `drain` and `parse` both need the consumer thread to exist: drain's
@@ -673,48 +672,31 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cfg.threads.unwrap_or(0))
             .build()?;
+        let height_cursor = AtomicU32::new(start);
+        let num_workers = pool.current_num_threads();
         // The worker pool's result is captured, not propagated: an abort here
         // (a parse failure, or the watchdog tripping a worker's spin loop) must
-        // still leave a report with the live counters. `map_init` collects into
-        // a `Result`, so a worker error is a value rather than a panic.
-        let worker_result = pool.install(|| {
-            heights
-                .par_iter()
-                .map_init(
-                    || {
-                        (
-                            file_cache.clone(),
-                            tx.clone(),
-                            Arc::clone(&parse_wall_w),
-                            Arc::clone(&watchdog_w),
-                            Arc::clone(&reorder_w),
-                            Arc::clone(&next_h_w),
-                        )
-                    },
-                    |(cache, tx, parse_wall, watchdog, reorder, next_h),
-                     &height|
-                     -> anyhow::Result<u64> {
-                        // Backpressure, as in `pipeline::run_parse`. The
-                        // exemption is load-bearing: a worker holding the
-                        // height the consumer is waiting for must always be
-                        // allowed to run, or no block can ever unblock the
-                        // consumer and the whole pipeline deadlocks.
-                        //
-                        // coverage-exempt: 711, 713-714, 716 — mirror of the production
-                        // spin in `pipeline::run_parse`. The body (and the
-                        // second `&&` clause, which short-circuits) only runs
-                        // when the consumer is `reorder_high` blocks behind
-                        // *and* this worker's height is not the one awaited,
-                        // i.e. under memory pressure the small unit fixtures
-                        // never create.
-                        while reorder.load(Ordering::Relaxed) > reorder_high_w
-                            && next_h.load(Ordering::Relaxed) != height
-                        {
-                            if watchdog.is_tripped() {
-                                return Err(watchdog.tripped_error());
-                            }
-                            std::thread::sleep(std::time::Duration::from_micros(50));
+        // still leave a report with the live counters. Heights are claimed in
+        // strict ascending order from `height_cursor`, matching production.
+        let worker_result: anyhow::Result<Vec<u64>> = pool.install(|| {
+            let chunks: anyhow::Result<Vec<Vec<u64>>> = (0..num_workers)
+                .into_par_iter()
+                .map(|_| -> anyhow::Result<Vec<u64>> {
+                    let cache = file_cache.clone();
+                    let tx = tx.clone();
+                    let mut local_samples = Vec::new();
+                    loop {
+                        let height = height_cursor.fetch_add(1, Ordering::Relaxed);
+                        if height >= end {
+                            return Ok(local_samples);
                         }
+                        crate::pipeline::wait_for_consumer(
+                            height,
+                            reorder_high_w,
+                            &next_h_w,
+                            &reorder_w,
+                            &watchdog_w,
+                        )?;
                         let t = std::time::Instant::now();
                         let loc = &index_w.by_height[height as usize];
                         let bytes = cache.block_bytes(loc)?;
@@ -724,27 +706,17 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         let hash = bidx_core::dsha256(&header_raw);
                         let block = bidx_parser::parse_block_full(&bytes, height, hash, &header)?;
                         let dt = t.elapsed().as_nanos() as u64;
-                        parse_wall.fetch_add(dt, Ordering::Relaxed);
-                        // As in `pipeline::run_parse`: a failed send means the
-                        // consumer is gone, which is usually the RSS watchdog
-                        // having aborted it. Surface the real cause.
-                        //
-                        // coverage-exempt: 738-739, 741 — the map_err closure body
-                        // only runs when a send to the consumer fails, which
-                        // needs the consumer thread to have aborted mid-run;
-                        // the fixtures never provoke that. The closure's
-                        // construction is covered.
-                        tx.send(WorkItem::Block { height, block }).map_err(|_| {
-                            if watchdog.is_tripped() {
-                                watchdog.tripped_error()
-                            } else {
-                                anyhow::anyhow!("consumer dropped")
-                            }
-                        })?;
-                        Ok(dt)
-                    },
-                )
-                .collect::<anyhow::Result<Vec<u64>>>()
+                        parse_wall_w.fetch_add(dt, Ordering::Relaxed);
+                        crate::pipeline::send_work_item(
+                            &tx,
+                            WorkItem::Block { height, block },
+                            &watchdog_w,
+                        )?;
+                        local_samples.push(dt);
+                    }
+                })
+                .collect();
+            chunks.map(|vv| vv.into_iter().flatten().collect())
         });
         // Close the channel so the consumer drains what is buffered and then
         // exits its `recv` loop, even after a worker error. This is what lets
@@ -1005,22 +977,16 @@ pub(crate) struct OomWatchdog {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Soft-threshold percentage of the ceiling: pressure is signalled here.
-const SOFT_PCT: u64 = 85;
-/// Recovery percentage: pressure clears once RSS falls back below this. The gap
-/// to `SOFT_PCT` is the hysteresis band (~1 GiB on a 20 GiB ceiling), far more
-/// than one block's worth of jitter.
-const RECOVER_PCT: u64 = 80;
-
-/// Soft threshold in KiB for a given ceiling. Divided before multiplying so a
-/// `u64::MAX` ceiling (used in tests) cannot overflow.
+/// Soft threshold in KiB for a given ceiling, sourced from [`bidx_core::mem`]
+/// so the planner and watchdog agree on the exact soft/recovery split. Divided
+/// before multiplying so a `u64::MAX` ceiling (used in tests) cannot overflow.
 fn soft_rss_kb(max_rss_kb: u64) -> u64 {
-    max_rss_kb / 100 * SOFT_PCT
+    max_rss_kb / 100 * bidx_core::mem::SOFT_PCT
 }
 
 /// Recovery threshold in KiB for a given ceiling (see [`soft_rss_kb`]).
 fn recover_rss_kb(max_rss_kb: u64) -> u64 {
-    max_rss_kb / 100 * RECOVER_PCT
+    max_rss_kb / 100 * bidx_core::mem::RECOVER_PCT
 }
 
 /// Decide whether an RSS sample exceeds the ceiling, logging the trip once at
@@ -1168,9 +1134,7 @@ fn bench_consume(
 ) -> Result<Vec<u64>> {
     let mut buffer: std::collections::BTreeMap<u32, bidx_parser::FullBlock> =
         std::collections::BTreeMap::new();
-    let mut file_cache_bound = file_cache_start;
-    // Edge-trigger for the relief path (see the per-block watchdog check).
-    let mut was_pressured = false;
+    let mut pressure = crate::pipeline::PressureState::new(file_cache_start);
     let mut next = start;
     if let Some(n) = next_height {
         n.store(next, Ordering::Relaxed);
@@ -1209,15 +1173,12 @@ fn bench_consume(
             // consumer for why): shed cache memory so the hard ceiling is not
             // reached. Hard stage second: abort only if it was anyway.
             if let Some(w) = watchdog {
-                let pressured = w.is_pressured();
-                crate::pipeline::shed_on_pressure(
-                    pressured,
-                    was_pressured,
+                pressure.poll(
+                    w.is_pressured(),
+                    std::time::Instant::now(),
                     utxo,
                     file_cache,
-                    &mut file_cache_bound,
                 );
-                was_pressured = pressured;
                 if w.is_tripped() {
                     return Err(w.tripped_error());
                 }
@@ -1571,7 +1532,7 @@ mod tests {
         // The bench must measure production defaults unless told otherwise.
         let t = Tuning::from_cfg(&test_cfg(BenchMode::Full));
         assert_eq!(t.reorder_high, crate::pipeline::REORDER_HIGH);
-        assert_eq!(t.channel_depth, 512);
+        assert_eq!(t.channel_depth, crate::pipeline::CHANNEL_DEPTH);
         assert_eq!(t.sink_batch_rows, SinkConfig::default().batch_size);
     }
 
@@ -1579,11 +1540,11 @@ mod tests {
     fn tuning_overrides_are_honoured() {
         let mut cfg = test_cfg(BenchMode::Full);
         cfg.reorder_high = Some(4);
-        cfg.channel_depth = Some(64);
+        cfg.channel_depth = Some(16);
         cfg.sink_batch_rows = Some(1_000);
         let t = Tuning::from_cfg(&cfg);
         assert_eq!(t.reorder_high, 4);
-        assert_eq!(t.channel_depth, 64);
+        assert_eq!(t.channel_depth, 16);
         assert_eq!(t.sink_config().batch_size, 1_000);
     }
 

@@ -49,9 +49,10 @@ use tracing::{info, warn};
 ///
 /// Public so `bidx bench` can sweep it without a rebuild.
 pub const REORDER_HIGH: usize = 32;
-/// Worker -> consumer channel depth. Bounded on purpose: an unbounded
-/// channel is a memory leak under backpressure.
-pub const CHANNEL_DEPTH: usize = 512;
+/// Worker -> consumer channel depth. Bounded tightly (`2 * REORDER_HIGH`) so
+/// parsed `FullBlock`s cannot pile up by the hundreds in the channel while the
+/// ordered consumer is inside a slow `apply_block` or flush.
+pub const CHANNEL_DEPTH: usize = 64;
 
 /// Consumer -> sink channel depth. The sink thread overlaps Parquet I/O with
 /// the UTXO apply, so a small bound is enough to keep both busy while capping
@@ -293,7 +294,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // one worker that can unblock the consumer is never parked.
     let next_height = Arc::new(AtomicU32::new(start));
 
-    let heights: Vec<u32> = (start..end).collect();
+    let height_cursor = AtomicU32::new(start);
     let index_for_workers = Arc::clone(&index);
     let orphan_blocks = cfg.orphan_blocks.clone();
     let orphans_skipped = Arc::new(AtomicU64::new(0));
@@ -366,83 +367,51 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // checks the watchdog first.
     let watchdog_w = Arc::clone(&watchdog);
 
+    let num_workers = pool.current_num_threads();
     let parse_result: Result<()> = pool.install(|| {
-        heights.par_iter().try_for_each_init(
-            || {
-                (
-                    file_cache.clone(),
-                    tx.clone(),
-                    Arc::clone(&reorder_depth_w),
-                    Arc::clone(&next_height_w),
-                    Arc::clone(&watchdog_w),
-                )
-            },
-            |(cache, tx, reorder, next_h, watchdog), &height| -> Result<()> {
-                // Backpressure: spin/sleep until consumer drains the
-                // reorder buffer below the watermark. This caps the
-                // consumer's BTreeMap at ~REORDER_HIGH parsed blocks.
-                //
-                // Two guards make this safe. The watchdog check stops an
-                // aborted consumer (RSS over limit) from turning the spin into
-                // a hang. The `next_h` exemption stops a deadlock: the worker
-                // holding the height the consumer is waiting for must run, or
-                // no block ever arrives to let the consumer drain.
-                //
-                // coverage-exempt: 397-402 — the spin body only runs when the
-                // consumer is >REORDER_HIGH blocks behind *and* the worker's
-                // height is not the one being awaited, i.e. under real memory
-                // pressure the unit fixtures never create. The first clause of
-                // the condition is exercised.
-                while reorder.load(Ordering::Relaxed) > REORDER_HIGH
-                    && next_h.load(Ordering::Relaxed) != height
-                {
-                    if watchdog.is_tripped() {
-                        return Err(watchdog.tripped_error());
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-                let loc = &index_for_workers.by_height[height as usize];
-                let bytes = cache.block_bytes(loc)?;
-                // We need the block's header to pass into parse; re-parse the
-                // 80-byte header from the payload (cheap) and reuse the hash
-                // from the chain index... but ChainIndex doesn't store hashes
-                // per height in a Vec. Compute hash from header bytes here.
-                let mut header_raw = [0u8; 80];
-                header_raw.copy_from_slice(&bytes[..80]);
-                let header = bidx_core::BlockHeader::parse(&header_raw);
-                let hash = bidx_core::dsha256(&header_raw);
-                // A send failure means the consumer is gone. That is either a
-                // real bug or the RSS watchdog having aborted it; report the
-                // actual cause rather than a generic "consumer dropped".
-                // coverage-exempt: 421-425, 436, 442 — the closure body and the
-                // two `map_err` closures only run when a send to the consumer
-                // fails (consumer aborted mid-run via the RSS watchdog); not
-                // reachable in the unit fixtures. Construction is covered.
-                let send_failed = |w: &crate::bench::OomWatchdog| -> anyhow::Error {
-                    if w.is_tripped() {
-                        w.tripped_error()
-                    } else {
-                        anyhow::anyhow!("consumer dropped")
-                    }
-                };
-                // Skip orphaned (stale / side-chain) blocks. Their UTXOs were
-                // never part of the active chain; indexing them would poison
-                // the UTXO set and emit duplicate rows. We still must notify
-                // the ordered consumer so it can advance past this height.
-                if let Some(orphans) = &orphan_blocks {
-                    if orphans.contains(&hash) {
-                        orphans_skipped.fetch_add(1, Ordering::Relaxed);
-                        tx.send(WorkItem::Skipped { height })
-                            .map_err(|_| send_failed(watchdog))?;
+        // Workers claim heights in strict ascending order from `height_cursor`
+        // rather than binary-splitting `(start..end)` via `par_iter()`. That
+        // keeps every worker on the same 1-2 `blk*.dat` files (preventing LRU
+        // thrashing across distant chain eras) and lets `wait_for_consumer`
+        // park workers before they allocate `FullBlock`s far ahead of `next`.
+        (0..num_workers)
+            .into_par_iter()
+            .try_for_each(|_| -> Result<()> {
+                let cache = file_cache.clone();
+                let tx = tx.clone();
+                loop {
+                    let height = height_cursor.fetch_add(1, Ordering::Relaxed);
+                    if height >= end {
                         return Ok(());
                     }
+                    wait_for_consumer(
+                        height,
+                        REORDER_HIGH,
+                        &next_height_w,
+                        &reorder_depth_w,
+                        &watchdog_w,
+                    )?;
+                    let loc = &index_for_workers.by_height[height as usize];
+                    let bytes = cache.block_bytes(loc)?;
+                    let mut header_raw = [0u8; 80];
+                    header_raw.copy_from_slice(&bytes[..80]);
+                    let header = bidx_core::BlockHeader::parse(&header_raw);
+                    let hash = bidx_core::dsha256(&header_raw);
+                    // Skip orphaned (stale / side-chain) blocks. Their UTXOs
+                    // were never part of the active chain; indexing them would
+                    // poison the UTXO set and emit duplicate rows. Notify the
+                    // ordered consumer so it advances past this height.
+                    if let Some(orphans) = &orphan_blocks {
+                        if orphans.contains(&hash) {
+                            orphans_skipped.fetch_add(1, Ordering::Relaxed);
+                            send_work_item(&tx, WorkItem::Skipped { height }, &watchdog_w)?;
+                            continue;
+                        }
+                    }
+                    let block = parse_block_full_opts(&bytes, height, hash, &header, parse_opts)?;
+                    send_work_item(&tx, WorkItem::Block { height, block }, &watchdog_w)?;
                 }
-                let block = parse_block_full_opts(&bytes, height, hash, &header, parse_opts)?;
-                tx.send(WorkItem::Block { height, block })
-                    .map_err(|_| send_failed(watchdog))?;
-                Ok(())
-            },
-        )
+            })
     });
     // Close the channel so the consumer can terminate.
     drop(tx);
@@ -610,46 +579,119 @@ impl ThreadFileCache {
     }
 }
 
-/// Shed cache memory when RSS first crosses the watchdog's soft threshold.
+/// Park a parse worker when its assigned `height` runs more than
+/// `reorder_high` blocks ahead of `next_height` (or when the consumer's
+/// reorder buffer is already above `reorder_high`).
 ///
-/// Takes the current and previous pressure readings so it fires once per
-/// *episode*: the watchdog flag is sticky until RSS recovers, and shedding on
-/// every pressured block would floor the caches and wreck throughput. Returns
-/// the bytes freed; the caller updates its `was_pressured` to `pressured`.
+/// The worker holding `next_height` itself is always exempt (`height ==
+/// next_height` short-circuits), keeping the pipeline deadlock-free while
+/// bounding in-flight `FullBlock`s across workers, channel, and reorder buffer
+/// combined.
+pub(crate) fn wait_for_consumer(
+    height: u32,
+    reorder_high: usize,
+    next_height: &AtomicU32,
+    reorder_depth: &AtomicUsize,
+    watchdog: &crate::bench::OomWatchdog,
+) -> Result<()> {
+    while (height.saturating_sub(next_height.load(Ordering::Relaxed)) as usize > reorder_high
+        || reorder_depth.load(Ordering::Relaxed) > reorder_high)
+        && next_height.load(Ordering::Relaxed) != height
+    {
+        if watchdog.is_tripped() {
+            return Err(watchdog.tripped_error());
+        }
+        std::thread::sleep(std::time::Duration::from_micros(50));
+    }
+    Ok(())
+}
+
+/// Send a [`WorkItem`] to the ordered consumer, surfacing the RSS watchdog's
+/// error rather than a generic `"consumer dropped"` if the consumer aborted on
+/// an over-limit trip.
+pub(crate) fn send_work_item(
+    tx: &crossbeam_channel::Sender<WorkItem>,
+    item: WorkItem,
+    watchdog: &crate::bench::OomWatchdog,
+) -> Result<()> {
+    tx.send(item).map_err(|_| {
+        if watchdog.is_tripped() {
+            watchdog.tripped_error()
+        } else {
+            anyhow::anyhow!("consumer dropped")
+        }
+    })
+}
+
+/// Minimum interval between consecutive cache-shedding steps during a single
+/// sustained pressure episode. Spans ten 200 ms watchdog polls so `VmRSS`
+/// reflects the previous step's `mremap` / `malloc_trim` before deciding
+/// whether a further step is required.
+pub(crate) const PRESSURE_RELIEF_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Progressive memory-pressure controller shared by `consume_ordered` and
+/// `bench::bench_consume`.
 ///
-/// Shared by `consume_ordered` and `bench::bench_consume` so the production and
-/// bench consumers relieve pressure identically. All three levers are pure
-/// caches — the recent-UTXO cache, the RocksDB block cache, and the decoded-file
-/// LRU — so dropping them costs hit rate, never correctness.
-pub(crate) fn shed_on_pressure(
-    pressured: bool,
-    was_pressured: bool,
-    utxo: Option<&UtxoStore>,
-    file_cache: &ThreadFileCache,
-    file_cache_bound: &mut usize,
-) -> usize {
-    if !(pressured && !was_pressured) {
-        return 0;
+/// Unlike a pure single-shot rising-edge latch (which fired once and then
+/// stayed inert forever if one halving brought RSS to e.g. 76% — above the
+/// recovery threshold — before RSS climbed on to 100%), [`PressureState`]
+/// sheds immediately on the rising edge *and* takes additional steps every
+/// [`PRESSURE_RELIEF_COOLDOWN`] while pressure persists until either RSS
+/// recovers or all three cache levers reach their floors.
+pub(crate) struct PressureState {
+    last_relief: Option<std::time::Instant>,
+    pub(crate) file_cache_bound: usize,
+}
+
+impl PressureState {
+    pub(crate) fn new(file_cache_start: usize) -> Self {
+        Self {
+            last_relief: None,
+            file_cache_bound: file_cache_start,
+        }
     }
-    let mut freed = 0;
-    if let Some(u) = utxo {
-        freed += u.relieve_pressure();
+
+    pub(crate) fn poll(
+        &mut self,
+        pressured: bool,
+        now: std::time::Instant,
+        utxo: Option<&UtxoStore>,
+        file_cache: &ThreadFileCache,
+    ) -> usize {
+        if !pressured {
+            self.last_relief = None;
+            return 0;
+        }
+        if let Some(prev) = self.last_relief {
+            if now.saturating_duration_since(prev) < PRESSURE_RELIEF_COOLDOWN {
+                return 0;
+            }
+        }
+        self.last_relief = Some(now);
+        let mut freed = 0;
+        if let Some(u) = utxo {
+            freed += u.relieve_pressure();
+        }
+        let next_bound = (self.file_cache_bound / 2).max(1);
+        let shrank_files = next_bound < self.file_cache_bound;
+        if shrank_files {
+            file_cache.shrink_to(next_bound);
+            self.file_cache_bound = next_bound;
+            bidx_core::trim_allocator();
+        }
+        if freed > 0 || shrank_files {
+            // coverage-exempt: the `tracing::warn!` field expressions are only
+            // evaluated when a subscriber is installed; the unit tests run
+            // without one, so only the macro's target line is instrumented.
+            tracing::warn!(
+                freed_mb = freed / (1 << 20),
+                file_cache_files = self.file_cache_bound,
+                "watchdog: RSS over soft threshold; shedding cache memory"
+            );
+        }
+        freed
     }
-    let next_bound = (*file_cache_bound / 2).max(1);
-    if next_bound < *file_cache_bound {
-        file_cache.shrink_to(next_bound);
-        *file_cache_bound = next_bound;
-    }
-    // coverage-exempt: 676-683 — the `tracing::warn!` field expressions are only
-    // evaluated when a subscriber is installed; the unit tests run without one,
-    // so only the macro's target line is instrumented. The branch itself is
-    // covered by `shed_on_pressure_frees_memory_only_on_the_rising_edge`.
-    tracing::warn!(
-        freed_mb = freed / (1 << 20),
-        file_cache_files = *file_cache_bound,
-        "watchdog: RSS over soft threshold; shedding cache memory"
-    );
-    freed
 }
 
 /// Receives out-of-order parsed blocks, buffers until the next expected
@@ -687,12 +729,7 @@ fn consume_ordered(
     let mut skipped_queue: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut next = start;
     next_height.store(next, Ordering::Relaxed);
-    // Current file-LRU bound, lowered a step at a time as pressure is observed.
-    let mut file_cache_bound = file_cache_start;
-    // Tracks the previous pressure reading so memory is shed only on the rising
-    // edge (see the per-block check below). Without this, a sticky flag would
-    // shed on every block and floor the caches.
-    let mut was_pressured = false;
+    let mut pressure = PressureState::new(file_cache_start);
 
     let sink_cfg = SinkConfig {
         capture_witness,
@@ -752,18 +789,12 @@ fn consume_ordered(
             // floor the caches and wreck throughput. One step per episode, and
             // the next episode can only start after RSS has fallen back.
             if let Some(w) = watchdog {
-                let pressured = w.is_pressured();
-                shed_on_pressure(
-                    pressured,
-                    was_pressured,
+                pressure.poll(
+                    w.is_pressured(),
+                    std::time::Instant::now(),
                     Some(utxo),
                     file_cache,
-                    &mut file_cache_bound,
                 );
-                was_pressured = pressured;
-                // coverage-exempt: 768 — `consume_ordered` is only driven by the
-                // end-to-end `run_parse` tests, none of which trip the watchdog
-                // mid-run; the bench consumer's equivalent abort is directly tested.
                 if w.is_tripped() {
                     return Err(w.tripped_error());
                 }
@@ -804,9 +835,6 @@ fn consume_ordered(
             // Hand the fully-enriched block to the sink thread. A send error
             // means the sink already failed; surface its error, not a generic
             // "channel closed".
-            // coverage-exempt: 817-820 — only runs when the sink thread has
-            // already died (a Parquet write error mid-run), which the fixtures
-            // do not provoke; the normal send is covered.
             if sink_tx
                 .send(SinkMsg::Block {
                     block,
@@ -814,10 +842,9 @@ fn consume_ordered(
                 })
                 .is_err()
             {
-                let e = sink_handle
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
-                return Err(e.unwrap_err().context("parquet sink thread failed"));
+                // coverage-exempt: only reached if the background Parquet sink
+                // thread died mid-run on a filesystem fault.
+                return Err(reap_dead_sink(sink_handle));
             }
 
             progress.inc(1);
@@ -841,17 +868,18 @@ fn consume_ordered(
         .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
 
     if next < end {
-        // Channel closed before we saw every height: that's an error.
-        // coverage-exempt: 851-852 — reached only when the producer's channel
-        // closes before every height was delivered (a parse/worker abort). The
-        // fixtures always complete the range and return via the `break
-        // 'consume` exit, so this defensive tail is not exercised; it exists so
-        // a truncated run fails loudly instead of silently writing a partial
-        // index. The sink is still reaped above so its part file is closed.
         sink_res?;
         anyhow::bail!("channel closed early: stopped at height {next}, expected {end}");
     }
     sink_res
+}
+
+// coverage-exempt: only reached if the background Parquet sink thread died mid-run on an I/O fault.
+fn reap_dead_sink(sink_handle: std::thread::JoinHandle<Result<()>>) -> anyhow::Error {
+    let e = sink_handle
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
+    e.unwrap_err().context("parquet sink thread failed")
 }
 
 /// A message from the ordered consumer to the sink thread.
@@ -1671,51 +1699,237 @@ mod tests {
     }
 
     #[test]
-    fn shed_on_pressure_frees_memory_only_on_the_rising_edge() {
-        // The relief path must fire once per episode, not per block: the
-        // watchdog flag stays set until RSS recovers, so a level-triggered
-        // implementation would shed on every block and floor the caches.
+    fn pressure_state_sheds_on_rising_edge_and_progressively_after_cooldown() {
+        // Relief must fire immediately on the rising edge, suppress per-block
+        // shedding during the cooldown window, fire additional progressive
+        // steps if RSS stays above the recovery band past cooldown, reset
+        // immediately on recovery, and stop cleanly once all caches hit floor.
         let dir = tmp_utxo_dir("shed");
         let store = UtxoStore::open_tuned(&dir, 256 << 20, 64 << 20).unwrap();
         let file_dir = make_many_blk_files(8);
         let cache = ThreadFileCache::with_capacity(&file_dir, 8);
-        let mut bound = 8;
+        let mut state = PressureState::new(8);
+        let t0 = std::time::Instant::now();
 
         // No pressure: nothing shed, bound unchanged.
-        assert_eq!(
-            shed_on_pressure(false, false, Some(&store), &cache, &mut bound),
-            0
-        );
-        assert_eq!(bound, 8);
+        assert_eq!(state.poll(false, t0, Some(&store), &cache), 0);
+        assert_eq!(state.file_cache_bound, 8);
 
-        // Rising edge: shed. Recent cache halved (64→32 MiB) + block cache
-        // halved (256→128 MiB) = 160 MiB; file bound halved to 4.
+        // Rising edge: shed immediately. Recent halved (64->32 MiB) + block
+        // cache halved (256->128 MiB) = 160 MiB; file bound halved to 4.
         assert_eq!(
-            shed_on_pressure(true, false, Some(&store), &cache, &mut bound),
+            state.poll(true, t0, Some(&store), &cache),
             (32 << 20) + (128 << 20)
         );
-        assert_eq!(bound, 4);
+        assert_eq!(state.file_cache_bound, 4);
 
-        // Still pressured, but not a new edge: no further shedding.
+        // Still pressured inside the 2s cooldown: no further shedding yet.
         assert_eq!(
-            shed_on_pressure(true, true, Some(&store), &cache, &mut bound),
+            state.poll(
+                true,
+                t0 + std::time::Duration::from_millis(500),
+                Some(&store),
+                &cache,
+            ),
             0
         );
-        assert_eq!(bound, 4);
+        assert_eq!(state.file_cache_bound, 4);
 
-        // A fresh episode (recovered then pressured again) sheds again.
+        // Sustained pressure past cooldown (RSS never dipped below recovery):
+        // takes a second progressive step rather than staying dead-latched!
+        let t1 = t0 + PRESSURE_RELIEF_COOLDOWN;
         assert_eq!(
-            shed_on_pressure(true, false, Some(&store), &cache, &mut bound),
+            state.poll(true, t1, Some(&store), &cache),
             (16 << 20) + (64 << 20)
         );
-        assert_eq!(bound, 2);
+        assert_eq!(state.file_cache_bound, 2);
 
-        // With no store, the file-LRU lever still applies (covers the None arm).
-        let mut b2 = 8;
-        assert_eq!(shed_on_pressure(true, false, None, &cache, &mut b2), 0);
-        assert_eq!(b2, 4);
+        // Recovery clears the cooldown so a fresh pressure episode fires right
+        // away without waiting another 2s.
+        assert_eq!(state.poll(false, t1, Some(&store), &cache), 0);
+        assert_eq!(
+            state.poll(
+                true,
+                t1 + std::time::Duration::from_millis(10),
+                Some(&store),
+                &cache,
+            ),
+            8 << 20 // block cache already at 64 MiB floor; recent 16->8 MiB
+        );
+        assert_eq!(state.file_cache_bound, 1);
+
+        // With no store and file_cache_bound > 1, file-LRU lever still works;
+        // once bound reaches 1, further polls at floor return 0 quietly.
+        let mut s2 = PressureState::new(4);
+        assert_eq!(s2.poll(true, t0, None, &cache), 0);
+        assert_eq!(s2.file_cache_bound, 2);
+        assert_eq!(s2.poll(true, t0 + PRESSURE_RELIEF_COOLDOWN, None, &cache), 0);
+        assert_eq!(s2.file_cache_bound, 1);
+        assert_eq!(
+            s2.poll(true, t0 + PRESSURE_RELIEF_COOLDOWN * 2, None, &cache),
+            0
+        );
+        assert_eq!(s2.file_cache_bound, 1);
+
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&file_dir);
+    }
+
+    #[test]
+    fn wait_for_consumer_exempts_next_height_spins_until_caught_up_and_aborts_on_trip() {
+        let next_h = AtomicU32::new(0);
+        let reorder = AtomicUsize::new(0);
+        let quiet_wd = crate::bench::OomWatchdog::start(u64::MAX);
+
+        // Within `reorder_high` window: returns immediately.
+        wait_for_consumer(2, 4, &next_h, &reorder, &quiet_wd).unwrap();
+
+        // Even when `reorder > reorder_high`, the worker holding `next_h` is
+        // exempt so the consumer can never deadlock.
+        reorder.store(99, Ordering::Relaxed);
+        wait_for_consumer(0, 4, &next_h, &reorder, &quiet_wd).unwrap();
+        reorder.store(0, Ordering::Relaxed);
+
+        // Ahead of `next_h + reorder_high`: spins briefly until consumer
+        // advances `next_h`.
+        let next_h_arc = Arc::new(AtomicU32::new(0));
+        let next_h_bg = Arc::clone(&next_h_arc);
+        let advancer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            next_h_bg.store(10, Ordering::Relaxed);
+        });
+        wait_for_consumer(10, 2, &next_h_arc, &reorder, &quiet_wd).unwrap();
+        advancer.join().unwrap();
+
+        // When the watchdog trips while parked, returns the watchdog error
+        // rather than spinning forever.
+        let tripped_wd = crate::bench::OomWatchdog::start(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !tripped_wd.is_tripped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let err = wait_for_consumer(50, 2, &next_h, &reorder, &tripped_wd).unwrap_err();
+        assert!(err.to_string().contains("watchdog"));
+    }
+
+    #[test]
+    fn send_work_item_surfaces_watchdog_cause_when_consumer_drops() {
+        let quiet_wd = crate::bench::OomWatchdog::start(u64::MAX);
+        let (tx, rx) = bounded::<WorkItem>(2);
+        send_work_item(&tx, WorkItem::Skipped { height: 0 }, &quiet_wd).unwrap();
+        drop(rx);
+
+        // Consumer dropped without a watchdog trip: reports "consumer dropped".
+        let e = send_work_item(&tx, WorkItem::Skipped { height: 1 }, &quiet_wd).unwrap_err();
+        assert!(e.to_string().contains("consumer dropped"), "got {e}");
+
+        // Consumer dropped because watchdog tripped: surfaces watchdog error.
+        let tripped_wd = crate::bench::OomWatchdog::start(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !tripped_wd.is_tripped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let e2 = send_work_item(&tx, WorkItem::Skipped { height: 2 }, &tripped_wd).unwrap_err();
+        assert!(e2.to_string().contains("watchdog"), "got {e2}");
+    }
+
+    #[test]
+    fn consume_ordered_aborts_on_tripped_watchdog_and_early_channel_close() {
+        let root = tmp_utxo_dir("consume-abort");
+        let utxo_dir = root.join("utxo");
+        let out_dir = root.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let store = UtxoStore::open(&utxo_dir).unwrap();
+        let disk_cfg = DiskGuardConfig {
+            checkpoint_file: root.join("checkpoints.txt"),
+            network: bidx_core::Network::Regtest,
+            index_root: root.clone(),
+            tracked_dirs: vec![utxo_dir.clone(), out_dir.clone()],
+        };
+        let recorder = DiskRecorder::new(disk_cfg);
+        let progress = ProgressBar::hidden();
+        let missing = AtomicU64::new(0);
+        let reorder = AtomicUsize::new(0);
+        let next_h = AtomicU32::new(0);
+        let file_cache = ThreadFileCache::with_capacity(&root, 2);
+
+        // 1. Producer closes channel before delivering all heights: fails loudly.
+        let (tx, rx) = bounded::<WorkItem>(2);
+        drop(tx);
+        let e1 = consume_ordered(
+            rx,
+            0,
+            2,
+            10,
+            &out_dir,
+            &store,
+            &progress,
+            &missing,
+            &recorder,
+            &reorder,
+            &next_h,
+            None,
+            false,
+            &file_cache,
+            2,
+        )
+        .unwrap_err();
+        assert!(e1.to_string().contains("channel closed early"), "got {e1}");
+
+        // 2. Tripped watchdog aborts cleanly on the next drained block.
+        let tripped_wd = crate::bench::OomWatchdog::start(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !tripped_wd.is_tripped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (tx2, rx2) = bounded::<WorkItem>(2);
+        let dummy_block = FullBlock {
+            block_row: bidx_core::BlockRow {
+                height: 0,
+                hash: [0u8; 32],
+                prev_hash: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0,
+                nonce: 0,
+                version: 1,
+                tx_count: 0,
+                size: 80,
+                weight: 320,
+                total_fee: 0,
+                coinbase_value: 0,
+            },
+            txs: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            witnesses: Vec::new(),
+        };
+        tx2.send(WorkItem::Block {
+            height: 0,
+            block: dummy_block,
+        })
+        .unwrap();
+        drop(tx2);
+        let e2 = consume_ordered(
+            rx2,
+            0,
+            1,
+            10,
+            &out_dir,
+            &store,
+            &progress,
+            &missing,
+            &recorder,
+            &reorder,
+            &next_h,
+            Some(&tripped_wd),
+            false,
+            &file_cache,
+            2,
+        )
+        .unwrap_err();
+        assert!(e2.to_string().contains("watchdog"), "got {e2}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A unique temp dir for a UTXO store in a pipeline test.

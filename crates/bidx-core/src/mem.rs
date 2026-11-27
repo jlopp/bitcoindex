@@ -35,10 +35,11 @@
 //! are sized *last*, as whatever is left over, so they can never push the total
 //! past the ceiling.
 
-/// One tenth of `MemAvailable` is reserved against the kernel's own estimate
-/// being optimistic (cgroup limits, memory fragmentation, a competing process
-/// growing between the read and the allocation).
-const RESERVE_FRACTION_DENOM: u64 = 10;
+/// One eighth of `MemAvailable` is reserved for the kernel page cache (which
+/// backs `blk*.dat`, SST, and Parquet I/O) and against `MemAvailable` being
+/// optimistic (cgroup limits, memory fragmentation, or competing host
+/// processes).
+const RESERVE_FRACTION_DENOM: u64 = 8;
 
 /// Fixed reserve for the runtime itself: parse worker scratch, the reorder
 /// buffer, in-flight sink batches, and allocator slack. Kept in KiB to match
@@ -52,20 +53,37 @@ pub const RUNTIME_RESERVE_KB: u64 = 2 * 1024 * 1024; // 2 GiB
 pub const MEMTABLE_BUDGET_KB: u64 = 2 * 1024 * 1024; // 2 GiB
 
 /// Heap that is not a cache and does not scale with the block cache: the
-/// reorder buffer (REORDER_HIGH parsed blocks), the `pending` map, the sink's
-/// in-flight batches, RocksDB's iterator/index allocations, and general
-/// allocator overhead.
-pub const FIXED_RUNTIME_RESERVE_KB: u64 = 1 * 1024 * 1024; // 1 GiB
+/// `ChainIndex` built by the header pass, the reorder/channel buffers, the
+/// `pending` map, `ParquetSink`'s column builders and Zstd encoders, RocksDB's
+/// background compaction buffers and `TableReader` handles, and multi-thread
+/// allocator arena slack.
+pub const FIXED_RUNTIME_RESERVE_KB: u64 = 2 * 1024 * 1024; // 2 GiB
 
 /// Decoded size of one blk file held by the file LRU. Bitcoin Core v28 stores
 /// blk files XOR-obfuscated, so opening one allocates a full decoded buffer of
 /// the file's length (~128 MiB for mainnet).
 pub const DECODED_FILE_KB: u64 = 128 * 1024; // 128 MiB
 
+/// Upper bound on resident files in the decoded-blk LRU. Because parse workers
+/// pull heights from a sequential cursor, all workers stay within a small
+/// window of heights (typically 1-2 `blk*.dat` files, occasionally 3-4 when
+/// Bitcoin Core wrote blocks slightly out of order), so 8 files (1 GiB) keeps
+/// hit rates near 100% without pinning 2 GiB.
+pub const MAX_FILE_CACHE_FILES: usize = 8;
+
 /// Fraction of the post-overhead ceiling the caches may occupy. The remaining
-/// 20% is the spike margin: a compaction burst or one outsized block must not
-/// be able to reach the ceiling and trip the watchdog.
-pub const CACHE_FRACTION_PCT: u64 = 80;
+/// 25% is the spike margin for RocksDB compaction bursts, file-backed `mmap`
+/// pages counted in `VmRSS`, and allocator arena retention.
+pub const CACHE_FRACTION_PCT: u64 = 75;
+
+/// Soft-threshold percentage of `ceiling_kb`: cache-shedding starts here,
+/// leaving a 20% runway before the hard ceiling for progressive relief steps
+/// to take effect.
+pub const SOFT_PCT: u64 = 80;
+
+/// Hysteresis recovery percentage of `ceiling_kb`: pressure clears once RSS
+/// drops back below this band.
+pub const RECOVER_PCT: u64 = 72;
 
 /// Percentage of the *cache* budget given to the recent-UTXO cache. It gets the
 /// larger share because a hit there removes the RocksDB lookup entirely (no
@@ -121,10 +139,10 @@ impl MemoryPlan {
     }
 
     /// RSS (KiB) at which the consumer should start shedding memory rather than
-    /// waiting for the hard ceiling. 85% leaves room for one more block plus a
-    /// compaction burst to complete before the hard limit is reached.
+    /// waiting for the hard ceiling. [`SOFT_PCT`]% leaves a 20% runway for
+    /// progressive relief steps and compaction bursts before the hard limit.
     pub fn soft_kb(&self) -> u64 {
-        self.ceiling_kb * 85 / 100
+        self.ceiling_kb / 100 * SOFT_PCT
     }
 }
 
@@ -181,10 +199,11 @@ pub fn plan_memory(available_kb: u64, total_kb: u64) -> MemoryPlan {
         .saturating_sub(RUNTIME_RESERVE_KB)
         .max(MIN_CEILING_KB);
 
-    // The file LRU is capped at ~10% of the ceiling and clamped to `[1, 16]` so
-    // a tiny host still caches at least one file and a huge one does not pin
-    // gigabytes of decoded blk data.
-    let file_cache_files = ((ceiling_kb / 10) / DECODED_FILE_KB).clamp(1, 16) as usize;
+    // The file LRU is capped at ~1/16th of the ceiling and clamped to
+    // `[1, MAX_FILE_CACHE_FILES]` so a tiny host still caches at least one file
+    // and a large one does not pin gigabytes of decoded blk data.
+    let file_cache_files =
+        ((ceiling_kb / 16) / DECODED_FILE_KB).clamp(1, MAX_FILE_CACHE_FILES as u64) as usize;
     let file_cache_kb = file_cache_files as u64 * DECODED_FILE_KB;
 
     // Overheads: the absolute budget, but never more than a fraction of the
@@ -215,9 +234,33 @@ pub fn plan_cache_budget(available_kb: u64, total_kb: u64) -> CacheBudget {
     plan_memory(available_kb, total_kb).caches()
 }
 
+/// Ask the system allocator to return unused heap pages to the OS.
+///
+/// Under multi-threaded workloads (Rayon parse workers + RocksDB background
+/// flush/compaction threads), glibc's `ptmalloc2` retains freed chunks in
+/// per-thread arenas rather than unmapping them, so `VmRSS` can stay gigabytes
+/// above live Rust/C++ allocations even after caches evict or temporary
+/// header-pass maps drop. Calling `malloc_trim(0)` at coarse lifecycle
+/// boundaries (before planning memory after the header pass, between bench
+/// trials, and when the watchdog sheds cache memory) forces `madvise` on free
+/// arena pages so the kernel — and the RSS watchdog — see reclaimed RAM.
+pub fn trim_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim(0)` is thread-safe in glibc and only releases
+    // completely free pages from allocator arenas back to the kernel.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Plan the whole memory layout from the live host. Thin wrapper over
 /// [`plan_memory`] so callers (the CLI) have one obvious entry point.
+///
+/// Trims allocator arenas first so any slack left behind by the preceding
+/// header pass (or an earlier benchmark trial) is returned to `MemAvailable`
+/// before the snapshot is read.
 pub fn plan_memory_for_host() -> MemoryPlan {
+    trim_allocator();
     plan_memory(mem_available_kb(), mem_total_kb())
 }
 
@@ -259,15 +302,15 @@ mod tests {
 
     #[test]
     fn plan_splits_usable_memory_between_the_two_caches() {
-        // 32 GiB available, 32 GiB total: ceiling = 32 - 3.2 - 2 = 26.8 GiB,
-        // file LRU = clamp(26.8/10 GiB / 128 MiB) = 16 files = 2 GiB,
-        // overhead = 2 + 1 + 2 = 5 GiB, cache = (26.8 - 5) * 80% = 17.44 GiB,
-        // recent = 60% = 10.46 GiB, block = 6.98 GiB. Assert the exact
+        // 32 GiB available, 32 GiB total: ceiling = 32 - 4 - 2 = 26 GiB,
+        // file LRU = clamp(26/16 GiB / 128 MiB, 1, 8) = 8 files = 1 GiB,
+        // overhead = 2 + 2 + 1 = 5 GiB, cache = (26 - 5) * 75% = 15.75 GiB,
+        // recent = 60% = 9.45 GiB, block = 6.30 GiB. Assert the exact
         // arithmetic rather than a range so a change to any constant is caught.
         let avail = 32 * 1024 * 1024; // KiB
         let total = 32 * 1024 * 1024;
         let p = plan_memory(avail, total);
-        let ceiling_kb = avail - avail / 10 - RUNTIME_RESERVE_KB;
+        let ceiling_kb = avail - avail / RESERVE_FRACTION_DENOM - RUNTIME_RESERVE_KB;
         assert_eq!(p.ceiling_kb, ceiling_kb);
         let file_kb = p.file_cache_files as u64 * DECODED_FILE_KB;
         // On a 32 GiB ceiling neither overhead cap binds, so the overheads are
@@ -284,7 +327,7 @@ mod tests {
         // The recent cache gets the larger share by construction.
         assert!(p.recent_cache_bytes > p.block_cache_bytes);
         assert_eq!(p.memtable_budget_bytes, (MEMTABLE_BUDGET_KB * 1024) as usize);
-        assert_eq!(p.file_cache_files, 16);
+        assert_eq!(p.file_cache_files, MAX_FILE_CACHE_FILES);
     }
 
     /// The load-bearing invariant: everything the plan budgets for must fit
@@ -342,14 +385,19 @@ mod tests {
     fn plan_scales_the_file_lru_with_the_ceiling() {
         // A small ceiling keeps a single decoded file...
         assert_eq!(plan_memory(4 * 1024 * 1024, 4 * 1024 * 1024).file_cache_files, 1);
-        // ...and a large one caps at 16 rather than pinning gigabytes.
-        assert_eq!(plan_memory(256 * 1024 * 1024, 256 * 1024 * 1024).file_cache_files, 16);
+        // ...a medium ceiling scales proportionally...
+        assert_eq!(plan_memory(16 * 1024 * 1024, 16 * 1024 * 1024).file_cache_files, 6);
+        // ...and a large one caps at MAX_FILE_CACHE_FILES rather than pinning gigabytes.
+        assert_eq!(
+            plan_memory(256 * 1024 * 1024, 256 * 1024 * 1024).file_cache_files,
+            MAX_FILE_CACHE_FILES
+        );
     }
 
     #[test]
     fn plan_at_the_default_fallback_is_conservative() {
-        // The fallback (3 GiB available) must stay small: ceiling = 3 - 0.3 - 2
-        // = 0.7 GiB, so the caches are well under the legacy 1 GiB block cache.
+        // The fallback (3 GiB available) must stay small: ceiling = 3 - 0.375 - 2
+        // = 0.625 GiB, so the caches are well under the legacy 1 GiB block cache.
         let p = plan_memory(FALLBACK_AVAILABLE_KB, FALLBACK_AVAILABLE_KB);
         assert!(p.block_cache_bytes < 1024 * 1024 * 1024);
     }
@@ -364,7 +412,19 @@ mod tests {
     fn soft_threshold_sits_below_the_ceiling() {
         let p = plan_memory(32 * 1024 * 1024, 32 * 1024 * 1024);
         assert!(p.soft_kb() < p.ceiling_kb);
-        assert_eq!(p.soft_kb(), p.ceiling_kb * 85 / 100);
+        assert_eq!(p.soft_kb(), p.ceiling_kb / 100 * SOFT_PCT);
+        const { assert!(RECOVER_PCT < SOFT_PCT) };
+    }
+
+    #[test]
+    fn trim_allocator_preserves_live_heap_allocations() {
+        let live: Vec<u64> = (0..16_384).collect();
+        let transient: Vec<u8> = vec![0xA5; 4 << 20];
+        drop(transient);
+        trim_allocator();
+        assert_eq!(live.len(), 16_384);
+        assert_eq!(live[0], 0);
+        assert_eq!(live[16_383], 16_383);
     }
 
     #[test]

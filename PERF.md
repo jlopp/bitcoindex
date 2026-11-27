@@ -1083,3 +1083,83 @@ per-trial flush survives a later failure. `resolve_results` covers all four
 `(worker, consumer)` outcomes directly, and `run_bench_cold_store_still_flushes_the_report`
 covers the cold-store path. Per-file coverage is at 100%.
 
+## 17. Why mainnet crashed at height ~435,000 on 32 GiB RAM
+
+Even with `MemoryPlan` and the soft/hard `OomWatchdog` in place, a mainnet
+`bidx bench` on a 32 GiB machine crashed reproducibly around height
+435,000–439,800. Six compounding memory leaks, allocation spikes, and relief
+bugs caused it:
+
+1. **`RecentUtxoCache` tombstone leak + \(2^{28} \to 2^{29}\) `VecDeque` resize
+   spike (`crates/bidx-store/src/utxo.rs`).** `RecentUtxoCache::remove` removed
+   spent outputs from `FxHashMap` while leaving every ever-created 36-byte key
+   in `order: VecDeque<[u8; 36]>`, and `evict_to_budget` only popped `order`
+   when *unspent* count (`map.len() * 112`) exceeded `budget_bytes` (~9–10 GiB
+   on 32 GiB, ~85–95M live entries). At mainnet height 435,000, the live UTXO
+   set is ~44M (`map.len()` well under budget — so `evict_to_budget` had
+   **never once popped `order`**), while cumulative created outputs cross
+   \(2^{28} = 268{,}435{,}456\). Pushing the \(268{,}435{,}457\text{th}\)
+   outpoint grew `VecDeque` from \(2^{28} \times 36\text{ B} = 9.66\text{ GiB}\)
+   to \(2^{29} \times 36\text{ B} = 19.33\text{ GiB}\), holding **29.0 GiB**
+   during `realloc` alone. Worse, `set_budget` never called `shrink_to` on
+   either `FxHashMap` or `VecDeque`, so `relieve_pressure` freed **0 bytes** of
+   RSS.
+2. **Single-shot dead-latch in `shed_on_pressure` (`crates/bidx-cli/src/pipeline.rs`).**
+   Pressure relief fired only on the rising edge (`pressured && !was_pressured`).
+   Whenever a single halving did not drop `VmRSS` all the way from >85% below
+   the 80% recovery threshold, `pressured` stayed latched `true` and **no
+   second relief step ever fired** while RSS climbed on to 100%.
+3. **Rayon binary work-stealing across the whole chain + 512-deep channel
+   (`pipeline.rs`, `bench/mod.rs`).** `heights.par_iter()` recursively split
+   `0..tip` in half, so workers immediately jumped to heights 217k, 435k, 652k
+   while `next_height` was at 0 — opening a dozen unrelated 128 MiB `blk*.dat`
+   files simultaneously and buffering up to `CHANNEL_DEPTH = 512` parsed
+   `FullBlock`s (~1–3 GiB) inside `crossbeam_channel` before `reorder_depth`
+   even observed them.
+4. **Double-buffered XOR `BlkFile`s (`crates/bidx-parser/src/blkfile.rs`).**
+   When `xor.dat` was present (Bitcoin Core v28+), `BlkFile` decoded the file
+   into `decoded: Vec<u8>` (~128 MiB `RssAnon`) **and kept `mmap: Mmap` alive**
+   (~128 MiB `RssFile`, counted in `/proc/self/stat` `VmRSS`), doubling each
+   cached file to 256 MiB.
+5. **RocksDB pinned L0 filter/index blocks + glibc arena retention (`utxo.rs`,
+   `mem.rs`).** `set_pin_l0_filter_and_index_blocks_in_cache(true)` prevented
+   `block_cache.set_capacity()` from evicting L0 metadata (hundreds of SSTs in
+   deferred-compaction mode), and glibc `ptmalloc2` retained freed pages in
+   per-thread arenas across ~30 Rayon/RocksDB threads until `malloc_trim(0)`.
+6. **4× `ArrowWriter` row-group buffering (`parquet_writers.rs`).**
+   `SinkConfig::batch_size` was 250k rows, yet `max_row_group_size` was 1M,
+   causing `ArrowWriter` to hold four `RecordBatch`es per entity table in
+   `InMemoryRowGroup` before flushing.
+
+### Fixes
+
+- **Zero-tombstone, exact-budget `RecentUtxoCache` (`utxo.rs`):** replaced
+  `FxHashMap + VecDeque` with a contiguous `Vec<CacheEntry>` (96 B/slot with
+  intrusive `u32` doubly-linked FIFO pointers + `free_head` slot recycling) and
+  a compact open-addressed `Vec<u64>` index (`(tag32 << 32) | (slot + 1)`, 8 B
+  per bucket) using Knuth Algorithm R backward-shift deletion. Spent slots are
+  unlinked in \(O(1)\) and recycled immediately with zero tombstones; `entries`
+  grows via `reserve_exact` clamped to `max_entries` (`CACHE_ENTRY_COST = 128`,
+  so total heap is strictly \(\le \text{budget\_bytes}\)); and `set_budget`
+  drops the old bucket array first, compacts live slots in place, and calls
+  `shrink_to` so glibc `mremap` unmaps trailing pages without a 2× copy spike.
+- **Progressive `PressureState` + `trim_allocator()` (`pipeline.rs`, `mem.rs`,
+  `utxo.rs`):** fires immediately on the rising edge (now at `SOFT_PCT = 80%`,
+  recovery at `RECOVER_PCT = 72%`, leaving a 20% runway below `ceiling_kb`)
+  **and** repeats every 2 s (`PRESSURE_RELIEF_COOLDOWN`) while pressure
+  persists until RSS recovers or all caches hit their floors, calling
+  `libc::malloc_trim(0)` so freed C++/Rust arena pages return to the kernel.
+  `plan_memory_for_host` also trims arenas after the header pass before reading
+  `MemAvailable`, reserves `1/8` of `MemAvailable` + 2 GiB OS headroom + 2 GiB
+  fixed runtime reserve, caps `file_cache_files` at 8 (1 GiB), and uses a 25%
+  spike margin (`CACHE_FRACTION_PCT = 75`).
+- **Sequential `AtomicU32` height cursor + `CHANNEL_DEPTH = 64` (`pipeline.rs`,
+  `bench/mod.rs`):** workers claim heights in strict ascending order and call
+  `wait_for_consumer` before reading `blk` bytes or allocating `FullBlock`s,
+  keeping all workers on the same 1–2 `blk*.dat` files and bounding total
+  in-flight blocks to `reorder_high + num_threads`.
+- **Single-buffer `BlkFile` (`blkfile.rs`), `ArrowWriter` row-group bound
+  (`parquet_writers.rs`), and unpinned RocksDB index/filter caching +
+  budget-scaled `write_buffer_size` (`utxo.rs`).**
+
+

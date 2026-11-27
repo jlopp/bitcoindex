@@ -40,20 +40,29 @@ pub struct BlkRecord {
 /// into an owned buffer (one bulk decode per file). Otherwise we keep the
 /// zero-copy mmap view.
 ///
+enum BlkData {
+    /// Zero-copy mmap view for plain `blk*.dat` files, trimmed at `data_end`.
+    Mmap { mmap: Mmap, data_end: usize },
+    /// Owned plaintext payload for XOR-obfuscated `blk*.dat` files. Dropping
+    /// the raw `Mmap` once decoding completes halves resident memory per cached
+    /// file (~128 MiB instead of 128 MiB `RssAnon` + 128 MiB `RssFile`).
+    Decoded(Vec<u8>),
+}
+
+/// View over a single `blkNNNNN.dat` file.
+///
+/// If a sibling `xor.dat` holds a non-zero 8-byte key (Bitcoin Core v28+
+/// default `-blocksxor=1`), the meaningful prefix is decoded at open time
+/// into an owned buffer and the raw `mmap` is dropped immediately. Otherwise
+/// we keep the zero-copy mmap view.
+///
 /// Bitcoin Core preallocates blk files to 128 MiB with trailing zero
 /// padding; we trim at open time so iterators see "no more records" as
 /// `None` rather than a fake corrupted record parsed out of the padding.
 pub struct BlkFile {
     pub file_id: u32,
     pub path: PathBuf,
-    /// Raw mmap of the original file (full file, including trailing
-    /// preallocated zero padding when Bitcoin Core preallocated).
-    mmap: Mmap,
-    /// XOR-obfuscated payload, decoded at open. `None` when file is plain.
-    decoded: Option<Vec<u8>>,
-    /// End of meaningful data, i.e., the file length minus trailing
-    /// preallocated zero padding. Slice with `data()`.
-    data_end: usize,
+    backing: BlkData,
 }
 
 impl BlkFile {
@@ -91,29 +100,31 @@ impl BlkFile {
         // (where the "trailing zeros" heuristic cannot work at all, because
         // every padding byte decodes to a non-zero key byte).
         let data_end = record_walk_end(&mmap, xor_key.as_ref());
-        let decoded = match &xor_key {
+        let backing = match &xor_key {
             Some(key) => {
-                let mut decoded = xor_decode(&mmap, key);
-                decoded.truncate(data_end);
-                Some(decoded)
+                // Decode only the live prefix (`..data_end`) so trailing
+                // preallocated zero padding is neither faulted nor allocated,
+                // then drop `mmap` immediately so its file-backed pages do not
+                // stay resident alongside `decoded`.
+                let decoded = xor_decode(&mmap[..data_end], key);
+                drop(mmap);
+                BlkData::Decoded(decoded)
             }
-            None => None,
+            None => BlkData::Mmap { mmap, data_end },
         };
         Ok(BlkFile {
             file_id,
             path: path.to_path_buf(),
-            mmap,
-            decoded,
-            data_end,
+            backing,
         })
     }
 
     /// Return the slice of meaningful (post-trim) bytes.
     #[inline]
     pub fn data(&self) -> &[u8] {
-        match &self.decoded {
-            Some(v) => v.as_slice(),
-            None => &self.mmap[..self.data_end],
+        match &self.backing {
+            BlkData::Decoded(v) => v.as_slice(),
+            BlkData::Mmap { mmap, data_end } => &mmap[..*data_end],
         }
     }
 
@@ -897,6 +908,10 @@ mod tests {
         fs::write(&path, &obf).unwrap();
 
         let bf = BlkFile::open(&path, 0).unwrap();
+        assert!(
+            matches!(bf.backing, BlkData::Decoded(_)),
+            "XOR-obfuscated blk file must drop Mmap and hold only Decoded"
+        );
         assert_eq!(bf.data(), plain.as_slice());
         let count = bf.records().filter(|r| r.is_ok()).count();
         assert_eq!(count, 2);
