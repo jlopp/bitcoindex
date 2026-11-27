@@ -99,9 +99,11 @@ Each worker:
 ~128 MiB resident (signet's XOR-obfuscated files allocate a 128 MiB decoded
 buffer on open). A naive "one file per worker" scheme with 12 workers over 149
 files would hold ~19 GiB. Instead, one cache is created and **cloned into each
-worker**, so all workers share a single 16-file LRU (`MAX_CACHED_FILES`),
-capping decoded-file memory at ~2 GiB. XOR decode (~150 ms per 128 MiB) only
-runs on a cache miss.
+worker**, so all workers share a single LRU whose bound comes from the memory
+plan (`MemoryPlan::file_cache_files`, up to 16 on a large host), capping
+decoded-file memory at ~2 GiB. XOR decode (~150 ms per 128 MiB) only runs on a
+cache miss. The consumer can lower the bound at runtime
+(`ThreadFileCache::shrink_to`) when RSS crosses the watchdog's soft threshold.
 
 This is a deliberate deviation from the rule of thumb "give each thread its own
 cache": the point is to bound *total* memory, and to reproduce the
@@ -346,17 +348,29 @@ briefly until the consumer drains below it. Two guards make the spin safe:
 
 ### OOM watchdog
 
-`OomWatchdog` runs on a dedicated thread and only sets a flag when process RSS
-exceeds a ceiling. It cannot itself abort the pipeline (unwinding from an
-arbitrary thread would leave RocksDB and the Parquet writers in an unknown
-state); instead the ordered consumer polls `is_tripped` once per block and
-returns a clean, diagnostic error.
+`OomWatchdog` runs on a dedicated thread and sets **two** flags. It cannot
+itself abort the pipeline (unwinding from an arbitrary thread would leave
+RocksDB and the Parquet writers in an unknown state); instead the ordered
+consumer polls the flags once per block:
 
-The ceiling (`pipeline::max_rss_kb`) is computed from **`MemAvailable`**, not
-`MemTotal`, minus a 10% reserve and 2 GiB for the runtime. Using `MemTotal`
-ignores every other process on the box, so on a busy machine the ceiling can
-sit above where the kernel's OOM killer steps in — exactly how a 30 GiB machine
-kills bidx at 21 GiB with no diagnostic.
+- **Soft (`is_pressured`, 85% of the ceiling).** The consumer *sheds memory*
+  rather than aborting: `UtxoStore::relieve_pressure` halves the recent-UTXO
+  cache and the block-cache capacity, and the consumer halves the decoded-file
+  LRU (`ThreadFileCache::shrink_to`). All three are pure caches, so this costs
+  hit rate, not correctness — and it is what keeps the run alive.
+- **Hard (`is_tripped`, the ceiling).** The consumer returns a clean,
+  diagnostic error. This is the last resort, reached only if relief did not free
+  enough.
+
+The ceiling (`bidx_core::MemoryPlan::ceiling_kb`, via `pipeline::max_rss_kb`)
+comes from the **same plan** that sizes the caches, memtables, and file LRU, so
+`caches + memtables + file LRU + fixed reserve ≤ ceiling` holds by construction.
+Sizing the ceiling and the caches independently (the old behaviour) let the sum
+reach the ceiling, so the watchdog tripped exactly where a RocksDB allocation
+could fail — and RocksDB segfaults on allocation failure instead of returning an
+error. The plan's ceiling is `MemAvailable`-derived, not `MemTotal`: the latter
+ignores every other process on the box, so on a busy machine the ceiling can sit
+above where the kernel's OOM killer steps in.
 
 ## Data-model decisions
 

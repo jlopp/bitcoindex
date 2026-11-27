@@ -356,23 +356,26 @@ impl Tuning {
 /// Open the UTXO store for a trial, selecting the statistics and block-cache
 /// variants from the two opt-in flags. Split out so the four-way `(stats,
 /// cache)` matrix is unit-testable without running a whole trial.
+///
+/// The plan is passed in (rather than re-derived here) so the store's caches,
+/// the memtable cap, and the watchdog ceiling the trial uses are all the same
+/// number — the property that keeps `caches + memtables + file LRU` under the
+/// ceiling. An explicit `cache_mb` (including 0, the A/B baseline) overrides the
+/// plan's recent cache only; the block cache always comes from the plan.
 fn open_utxo_for_bench(
     path: &Path,
     rocksdb_stats: bool,
     cache_mb: Option<usize>,
+    plan: &bidx_core::MemoryPlan,
 ) -> Result<UtxoStore, bidx_store::UtxoError> {
-    // Default to the same auto-sized caches production uses, so a bare
-    // `bidx bench --mode full` measures the real read path. An explicit MiB
-    // (including 0, the A/B baseline) pins the recent cache; the block cache
-    // always comes from the host budget.
-    let budget = bidx_core::plan_cache_budget_for_host();
-    let recent = cache_mb
-        .map(|mb| mb << 20)
-        .unwrap_or(budget.recent_cache_bytes);
+    let mut planned = *plan;
+    if let Some(mb) = cache_mb {
+        planned.recent_cache_bytes = mb << 20;
+    }
     if rocksdb_stats {
-        UtxoStore::open_tuned_statistics(path, budget.block_cache_bytes, recent)
+        UtxoStore::open_planned_statistics(path, &planned)
     } else {
-        UtxoStore::open_tuned(path, budget.block_cache_bytes, recent)
+        UtxoStore::open_planned(path, &planned)
     }
 }
 
@@ -450,6 +453,11 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     }
     let total = (end - start) as u64;
     let tuning = Tuning::from_cfg(cfg);
+    // One memory plan for the whole trial: caches, memtable cap, file-LRU bound,
+    // and the watchdog ceiling all derive from it, so a run cannot be sized past
+    // the ceiling it will abort at. `--utxo-cache-mb` overrides only the recent
+    // cache (see `open_utxo_for_bench`); the plan is the default.
+    let plan = bidx_core::plan_memory_for_host();
     println!(
         "bench trial {}: {} blocks (heights {}..{}) mode={} threads={} reorder_high={} \
          channel_depth={} sink_batch_rows={}",
@@ -497,7 +505,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     // statistics are on. That open has slightly higher per-op overhead, so
     // it is opt-in and the flag is reported alongside the numbers.
     let utxo = if do_utxo {
-        let store = open_utxo_for_bench(utxo_path, cfg.rocksdb_stats, cfg.utxo_cache_mb);
+        let store = open_utxo_for_bench(utxo_path, cfg.rocksdb_stats, cfg.utxo_cache_mb, &plan);
         Some(Arc::new(store.context(
             "open utxo (delete existing dir to reset between different start heights)",
         )?))
@@ -524,9 +532,8 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     // block that lets the consumer drain, and the pipeline would deadlock. So
     // the worker whose `height` equals this is exempt from backpressure.
     let next_height = Arc::new(AtomicU32::new(start));
-    let watchdog = Arc::new(crate::bench::OomWatchdog::start(
-        crate::pipeline::max_rss_kb(),
-    ));
+    let watchdog = Arc::new(crate::bench::OomWatchdog::start(plan.ceiling_kb));
+    let file_cache = ThreadFileCache::with_capacity(&cfg.blocks_dir, plan.file_cache_files);
     let consumer_handle = if do_parse_stages {
         let (tx, rx) = crossbeam_channel::bounded::<WorkItem>(tuning.channel_depth);
         let parsed = Arc::clone(&blocks_done);
@@ -555,6 +562,8 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         let watchdog_c = Arc::clone(&watchdog);
         let reorder_c = Arc::clone(&reorder_depth);
         let next_h_c = Arc::clone(&next_height);
+        let file_cache_c = file_cache.clone();
+        let file_cache_start = plan.file_cache_files;
         let consumer = std::thread::spawn(move || -> Result<Vec<u64>> {
             bench_consume(
                 rx,
@@ -579,6 +588,8 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                 Some(&reorder_c),
                 Some(&next_h_c),
                 Some(watchdog_c.as_ref()),
+                &file_cache_c,
+                file_cache_start,
             )
         });
 
@@ -592,14 +603,12 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
         // would give every thread its own 16-file LRU instead of one shared
         // 16-file LRU — i.e. 16x the decoded-file memory and none of the
         // cross-worker eviction contention that production actually has.
-        let blocks_dir_w = cfg.blocks_dir.clone();
         let index_w = Arc::clone(&index);
         let parse_wall_w = Arc::clone(&parse_wall);
         let watchdog_w = Arc::clone(&watchdog);
         let reorder_w = Arc::clone(&reorder_depth);
         let next_h_w = Arc::clone(&next_height);
         let reorder_high_w = tuning.reorder_high;
-        let file_cache = ThreadFileCache::new(&blocks_dir_w);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cfg.threads.unwrap_or(0))
             .build()?;
@@ -626,7 +635,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // allowed to run, or no block can ever unblock the
                         // consumer and the whole pipeline deadlocks.
                         //
-                        // coverage-exempt: 637, 639-640, 642 — mirror of the production
+                        // coverage-exempt: 646, 648-651 — mirror of the production
                         // spin in `pipeline::run_parse`. The body (and the
                         // second `&&` clause, which short-circuits) only runs
                         // when the consumer is `reorder_high` blocks behind
@@ -655,7 +664,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
                         // consumer is gone, which is usually the RSS watchdog
                         // having aborted it. Surface the real cause.
                         //
-                        // coverage-exempt: 664-667 — the map_err closure body
+                        // coverage-exempt: 673-677 — the map_err closure body
                         // only runs when a send to the consumer fails, which
                         // needs the consumer thread to have aborted mid-run;
                         // the fixtures never provoke that. The closure's
@@ -757,7 +766,7 @@ fn run_trial(cfg: &BenchConfig, utxo_path: &Path, trial: u32) -> Result<TrialRep
     // A cold UTXO store makes apply_block look free, which is the single most
     // misleading result this tool can produce. Fail loudly instead.
     if let Some(e) = cold_store_error(trial, do_utxo, missing, cfg.allow_missing_utxos) {
-        return Err(e); // coverage-exempt: 748 — the guard is fully branch-tested via cold_store_error; this is its trivial propagation
+        return Err(e); // coverage-exempt: 769 — the guard is fully branch-tested via cold_store_error; this is its trivial propagation
     }
 
     let rocksdb = if cfg.rocksdb_stats {
@@ -880,23 +889,53 @@ fn out_dir_for(cfg: &BenchConfig) -> Result<PathBuf> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Watchdog that trips when RSS grows past `max_rss_kb`.
+/// Watchdog that trips when RSS grows past `max_rss_kb`, and separately reports
+/// when RSS crosses a lower *soft* threshold.
 ///
-/// Runs on a dedicated thread and only sets a flag; it cannot itself abort the
+/// Runs on a dedicated thread and only sets flags; it cannot itself abort the
 /// pipeline, because unwinding from an arbitrary thread would leave RocksDB
 /// and the Parquet writers in an unknown state. Instead the two ordered
-/// consumers (`pipeline::consume_ordered` and `bench::bench_consume`) poll
-/// `is_tripped` once per block and return a clean error, which propagates out
-/// as a normal failure with a diagnostic.
+/// consumers (`pipeline::consume_ordered` and `bench::bench_consume`) poll the
+/// flags once per block: on the soft flag they shed cache memory
+/// (`UtxoStore::relieve_pressure`) so the hard limit is never reached, and on
+/// the hard flag they return a clean error.
 ///
 /// This is the user's safety net against one slow early height blowing up the
 /// consumer's reorder buffer into GB-sized territory before our backpressure
 /// counter kicks in — and against the kernel's OOM killer, which kills the
-/// process with no explanation at all.
+/// process with no explanation at all. The soft/hard split is what makes it
+/// *preventive*: the previous single-threshold form aborted exactly at the
+/// point where an allocation could already have failed, which is why a run
+/// could segfault (RocksDB does not handle allocation failure) instead of
+/// returning the clean error the watchdog exists to produce.
 pub(crate) struct OomWatchdog {
     tripped: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while RSS is above the soft threshold and cleared once it falls back
+    /// below the recovery threshold. Hysteresis, not a one-way latch: the
+    /// consumer sheds on the rising edge, so a run that dips back under the
+    /// threshold does not keep shedding on every block (which would floor the
+    /// caches and wreck throughput for the rest of the run).
+    pressured: Arc<std::sync::atomic::AtomicBool>,
     max_rss_kb: u64,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Soft-threshold percentage of the ceiling: pressure is signalled here.
+const SOFT_PCT: u64 = 85;
+/// Recovery percentage: pressure clears once RSS falls back below this. The gap
+/// to `SOFT_PCT` is the hysteresis band (~1 GiB on a 20 GiB ceiling), far more
+/// than one block's worth of jitter.
+const RECOVER_PCT: u64 = 80;
+
+/// Soft threshold in KiB for a given ceiling. Divided before multiplying so a
+/// `u64::MAX` ceiling (used in tests) cannot overflow.
+fn soft_rss_kb(max_rss_kb: u64) -> u64 {
+    max_rss_kb / 100 * SOFT_PCT
+}
+
+/// Recovery threshold in KiB for a given ceiling (see [`soft_rss_kb`]).
+fn recover_rss_kb(max_rss_kb: u64) -> u64 {
+    max_rss_kb / 100 * RECOVER_PCT
 }
 
 /// Decide whether an RSS sample exceeds the ceiling, logging the trip once at
@@ -906,7 +945,7 @@ pub(crate) struct OomWatchdog {
 /// process.
 fn rss_trips(rss_kb: u64, max_rss_kb: u64) -> bool {
     if rss_kb > max_rss_kb {
-        // coverage-exempt: 914-916 — the `tracing::error!` field expressions
+        // coverage-exempt: 953-956 — the `tracing::error!` field expressions
         // are only evaluated when a subscriber is installed; the unit tests
         // run without one, so only the macro's target line is instrumented.
         // The branch itself is covered by `rss_trips_logs_and_trips_only_over_the_limit`.
@@ -922,12 +961,28 @@ fn rss_trips(rss_kb: u64, max_rss_kb: u64) -> bool {
 }
 
 impl OomWatchdog {
+    /// Start a watchdog that aborts above `max_rss_kb` and signals pressure at
+    /// 85% of it. The soft threshold is derived here (rather than passed in) so
+    /// every caller gets the same relationship between the two.
     pub(crate) fn start(max_rss_kb: u64) -> Self {
         let tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pressured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let soft_kb = soft_rss_kb(max_rss_kb);
+        let recover_kb = recover_rss_kb(max_rss_kb);
         let t2 = Arc::clone(&tripped);
+        let p2 = Arc::clone(&pressured);
         let handle = std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let rss = ResourceSample::now().rss_kb;
+            // Hysteresis: trip pressure above the soft line, clear it once RSS
+            // falls below the recovery line. Set it before the hard check so a
+            // run that jumps straight past both still records that relief was
+            // warranted.
+            if rss > soft_kb {
+                p2.store(true, Ordering::SeqCst);
+            } else if rss < recover_kb {
+                p2.store(false, Ordering::SeqCst);
+            }
             if rss_trips(rss, max_rss_kb) {
                 t2.store(true, Ordering::SeqCst);
                 return;
@@ -935,6 +990,7 @@ impl OomWatchdog {
         });
         OomWatchdog {
             tripped,
+            pressured,
             max_rss_kb,
             handle: Some(handle),
         }
@@ -944,12 +1000,31 @@ impl OomWatchdog {
         self.tripped.load(Ordering::SeqCst)
     }
 
-    /// Error to return once tripped. Includes the limit so the operator knows
-    /// which knob to turn (`--threads`, or `MAX_CACHED_FILES`).
+    /// True while RSS is above the soft threshold; clears once it recovers
+    /// below the hysteresis band. The consumer sheds only on the rising edge.
+    pub(crate) fn is_pressured(&self) -> bool {
+        self.pressured.load(Ordering::SeqCst)
+    }
+
+    /// The soft (pressure) threshold for this watchdog's ceiling.
+    #[cfg(test)]
+    pub(crate) fn soft_rss_kb(&self) -> u64 {
+        soft_rss_kb(self.max_rss_kb)
+    }
+
+    /// The recovery threshold for this watchdog's ceiling.
+    #[cfg(test)]
+    pub(crate) fn recover_rss_kb(&self) -> u64 {
+        recover_rss_kb(self.max_rss_kb)
+    }
+
+    /// Error to return once tripped. Names the caches and the thread count as
+    /// the levers, because those are what `relieve_pressure` and `--threads`
+    /// act on.
     pub(crate) fn tripped_error(&self) -> anyhow::Error {
         anyhow::anyhow!(
-            "watchdog: RSS exceeded {} MiB — reduce --threads or the decoded-file LRU \
-             (MAX_CACHED_FILES) and re-run",
+            "watchdog: RSS exceeded {} MiB even after shedding cache memory — \
+             reduce --threads (or lower --block-cache-mb/--utxo-cache-mb) and re-run",
             self.max_rss_kb / 1024
         )
     }
@@ -1001,9 +1076,16 @@ fn bench_consume(
     // is what keeps the pipeline deadlock-free.
     next_height: Option<&AtomicU32>,
     watchdog: Option<&crate::bench::OomWatchdog>,
+    // The shared decoded-file LRU and its starting bound, so the consumer can
+    // shrink it under memory pressure exactly as `pipeline::consume_ordered`.
+    file_cache: &ThreadFileCache,
+    file_cache_start: usize,
 ) -> Result<Vec<u64>> {
     let mut buffer: std::collections::BTreeMap<u32, bidx_parser::FullBlock> =
         std::collections::BTreeMap::new();
+    let mut file_cache_bound = file_cache_start;
+    // Edge-trigger for the relief path (see the per-block watchdog check).
+    let mut was_pressured = false;
     let mut next = start;
     if let Some(n) = next_height {
         n.store(next, Ordering::Relaxed);
@@ -1038,7 +1120,19 @@ fn bench_consume(
                 d.fetch_sub(1, Ordering::Relaxed);
             }
             // Poll the RSS watchdog once per block (a relaxed atomic load).
+            // Soft stage first, on the rising edge only (see the production
+            // consumer for why): shed cache memory so the hard ceiling is not
+            // reached. Hard stage second: abort only if it was anyway.
             if let Some(w) = watchdog {
+                let pressured = w.is_pressured();
+                crate::pipeline::shed_on_pressure(
+                    pressured,
+                    was_pressured,
+                    utxo,
+                    file_cache,
+                    &mut file_cache_bound,
+                );
+                was_pressured = pressured;
                 if w.is_tripped() {
                     return Err(w.tripped_error());
                 }
@@ -1720,6 +1814,9 @@ mod tests {
         let sink_wall = AtomicU64::new(0);
         let utxo_wall = AtomicU64::new(0);
         let progress = ProgressBar::new(end as u64);
+        // These tests exercise `bench_consume`'s bookkeeping, not the decoded-
+        // file path, so the cache points at a throwaway dir and is never read.
+        let file_cache = ThreadFileCache::with_capacity(&std::env::temp_dir(), 2);
         let us = bench_consume(
             rx,
             0,
@@ -1743,6 +1840,8 @@ mod tests {
             None,
             None,
             None,
+            &file_cache,
+            2,
         )
         .unwrap();
         ConsumeOutcome {
@@ -1830,6 +1929,8 @@ mod tests {
             Some(&reorder),
             Some(&next_h),
             None,
+            &ThreadFileCache::with_capacity(&std::env::temp_dir(), 2),
+            2,
         )
         .unwrap();
 
@@ -1885,6 +1986,8 @@ mod tests {
             None,
             None,
             None,
+            &ThreadFileCache::with_capacity(&std::env::temp_dir(), 2),
+            2,
         )
         .unwrap_err();
         assert!(e.to_string().contains("channel closed early"));
@@ -1945,6 +2048,8 @@ mod tests {
             None,
             None,
             None,
+            &ThreadFileCache::with_capacity(&std::env::temp_dir(), 2),
+            2,
         )
         .unwrap_err();
         assert!(e.to_string().contains("did not expect a skipped height"));
@@ -2151,6 +2256,25 @@ mod tests {
         let w = OomWatchdog::start(u64::MAX);
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(!w.is_tripped());
+        // Nor report pressure: the soft threshold is 85% of an unreachable
+        // ceiling, so the relief path stays dormant.
+        assert!(!w.is_pressured());
+        assert_eq!(w.soft_rss_kb(), soft_rss_kb(u64::MAX));
+        assert_eq!(w.recover_rss_kb(), recover_rss_kb(u64::MAX));
+        assert!(w.recover_rss_kb() < w.soft_rss_kb(), "hysteresis band required");
+    }
+
+    #[test]
+    fn watchdog_reports_pressure_before_it_trips() {
+        // A limit of 1 KiB is below current RSS, so both flags are observable.
+        // Pressure must latch: the consumer's relief path keys off it, and a
+        // flag that cleared itself would make relief fire intermittently.
+        let w = OomWatchdog::start(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !w.is_tripped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(w.is_pressured(), "a tripped watchdog must also be pressured");
     }
 
     #[test]
@@ -2227,6 +2351,8 @@ mod tests {
             None,
             None,
             Some(&watchdog),
+            &ThreadFileCache::with_capacity(&std::env::temp_dir(), 2),
+            2,
         )
         .unwrap_err();
         assert!(e.to_string().contains("watchdog"), "got {e}");
@@ -2450,7 +2576,8 @@ mod tests {
                 mb.map(|m| m as i64).unwrap_or(-1)
             ));
             let _ = std::fs::remove_dir_all(&dir);
-            let store = open_utxo_for_bench(&dir, stats, mb).unwrap();
+            let plan = bidx_core::plan_memory_for_host();
+            let store = open_utxo_for_bench(&dir, stats, mb, &plan).unwrap();
             assert_eq!(store.statistics_enabled(), stats, "stats={stats} mb={mb:?}");
             // `Some(0)` disables the cache; `None` auto-sizes it (non-zero on
             // any host with usable memory); `Some(4)` enables it.
@@ -2479,7 +2606,8 @@ mod tests {
                 cache_mb.map(|m| m as i64).unwrap_or(-1)
             ));
             let _ = std::fs::remove_dir_all(&dir);
-            let store = open_utxo_for_bench(&dir, false, cache_mb).unwrap();
+            let plan = bidx_core::plan_memory_for_host();
+            let store = open_utxo_for_bench(&dir, false, cache_mb, &plan).unwrap();
 
             let txid0 = [0x11u8; 32];
             let tx0 = TxRow {

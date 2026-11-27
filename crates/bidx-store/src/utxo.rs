@@ -193,6 +193,17 @@ impl RecentUtxoCache {
         }
     }
 
+    /// Lower the byte budget and evict down to it. Used by
+    /// `UtxoStore::relieve_pressure`; a no-op if the new budget is not smaller.
+    /// Eviction is by creation order (see `evict_to_budget`), so the entries
+    /// most likely to be spent again are the ones kept.
+    fn set_budget(&mut self, budget_bytes: usize) {
+        if budget_bytes < self.budget_bytes {
+            self.budget_bytes = budget_bytes;
+            self.evict_to_budget();
+        }
+    }
+
     fn len(&self) -> usize {
         self.map.len()
     }
@@ -326,6 +337,16 @@ pub struct UtxoStore {
     /// the stall counters in `rocksdb.stats` carry meaningful values; see
     /// `stall_report`.
     statistics: bool,
+    /// The shared block cache handle, kept so the runtime can shrink its
+    /// capacity under memory pressure (`relieve_pressure`). `None` only in
+    /// `#[cfg(test)]` fixtures that build a store without going through
+    /// `open_with`; every production path sets it.
+    block_cache: Option<rocksdb::Cache>,
+    /// The block cache's current capacity. RocksDB's `Cache` exposes
+    /// `set_capacity` but no getter, so the value is tracked here to know how
+    /// far `relieve_pressure` can shrink it. Atomic (not `Cell`) because the
+    /// store is shared across threads via `Arc`.
+    block_cache_bytes: std::sync::atomic::AtomicUsize,
 }
 
 pub struct SpendResult {
@@ -401,7 +422,7 @@ impl CacheStats {
 /// The cache is shared across column families so the read path cannot be
 /// starved by the undo/meta families, which are written far more than read.
 /// This 1 GiB value is now only the *fallback*: callers that know the host's
-/// memory (via `bidx_core::plan_cache_budget_for_host`) pass a larger size
+/// memory (via `bidx_core::plan_memory_for_host`) pass a larger size
 /// through [`UtxoStore::open_tuned`]. It is kept as the default so a bare
 /// `open()` on a small host cannot allocate an outsized cache.
 pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 1 << 30; // 1 GiB
@@ -499,16 +520,39 @@ fn tuned_options(statistics: bool, block_cache: &rocksdb::Cache) -> Options {
     opts
 }
 
+/// Default cap on the total memtable memory across all column families, used
+/// by the `open*` entry points that do not take a full [`bidx_core::MemoryPlan`].
+/// Matches the planner's `MEMTABLE_BUDGET_KB` so a hand-rolled open and a planned
+/// open bound memtables the same way.
+pub const DEFAULT_MEMTABLE_BUDGET_BYTES: usize =
+    (bidx_core::mem::MEMTABLE_BUDGET_KB as usize) << 10;
+
 impl UtxoStore {
     /// Open in bulk-load mode (no WAL, no undo logging), with the default
     /// block cache and no recent-UTXO cache.
     pub fn open(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, false, false, false, DEFAULT_BLOCK_CACHE_BYTES, 0)
+        Self::open_with(
+            path,
+            false,
+            false,
+            false,
+            DEFAULT_BLOCK_CACHE_BYTES,
+            0,
+            DEFAULT_MEMTABLE_BUDGET_BYTES,
+        )
     }
 
     /// Open in live mode: WAL enabled (durable per-block) and undo logging.
     pub fn open_live(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, true, true, false, DEFAULT_BLOCK_CACHE_BYTES, 0)
+        Self::open_with(
+            path,
+            true,
+            true,
+            false,
+            DEFAULT_BLOCK_CACHE_BYTES,
+            0,
+            DEFAULT_MEMTABLE_BUDGET_BYTES,
+        )
     }
 
     /// Like [`UtxoStore::open`] but with RocksDB statistics enabled, which
@@ -516,7 +560,15 @@ impl UtxoStore {
     /// amount of per-operation overhead, so this is for diagnosis, not for
     /// throughput runs.
     pub fn open_statistics(path: &Path) -> Result<Self, UtxoError> {
-        Self::open_with(path, false, false, true, DEFAULT_BLOCK_CACHE_BYTES, 0)
+        Self::open_with(
+            path,
+            false,
+            false,
+            true,
+            DEFAULT_BLOCK_CACHE_BYTES,
+            0,
+            DEFAULT_MEMTABLE_BUDGET_BYTES,
+        )
     }
 
     /// Open in bulk-load mode with the in-memory recent-UTXO cache enabled.
@@ -534,6 +586,7 @@ impl UtxoStore {
             false,
             DEFAULT_BLOCK_CACHE_BYTES,
             cache_bytes,
+            DEFAULT_MEMTABLE_BUDGET_BYTES,
         )
     }
 
@@ -546,16 +599,18 @@ impl UtxoStore {
             true,
             DEFAULT_BLOCK_CACHE_BYTES,
             cache_bytes,
+            DEFAULT_MEMTABLE_BUDGET_BYTES,
         )
     }
 
     /// Open in bulk-load mode with an explicit block-cache size (bytes) and
     /// recent-UTXO cache size (bytes; 0 disables it).
     ///
-    /// This is the entry point production bulk indexing uses: it sizes both
-    /// caches from the host's available memory (see
-    /// `bidx_core::plan_cache_budget_for_host`) so a large-RAM box is not left
-    /// faulting the UTXO read path off disk.
+    /// Prefer [`UtxoStore::open_planned`] for production bulk indexing: it sizes
+    /// both caches from the host's available memory *and* caps memtables, so a
+    /// large-RAM box is not left faulting the UTXO read path off disk while
+    /// staying under the watchdog ceiling. This variant takes the two cache
+    /// sizes directly for callers that have already planned them.
     pub fn open_tuned(
         path: &Path,
         block_cache_bytes: usize,
@@ -568,6 +623,7 @@ impl UtxoStore {
             false,
             block_cache_bytes,
             recent_cache_bytes,
+            DEFAULT_MEMTABLE_BUDGET_BYTES,
         )
     }
 
@@ -584,9 +640,48 @@ impl UtxoStore {
             true,
             block_cache_bytes,
             recent_cache_bytes,
+            DEFAULT_MEMTABLE_BUDGET_BYTES,
         )
     }
 
+    /// Open in bulk-load mode from a full [`bidx_core::MemoryPlan`].
+    ///
+    /// This is the entry point a bulk index should use: the plan's caches,
+    /// memtable cap, and file-LRU bound all derive from one ceiling, so the
+    /// process cannot be sized past the watchdog limit it will abort at. See
+    /// `bidx_core::mem`.
+    pub fn open_planned(
+        path: &Path,
+        plan: &bidx_core::MemoryPlan,
+    ) -> Result<Self, UtxoError> {
+        Self::open_with(
+            path,
+            false,
+            false,
+            false,
+            plan.block_cache_bytes,
+            plan.recent_cache_bytes,
+            plan.memtable_budget_bytes,
+        )
+    }
+
+    /// [`UtxoStore::open_planned`] with RocksDB statistics enabled.
+    pub fn open_planned_statistics(
+        path: &Path,
+        plan: &bidx_core::MemoryPlan,
+    ) -> Result<Self, UtxoError> {
+        Self::open_with(
+            path,
+            false,
+            false,
+            true,
+            plan.block_cache_bytes,
+            plan.recent_cache_bytes,
+            plan.memtable_budget_bytes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn open_with(
         path: &Path,
         wal: bool,
@@ -594,6 +689,7 @@ impl UtxoStore {
         statistics: bool,
         block_cache_bytes: usize,
         recent_cache_bytes: usize,
+        memtable_budget_bytes: usize,
     ) -> Result<Self, UtxoError> {
         // One block cache, shared by every column family. Allocating it here
         // (rather than inside `tuned_options`) is what makes the sharing real:
@@ -606,6 +702,15 @@ impl UtxoStore {
         let mut opts = tuned_options(statistics, &block_cache);
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        // Cap the total memtable memory across all families. Without this each
+        // family may hold up to `write_buffer_size * max_write_buffer_number`
+        // (512 MiB * 4 = 2 GiB), so three families could pin ~6 GiB of memtables
+        // that the cache budget never accounted for — the accounting gap that
+        // let a 32 GiB box reach its ceiling and segfault. `0` leaves RocksDB's
+        // own per-family default (used only by tests that want stock behaviour).
+        if memtable_budget_bytes > 0 {
+            opts.set_db_write_buffer_size(memtable_budget_bytes);
+        }
 
         // Per-CF options: this is where the storage tuning actually lands.
         // The undo and meta families share the same table factory and cache;
@@ -636,6 +741,8 @@ impl UtxoStore {
             },
             undo_enabled,
             statistics,
+            block_cache: Some(block_cache),
+            block_cache_bytes: std::sync::atomic::AtomicUsize::new(block_cache_bytes),
         })
     }
 
@@ -885,6 +992,50 @@ impl UtxoStore {
     pub fn flush(&self) -> Result<(), UtxoError> {
         self.db.flush()?;
         Ok(())
+    }
+
+    /// Shed memory under pressure, without failing the run.
+    ///
+    /// Called by the consumer when RSS crosses the watchdog's *soft* threshold
+    /// — i.e. before the hard ceiling that aborts the pipeline. Two levers, both
+    /// safe and both reversible by the workload:
+    ///
+    /// 1. **Shrink the recent-UTXO cache.** Its entries are a pure cache of the
+    ///    UTXO set, so dropping some costs hit rate, never correctness. The
+    ///    cache keeps functioning at the smaller budget and re-fills if pressure
+    ///    passes.
+    /// 2. **Halve the shared block cache.** RocksDB evicts to the new capacity
+    ///    on its own; a smaller block cache costs lookups, not correctness.
+    ///
+    /// Deliberately *not* done here: flushing memtables (`flush` is an I/O and
+    /// compaction burst, and the write buffer is already bounded by
+    /// `set_db_write_buffer_size`). Returns the bytes of cache capacity removed,
+    /// so a caller can log the effect.
+    pub fn relieve_pressure(&self) -> usize {
+        let mut freed = 0usize;
+        if let Some(ref c) = self.recent {
+            let mut c = c.lock();
+            let before = c.budget_bytes;
+            // Never below one entry's worth, so the cache cannot be shrunk into
+            // a state where it holds nothing but still reports as enabled.
+            let target = (before / 2).max(CACHE_ENTRY_COST);
+            c.set_budget(target);
+            freed += before.saturating_sub(target);
+        }
+        if let Some(ref cache) = self.block_cache {
+            let mut cache = cache.clone();
+            let cur = self
+                .block_cache_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let target = (cur / 2).max(64 << 20); // never below 64 MiB
+            if target < cur {
+                cache.set_capacity(target);
+                self.block_cache_bytes
+                    .store(target, std::sync::atomic::Ordering::Relaxed);
+                freed += cur - target;
+            }
+        }
+        freed
     }
 
     /// Test-only: empty the in-memory cache so a subsequent spend is forced to
@@ -1548,6 +1699,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `open_planned` must route the plan's caches into the store, and a plan
+    /// with a zero recent cache must leave the recent cache disabled. This is
+    /// the entry point a bulk index uses, so both the "caches reach the CF" and
+    /// the "zero disables" branches need covering.
+    #[test]
+    fn open_planned_routes_the_plan_into_the_store() {
+        let dir = tmp_path("planned");
+        let plan = bidx_core::MemoryPlan {
+            ceiling_kb: 16 * 1024 * 1024,
+            block_cache_bytes: 128 << 20,
+            recent_cache_bytes: 32 << 20,
+            memtable_budget_bytes: 256 << 20,
+            file_cache_files: 8,
+        };
+        let db = UtxoStore::open_planned_statistics(&dir, &plan).unwrap();
+        let props: std::collections::HashMap<String, String> =
+            db.perf_properties().into_iter().collect();
+        let cache: usize = props
+            .get("block_cache_capacity")
+            .expect("block_cache_capacity present")
+            .parse()
+            .expect("numeric");
+        assert_eq!(cache, plan.block_cache_bytes, "plan block cache must reach the CF");
+        assert_eq!(
+            db.cache_stats().unwrap().budget_bytes,
+            plan.recent_cache_bytes,
+            "plan recent cache must reach the store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A zero recent cache in the plan disables it.
+        let dir2 = tmp_path("plannedzero");
+        let zero = bidx_core::MemoryPlan {
+            recent_cache_bytes: 0,
+            ..plan
+        };
+        let db2 = UtxoStore::open_planned(&dir2, &zero).unwrap();
+        assert!(db2.cache_stats().is_none(), "zero recent cache must disable it");
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     /// `open_tuned` with a non-zero recent-cache budget must enable the cache
     /// and answer a spend from it, i.e. the plumbing actually reaches the
     /// store rather than being accepted and dropped.
@@ -1979,6 +2171,92 @@ mod tests {
             },
         );
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn recent_cache_set_budget_evicts_down_and_ignores_growth() {
+        // `set_budget` is the eviction primitive behind `relieve_pressure`: it
+        // must lower the budget and evict to it, and must NOT grow the budget
+        // (growing would undo a previous relief step).
+        let mut c = RecentUtxoCache::new(10 * CACHE_ENTRY_COST);
+        let val = UtxoValue {
+            value_sat: 1,
+            script_type: 0,
+            height: 0,
+            address_hash: [0; 32],
+        };
+        for i in 0..10u8 {
+            let mut k = [0u8; 36];
+            k[0] = i;
+            c.insert(k, val);
+        }
+        assert_eq!(c.len(), 10);
+        // Shrink to 4 entries: eviction drops the rest.
+        c.set_budget(4 * CACHE_ENTRY_COST);
+        assert_eq!(c.budget_bytes, 4 * CACHE_ENTRY_COST);
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.bytes(), 4 * CACHE_ENTRY_COST);
+        // A larger budget is ignored, so the earlier relief is not undone.
+        c.set_budget(8 * CACHE_ENTRY_COST);
+        assert_eq!(c.budget_bytes, 4 * CACHE_ENTRY_COST);
+        assert_eq!(c.len(), 4);
+    }
+
+    /// `relieve_pressure` must actually free memory on a real store — shrink the
+    /// recent cache and halve the block cache — because that is the whole point
+    /// of the soft watchdog threshold. Asserting the freed byte count (not just
+    /// "did not panic") is what proves the lever moved.
+    #[test]
+    fn relieve_pressure_shrinks_both_caches() {
+        let dir = tmp_path("relieve");
+        let db = UtxoStore::open_tuned(&dir, 256 << 20, 64 << 20).unwrap();
+        // Fill the recent cache past the half-budget point so the halving
+        // forces a real eviction: 64 MiB / CACHE_ENTRY_COST entries is the
+        // budget, so fill ~1.5x that.
+        let val = UtxoValue {
+            value_sat: 1,
+            script_type: 0,
+            height: 0,
+            address_hash: [0; 32],
+        };
+        let budget_entries = (64 << 20) / CACHE_ENTRY_COST;
+        let filled = budget_entries * 3 / 2;
+        {
+            let mut c = db.recent.as_ref().unwrap().lock();
+            for i in 0..filled {
+                let mut k = [0u8; 36];
+                k[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                c.insert(k, val);
+            }
+        }
+        let before = db.cache_stats().unwrap();
+        assert_eq!(before.entries, budget_entries, "filled to the budget");
+        let freed = db.relieve_pressure();
+        // Recent cache halved (64 MiB -> 32 MiB) plus block cache halved
+        // (256 MiB -> 128 MiB) = 160 MiB.
+        assert_eq!(freed, (32 << 20) + (128 << 20));
+        let after = db.cache_stats().unwrap();
+        assert_eq!(after.budget_bytes, before.budget_bytes / 2);
+        // Entries were evicted to fit the smaller budget, and the byte figure
+        // respects it.
+        assert!(after.entries < before.entries, "relief must evict entries");
+        assert!(after.bytes <= after.budget_bytes);
+        // A second call halves again, so relief is progressive.
+        let freed2 = db.relieve_pressure();
+        assert_eq!(freed2, (16 << 20) + (64 << 20));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The block-cache half of `relieve_pressure` must stop at the floor rather
+    /// than shrinking to zero (a zero-capacity cache is not a smaller cache, it
+    /// is a broken one), and report no further freeing once at the floor.
+    #[test]
+    fn relieve_pressure_stops_the_block_cache_at_its_floor() {
+        let dir = tmp_path("relieffloor");
+        // Open with the minimum so one halving reaches the 64 MiB floor.
+        let db = UtxoStore::open_tuned(&dir, 64 << 20, 0).unwrap();
+        assert_eq!(db.relieve_pressure(), 0, "already at the block-cache floor");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -13,6 +13,6 @@ pub use disk::{
     DiskCheckpoint, Network, CHECKPOINT_HEIGHT_STEP, MIN_FREE_BYTES,
 };
 pub use hash::{dsha256, hash160, Hash32};
-pub use mem::{plan_cache_budget, plan_cache_budget_for_host, CacheBudget};
+pub use mem::{plan_cache_budget, plan_memory, plan_memory_for_host, CacheBudget, MemoryPlan};
 pub use script::{classify_script, AddressHash, ScriptType};
 pub use types::*;

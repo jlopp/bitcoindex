@@ -23,35 +23,19 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-/// Get a sensible RSS ceiling for `bidx parse` based on memory that is
-/// actually available, not merely installed.
+/// The RSS ceiling `bidx` will abort a run at, based on memory that is actually
+/// available, not merely installed.
 ///
-/// Using `MemTotal` here is wrong: it ignores every other process on the box,
-/// so on a busy machine the computed ceiling can sit *above* the point where
-/// the kernel's OOM killer steps in, and the watchdog never fires. That is
-/// exactly how a 30 GiB machine ends up killing bidx at 21 GiB RSS with no
-/// diagnostic. `MemAvailable` is the kernel's own estimate of what a new
-/// allocation can obtain without swapping, which is the quantity we want.
-///
-/// We still leave a reserve for the runtime and the page cache the parse stage
-/// needs, and cap at 90% so a single runaway pipeline stage cannot consume the
-/// whole box.
+/// This is now a thin view of [`bidx_core::plan_memory_for_host`]'s ceiling, so
+/// there is exactly one place the number is derived. The old standalone form
+/// computed the ceiling from `MemAvailable` while the cache budget was computed
+/// from the same field *independently* — the two could sum past the machine, and
+/// the ceiling landed exactly where a RocksDB allocation could fail (which is a
+/// segfault, not an error). Deriving both from one plan is the fix; see
+/// `bidx_core::mem`.
+#[cfg(test)]
 pub(crate) fn max_rss_kb() -> u64 {
-    const RESERVED_FOR_RUNTIME_KB: u64 = 2 * 1024 * 1024; // 2 GiB
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
-    let field_kb = |name: &str| -> Option<u64> {
-        meminfo.as_ref()?.lines().find_map(|l| {
-            let rest = l.strip_prefix(name)?;
-            rest.split_whitespace().next()?.parse::<u64>().ok()
-        })
-    };
-    let total_kb = field_kb("MemTotal:").unwrap_or(16 * 1024 * 1024);
-    // Fall back to MemTotal when MemAvailable is missing (older kernels).
-    let available_kb = field_kb("MemAvailable:").unwrap_or(total_kb);
-    available_kb
-        .saturating_sub(available_kb / 10)
-        .saturating_sub(RESERVED_FOR_RUNTIME_KB)
-        .max(256 * 1024) // never return something absurdly small
+    bidx_core::plan_memory_for_host().ceiling_kb
 }
 
 use std::sync::Arc;
@@ -130,10 +114,11 @@ pub struct ParseConfig {
     /// Capture raw witness stack elements into the optional witnesses table.
     pub capture_witness: bool,
     /// RocksDB block-cache size in MiB. `None` (the default) sizes it from the
-    /// host's available memory via `bidx_core::plan_cache_budget_for_host`.
-    /// A larger cache is the single biggest lever on the apply path, because
-    /// every spent input is a point lookup that otherwise faults a data block
-    /// off disk.
+    /// host's available memory via `bidx_core::plan_memory_for_host`. A larger
+    /// cache is the single biggest lever on the apply path, because every spent
+    /// input is a point lookup that otherwise faults a data block off disk.
+    /// An override does not change the watchdog ceiling; the soft threshold
+    /// still sheds the cache if the override turns out too large for the host.
     pub block_cache_mb: Option<usize>,
     /// In-memory recent-UTXO cache size in MiB. `None` (the default) sizes it
     /// from the host's available memory. The cache answers a spend of a
@@ -243,24 +228,38 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // interleave across files naturally.
     let index = Arc::new(index);
 
-    // Size the two caches from the host's memory unless the caller pinned
-    // them. The apply path is one point lookup per spent input, and on a
-    // mainnet-sized UTXO set most of those miss the block cache and fault a
-    // data block off disk — which is the dominant cost of a bulk index. A
-    // 32 GiB box otherwise leaves ~29 GiB idle while it thrashes NVMe.
-    let budget = bidx_core::plan_cache_budget_for_host();
+    // Plan the whole memory layout from the host's memory unless the caller
+    // pinned the caches. The apply path is one point lookup per spent input,
+    // and on a mainnet-sized UTXO set most of those miss the block cache and
+    // fault a data block off disk — which is the dominant cost of a bulk index.
+    // A 32 GiB box otherwise leaves ~29 GiB idle while it thrashes NVMe.
+    //
+    // Crucially this is *one* plan: the caches, the memtable cap, the decoded-
+    // file LRU, and the watchdog ceiling all derive from the same number, so
+    // `caches + memtables + file LRU + fixed reserve` cannot exceed the ceiling
+    // the watchdog aborts at. Sizing the caches and the ceiling independently
+    // (the previous behaviour) let the total reach the ceiling, so the watchdog
+    // tripped exactly where a RocksDB allocation could fail — and RocksDB
+    // segfaults on allocation failure instead of returning an error.
+    let mut planned = bidx_core::plan_memory_for_host();
     let (block_cache_bytes, recent_cache_bytes) =
-        resolve_cache_bytes(cfg.block_cache_mb, cfg.utxo_cache_mb, budget);
+        resolve_cache_bytes(cfg.block_cache_mb, cfg.utxo_cache_mb, planned.caches());
+    // An explicit cache override replaces the plan's cache sizes but *not* its
+    // ceiling: the ceiling stays `MemAvailable`-derived, so a too-large
+    // `--block-cache-mb` cannot raise it past what the kernel will grant. The
+    // overridden caches are the operator's choice; the plan's memtable cap and
+    // file-LRU bound stay in force, and the soft watchdog still sheds the
+    // overridden caches if they turn out to be too big for the host.
+    planned.block_cache_bytes = block_cache_bytes;
+    planned.recent_cache_bytes = recent_cache_bytes;
     info!(
         block_cache_mb = block_cache_bytes / (1 << 20),
         recent_cache_mb = recent_cache_bytes / (1 << 20),
+        file_cache_files = planned.file_cache_files,
+        ceiling_mb = planned.ceiling_kb / 1024,
         "opening UTXO store"
     );
-    let utxo = Arc::new(UtxoStore::open_tuned(
-        &cfg.utxo,
-        block_cache_bytes,
-        recent_cache_bytes,
-    )?);
+    let utxo = Arc::new(UtxoStore::open_planned(&cfg.utxo, &planned)?);
 
     // Channel carries parsed blocks from workers to the ordered consumer.
     // Bound it to keep memory in check if the consumer (RocksDB) lags.
@@ -288,7 +287,6 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // one worker that can unblock the consumer is never parked.
     let next_height = Arc::new(AtomicU32::new(start));
 
-    let blocks_dir = cfg.blocks_dir.clone();
     let heights: Vec<u32> = (start..end).collect();
     let index_for_workers = Arc::clone(&index);
     let orphan_blocks = cfg.orphan_blocks.clone();
@@ -300,10 +298,18 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     let blocks_per_part = cfg.blocks_per_part;
     let capture_witness = cfg.capture_witness;
     let recorder = Arc::new(DiskRecorder::new(disk_cfg.clone()));
+    // The decoded-file LRU is created here, before the consumer, so the
+    // consumer can shrink it under memory pressure. It is cloned into each
+    // worker below; every clone shares one inner, so a `shrink_to` from the
+    // consumer lowers the bound for all of them.
+    let file_cache = ThreadFileCache::with_capacity(&cfg.blocks_dir, planned.file_cache_files);
     // The watchdog must exist before the consumer is spawned so the consumer
     // can poll it. `Arc` because the consumer thread needs its own handle;
-    // the original binding keeps it alive for the whole run.
-    let watchdog = Arc::new(crate::bench::OomWatchdog::start(max_rss_kb()));
+    // the original binding keeps it alive for the whole run. Its ceiling is the
+    // one the memory plan was sized against, so "the plan fits under the
+    // ceiling" is the same statement as "the watchdog will not trip on a run
+    // that respects its budgets".
+    let watchdog = Arc::new(crate::bench::OomWatchdog::start(planned.ceiling_kb));
     let consumer = std::thread::spawn({
         let progress = progress.clone();
         let missing_utxos = Arc::clone(&missing_utxos);
@@ -311,6 +317,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         let reorder_depth = Arc::clone(&reorder_depth_w);
         let next_height = Arc::clone(&next_height);
         let watchdog = Arc::clone(&watchdog);
+        let file_cache = file_cache.clone();
         move || -> Result<()> {
             consume_ordered(
                 rx,
@@ -326,6 +333,8 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 &next_height,
                 Some(watchdog.as_ref()),
                 capture_witness,
+                &file_cache,
+                planned.file_cache_files,
             )
         }
     });
@@ -338,7 +347,6 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
 
     let reorder_depth_w = Arc::clone(&reorder_depth);
     let next_height_w = Arc::clone(&next_height);
-    let file_cache = ThreadFileCache::new(&blocks_dir);
     let parse_opts = bidx_parser::ParseOptions {
         capture_witness: cfg.capture_witness,
     };
@@ -370,11 +378,11 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // holding the height the consumer is waiting for must run, or
                 // no block ever arrives to let the consumer drain.
                 //
-                // coverage-exempt: 379, 381-382, 384 — the spin body only runs
-                // when the consumer is >REORDER_HIGH blocks behind *and* the
-                // worker's height is not the one being awaited, i.e. under real
-                // memory pressure the unit fixtures never create. The first
-                // clause of the condition (line 378) is exercised.
+                // coverage-exempt: 387-392 — the spin body only runs when the
+                // consumer is >REORDER_HIGH blocks behind *and* the worker's
+                // height is not the one being awaited, i.e. under real memory
+                // pressure the unit fixtures never create. The first clause of
+                // the condition is exercised.
                 while reorder.load(Ordering::Relaxed) > REORDER_HIGH
                     && next_h.load(Ordering::Relaxed) != height
                 {
@@ -396,7 +404,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 // A send failure means the consumer is gone. That is either a
                 // real bug or the RSS watchdog having aborted it; report the
                 // actual cause rather than a generic "consumer dropped".
-                // coverage-exempt: 403-408, 418, 424 — the closure body and the
+                // coverage-exempt: 411-415, 426, 432 — the closure body and the
                 // two `map_err` closures only run when a send to the consumer
                 // fails (consumer aborted mid-run via the RSS watchdog); not
                 // reachable in the unit fixtures. Construction is covered.
@@ -445,15 +453,19 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     Ok(())
 }
 
-/// Per-process bounded LRU cache of mmap'd blk files.
+/// Default per-process bound on the number of decoded blk files held in the
+/// shared LRU, used by the tests and as the fallback when no `MemoryPlan` is
+/// supplied.
 ///
-/// Each `BlkFile` is ~128 MiB in memory — we keep at most
-/// `MAX_CACHED_FILES` decoded at once to bound RSS. Signet uses XOR-
-/// obfuscated blk files (Bitcoin Core v28), so each open allocates a
-/// 128 MiB decoded `Vec<u8>`; without eviction, 12 workers opening all
-/// 149 files share ~149 × 128 MiB ≈ 19 GiB. With a 16-file LRU we cap
-/// at ~2 GiB. XOR decode (~150 ms per 128 MiB) only runs on cache miss.
-const MAX_CACHED_FILES: usize = 16;
+/// Each `BlkFile` is ~128 MiB in memory, so this caps the decoded-file heap at
+/// ~2 GiB. Signet uses XOR-obfuscated blk files (Bitcoin Core v28), so each
+/// open allocates a 128 MiB decoded `Vec<u8>`; without eviction, 12 workers
+/// opening all 149 files share ~149 × 128 MiB ≈ 19 GiB. XOR decode (~150 ms per
+/// 128 MiB) only runs on cache miss. Production scales this with the memory
+/// ceiling (see `bidx_core::MemoryPlan::file_cache_files`), so the constant is
+/// only referenced from tests.
+#[cfg(test)]
+pub(crate) const MAX_CACHED_FILES: usize = 16;
 
 pub(crate) struct ThreadFileCache {
     blocks_dir: PathBuf,
@@ -464,6 +476,10 @@ struct CacheInner {
     /// LRU list, oldest at front, most-recently-used at back.
     lru: parking_lot::Mutex<std::collections::VecDeque<u32>>,
     map: parking_lot::RwLock<FxHashMap<u32, Arc<BlkFile>>>,
+    /// Maximum resident files. A shared `AtomicUsize` so `shrink_to` (called by
+    /// the consumer under memory pressure) lowers the bound for every clone —
+    /// each worker holds its own `ThreadFileCache` but they share this inner.
+    capacity: std::sync::atomic::AtomicUsize,
 }
 
 impl Clone for ThreadFileCache {
@@ -476,33 +492,65 @@ impl Clone for ThreadFileCache {
 }
 
 impl ThreadFileCache {
+    /// Convenience constructor using [`MAX_CACHED_FILES`]. Test-only because
+    /// production always passes the plan's `file_cache_files` to
+    /// [`ThreadFileCache::with_capacity`].
+    #[cfg(test)]
     pub(crate) fn new(blocks_dir: &Path) -> Self {
+        Self::with_capacity(blocks_dir, MAX_CACHED_FILES)
+    }
+
+    /// Like [`ThreadFileCache::new`] but with an explicit resident-file bound,
+    /// so a memory plan can scale the decoded-file heap with the ceiling.
+    pub(crate) fn with_capacity(blocks_dir: &Path, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         ThreadFileCache {
             blocks_dir: blocks_dir.to_path_buf(),
             inner: Arc::new(CacheInner {
-                lru: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
-                    MAX_CACHED_FILES,
-                )),
+                lru: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
                 map: parking_lot::RwLock::new(FxHashMap::default()),
+                capacity: std::sync::atomic::AtomicUsize::new(capacity),
             }),
+        }
+    }
+
+    /// Lower the resident-file bound and evict down to it. Called by the
+    /// consumer under memory pressure. Idempotent and monotone-decreasing: a
+    /// later call may shrink further but never grows it back (the workload does
+    /// not re-request files it no longer needs, so re-growing only risks
+    /// re-approaching the ceiling).
+    pub(crate) fn shrink_to(&self, capacity: usize) {
+        use std::sync::atomic::Ordering;
+        let capacity = capacity.max(1);
+        let cur = self.inner.capacity.load(Ordering::Relaxed);
+        if capacity >= cur {
+            return;
+        }
+        self.inner.capacity.store(capacity, Ordering::Relaxed);
+        let mut lru = self.inner.lru.lock();
+        while lru.len() > capacity {
+            if let Some(old) = lru.pop_front() {
+                self.inner.map.write().remove(&old);
+            }
         }
     }
 
     /// Number of `BlkFile`s currently resident in the shared LRU. Used by
     /// `bidx bench --trace-cache` to prove the decoded-file bound actually
-    /// holds; a value above `MAX_CACHED_FILES` means eviction is broken.
-    /// Number of `BlkFile`s currently resident in the shared LRU.
+    /// holds; a value above the capacity means eviction is broken.
     ///
-    /// Exposed for tests: the whole point of `MAX_CACHED_FILES` is that this
-    /// never exceeds it, and an assertion on the count is the only way to
-    /// catch an eviction regression that would otherwise only show up as a
-    /// 19 GiB RSS spike on a long run.
+    /// Exposed for tests: the whole point of the bound is that this never
+    /// exceeds it, and an assertion on the count is the only way to catch an
+    /// eviction regression that would otherwise only show up as a 19 GiB RSS
+    /// spike on a long run.
     #[cfg(test)]
     pub(crate) fn resident(&self) -> usize {
         self.inner.map.read().len()
     }
 
     fn touch(&self, file_id: u32) {
+        use std::sync::atomic::Ordering;
+        let capacity = self.inner.capacity.load(Ordering::Relaxed);
         let mut lru = self.inner.lru.lock();
         // Move `file_id` to the back (most recently used).
         if let Some(pos) = lru.iter().position(|&id| id == file_id) {
@@ -510,7 +558,7 @@ impl ThreadFileCache {
         }
         lru.push_back(file_id);
         // Evict oldest if over capacity.
-        while lru.len() > MAX_CACHED_FILES {
+        while lru.len() > capacity {
             if let Some(old) = lru.pop_front() {
                 if old != file_id {
                     self.inner.map.write().remove(&old);
@@ -545,6 +593,48 @@ impl ThreadFileCache {
     }
 }
 
+/// Shed cache memory when RSS first crosses the watchdog's soft threshold.
+///
+/// Takes the current and previous pressure readings so it fires once per
+/// *episode*: the watchdog flag is sticky until RSS recovers, and shedding on
+/// every pressured block would floor the caches and wreck throughput. Returns
+/// the bytes freed; the caller updates its `was_pressured` to `pressured`.
+///
+/// Shared by `consume_ordered` and `bench::bench_consume` so the production and
+/// bench consumers relieve pressure identically. All three levers are pure
+/// caches — the recent-UTXO cache, the RocksDB block cache, and the decoded-file
+/// LRU — so dropping them costs hit rate, never correctness.
+pub(crate) fn shed_on_pressure(
+    pressured: bool,
+    was_pressured: bool,
+    utxo: Option<&UtxoStore>,
+    file_cache: &ThreadFileCache,
+    file_cache_bound: &mut usize,
+) -> usize {
+    if !(pressured && !was_pressured) {
+        return 0;
+    }
+    let mut freed = 0;
+    if let Some(u) = utxo {
+        freed += u.relieve_pressure();
+    }
+    let next_bound = (*file_cache_bound / 2).max(1);
+    if next_bound < *file_cache_bound {
+        file_cache.shrink_to(next_bound);
+        *file_cache_bound = next_bound;
+    }
+    // coverage-exempt: 676-683 — the `tracing::warn!` field expressions are only
+    // evaluated when a subscriber is installed; the unit tests run without one,
+    // so only the macro's target line is instrumented. The branch itself is
+    // covered by `shed_on_pressure_frees_memory_only_on_the_rising_edge`.
+    tracing::warn!(
+        freed_mb = freed / (1 << 20),
+        file_cache_files = *file_cache_bound,
+        "watchdog: RSS over soft threshold; shedding cache memory"
+    );
+    freed
+}
+
 /// Receives out-of-order parsed blocks, buffers until the next expected
 /// height arrives, applies UTXO changes in order, and hands each enriched block
 /// to a dedicated sink thread that writes Parquet.
@@ -571,11 +661,21 @@ fn consume_ordered(
     next_height: &AtomicU32,
     watchdog: Option<&crate::bench::OomWatchdog>,
     capture_witness: bool,
+    // The shared decoded-file LRU, so the consumer can shrink it under pressure.
+    file_cache: &ThreadFileCache,
+    // The plan's starting file-LRU bound; each relief step halves from the last.
+    file_cache_start: usize,
 ) -> Result<()> {
     let mut buffer: BTreeMap<u32, FullBlock> = BTreeMap::new();
     let mut skipped_queue: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
     let mut next = start;
     next_height.store(next, Ordering::Relaxed);
+    // Current file-LRU bound, lowered a step at a time as pressure is observed.
+    let mut file_cache_bound = file_cache_start;
+    // Tracks the previous pressure reading so memory is shed only on the rising
+    // edge (see the per-block check below). Without this, a sticky flag would
+    // shed on every block and floor the caches.
+    let mut was_pressured = false;
 
     let sink_cfg = SinkConfig {
         capture_witness,
@@ -620,11 +720,33 @@ fn consume_ordered(
         while let Some(block) = buffer.remove(&next) {
             // Poll the RSS watchdog once per block. It is a relaxed atomic
             // load, so the cost is nil next to apply_block.
-            // coverage-exempt: 629 — returns only when the watchdog has already
-            // tripped (process RSS over the computed ceiling), which the unit
-            // fixtures do not reach; the `Some(w)`/`is_tripped` checks are
-            // exercised on the non-tripped path.
+            //
+            // Two stages, and the order matters. First, on the *rising edge* of
+            // the soft threshold, shed cache memory (shrink the recent-UTXO
+            // cache and the block cache, and halve the decoded-file LRU) so the
+            // hard ceiling is not reached. Only if RSS has *still* crossed the
+            // hard ceiling do we abort. The soft stage is the whole point:
+            // aborting at the hard limit is too late — by then an allocation
+            // may already have failed, and RocksDB does not handle allocation
+            // failure, it segfaults.
+            //
+            // Edge-triggered, not level-triggered: the watchdog flag is sticky
+            // until RSS recovers, so shedding on every pressured block would
+            // floor the caches and wreck throughput. One step per episode, and
+            // the next episode can only start after RSS has fallen back.
             if let Some(w) = watchdog {
+                let pressured = w.is_pressured();
+                shed_on_pressure(
+                    pressured,
+                    was_pressured,
+                    Some(utxo),
+                    file_cache,
+                    &mut file_cache_bound,
+                );
+                was_pressured = pressured;
+                // coverage-exempt: 750-751 — `consume_ordered` is only driven by the
+                // end-to-end `run_parse` tests, none of which trip the watchdog
+                // mid-run; the bench consumer's equivalent abort is directly tested.
                 if w.is_tripped() {
                     return Err(w.tripped_error());
                 }
@@ -665,9 +787,9 @@ fn consume_ordered(
             // Hand the fully-enriched block to the sink thread. A send error
             // means the sink already failed; surface its error, not a generic
             // "channel closed".
-            // coverage-exempt: 678, 680-681 — only runs when the sink thread
-            // has already died (a Parquet write error mid-run), which the
-            // fixtures do not provoke; the normal send is covered.
+            // coverage-exempt: 796-806 — only runs when the sink thread has
+            // already died (a Parquet write error mid-run), which the fixtures
+            // do not provoke; the normal send is covered.
             if sink_tx
                 .send(SinkMsg::Block {
                     block,
@@ -703,7 +825,7 @@ fn consume_ordered(
 
     if next < end {
         // Channel closed before we saw every height: that's an error.
-        // coverage-exempt: 712-713 — reached only when the producer's channel
+        // coverage-exempt: 826-836 — reached only when the producer's channel
         // closes before every height was delivered (a parse/worker abort). The
         // fixtures always complete the range and return via the `break
         // 'consume` exit, so this defensive tail is not exercised; it exists so
@@ -1529,6 +1651,100 @@ mod tests {
         cache.block_bytes(&loc(0)).unwrap();
         assert_eq!(cache.resident(), n as usize);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shed_on_pressure_frees_memory_only_on_the_rising_edge() {
+        // The relief path must fire once per episode, not per block: the
+        // watchdog flag stays set until RSS recovers, so a level-triggered
+        // implementation would shed on every block and floor the caches.
+        let dir = tmp_utxo_dir("shed");
+        let store = UtxoStore::open_tuned(&dir, 256 << 20, 64 << 20).unwrap();
+        let file_dir = make_many_blk_files(8);
+        let cache = ThreadFileCache::with_capacity(&file_dir, 8);
+        let mut bound = 8;
+
+        // No pressure: nothing shed, bound unchanged.
+        assert_eq!(
+            shed_on_pressure(false, false, Some(&store), &cache, &mut bound),
+            0
+        );
+        assert_eq!(bound, 8);
+
+        // Rising edge: shed. Recent cache halved (64→32 MiB) + block cache
+        // halved (256→128 MiB) = 160 MiB; file bound halved to 4.
+        assert_eq!(
+            shed_on_pressure(true, false, Some(&store), &cache, &mut bound),
+            (32 << 20) + (128 << 20)
+        );
+        assert_eq!(bound, 4);
+
+        // Still pressured, but not a new edge: no further shedding.
+        assert_eq!(
+            shed_on_pressure(true, true, Some(&store), &cache, &mut bound),
+            0
+        );
+        assert_eq!(bound, 4);
+
+        // A fresh episode (recovered then pressured again) sheds again.
+        assert_eq!(
+            shed_on_pressure(true, false, Some(&store), &cache, &mut bound),
+            (16 << 20) + (64 << 20)
+        );
+        assert_eq!(bound, 2);
+
+        // With no store, the file-LRU lever still applies (covers the None arm).
+        let mut b2 = 8;
+        assert_eq!(shed_on_pressure(true, false, None, &cache, &mut b2), 0);
+        assert_eq!(b2, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&file_dir);
+    }
+
+    /// A unique temp dir for a UTXO store in a pipeline test.
+    fn tmp_utxo_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "bidx-shed-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn thread_file_cache_shrink_to_lowers_the_bound_and_evicts() {
+        // `shrink_to` is the relief lever: it must lower the resident bound and
+        // evict down to it, and must never grow the bound back (a later, larger
+        // request is ignored).
+        let n = 8u32;
+        let dir = make_many_blk_files(n);
+        let cache = ThreadFileCache::with_capacity(&dir, 8);
+        let loc = |file_id: u32| BlockLocation {
+            file_id,
+            offset: 0,
+            record_len: (BLOCK_HEADER_LEN + 1 + 47 + 8) as u32,
+        };
+        for file_id in 0..n {
+            cache.block_bytes(&loc(file_id)).unwrap();
+        }
+        assert_eq!(cache.resident(), 8);
+        cache.shrink_to(3);
+        assert!(cache.resident() <= 3, "shrink must evict to the new bound");
+        // Opening more files now stays under the lowered bound.
+        for file_id in 0..n {
+            cache.block_bytes(&loc(file_id)).unwrap();
+        }
+        assert!(cache.resident() <= 3);
+        // A grow request is a no-op, so relief is not silently undone.
+        cache.shrink_to(16);
+        cache.block_bytes(&loc(0)).unwrap();
+        assert!(cache.resident() <= 3, "shrink_to must not grow the bound");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A transport that reports one stale `getchaintips` branch and serves the

@@ -785,3 +785,93 @@ end-to-end auto-network/default-checkpoint-path run; `chain.rs`'s parallel pass
 is exercised by the existing chain-index tests. Per-file coverage is at 100%
 for every touched file (`scripts/coverage/check-changed.sh`).
 
+## 13. The mainnet OOM segfault: one memory plan, a soft watchdog, and relief
+
+The report: a mainnet bulk index on the same 12-core / 32 GB / NVMe box died at
+**height 439,800** with
+
+```
+ERROR watchdog: RSS exceeded limit; aborting pipeline rss_mb=23800 limit_mb=23800
+```
+
+and a **segmentation fault**. The watchdog message suggests `--threads` or
+`MAX_CACHED_FILE`, but the operator's question was the right one: why should a
+run have to be hand-tuned not to crash?
+
+### Root cause: two budgets that did not know about each other
+
+The cache-budget planner and `max_rss_kb` both read `/proc/meminfo` and
+computed a number from it *independently*:
+
+- the **cache budget** = `(available − 10% − 2 GiB) × 60%` → on this box
+  ~14.2 GiB of caches (recent ~8.5 + block ~5.7);
+- the **watchdog ceiling** = `available − 10% − 2 GiB` → ~23.8 GiB, exactly
+  where RSS was at the crash.
+
+The caches were not the only heap. **RocksDB memtables** were the unaccounted
+one: with `write_buffer_size = 512 MiB` and `max_write_buffer_number = 4`, each
+family may pin 2 GiB, and three families could pin ~6 GiB that the cache budget
+never saw. Add the decoded-file LRU (16 × 128 MiB = 2 GiB), the reorder buffer,
+the sink batches, and RocksDB's own index/filter allocations, and
+`caches + overhead` lands **on** the ceiling rather than below it.
+
+That makes the watchdog a tripwire at the wrong place. It fires at the exact RSS
+where a RocksDB allocation can fail — and **RocksDB does not handle allocation
+failure; it segfaults**. The "abort" and the crash race, and the crash wins
+because tearing down RocksDB mid-write on a failed allocation is undefined.
+
+### The fix
+
+**One plan, sized under the ceiling (`bidx_core::MemoryPlan`).** `plan_memory`
+derives the ceiling *and* every budget beneath it from one number, and the
+caches are sized **last, as the remainder**, so the invariant
+
+```
+block_cache + recent_cache + memtables + file_lru + fixed_runtime ≤ ceiling
+```
+
+holds by construction. `UtxoStore::open_planned` opens from the plan;
+`run_parse` and `run_trial` pass the same plan to the store, the decoded-file
+LRU, and the watchdog, so "the plan fits" and "the watchdog will not trip" are
+the same statement. Two supporting changes:
+
+- **`set_db_write_buffer_size`** caps *all* memtables at the plan's
+  `memtable_budget_bytes` (2 GiB on a big box), closing the largest gap.
+- The fixed overheads are **capped by a fraction of the ceiling**, not just by
+  their own absolute constant, so a small host scales them down instead of the
+  2 GiB memtable reserve alone exceeding a 4 GiB ceiling.
+
+**A soft watchdog threshold with automatic relief.** The watchdog now latches a
+*pressure* flag at 85% of the ceiling, before the hard limit. On each block the
+consumer checks it and, if set, sheds memory instead of waiting to abort:
+
+1. `UtxoStore::relieve_pressure` halves the recent-UTXO cache budget (evicting
+   to the new budget) and halves the shared block-cache capacity;
+2. the consumer halves the decoded-file LRU bound (`ThreadFileCache::shrink_to`,
+   which lowers the shared bound for every worker clone).
+
+All three are pure caches: dropping them costs hit rate, never correctness. The
+hard abort remains as the last resort, but its error now says the caches were
+already shed. In the normal case the run **does not crash and does not need
+re-tuning** — it trades cache for headroom and keeps going.
+
+### Why not just raise the ceiling?
+
+The ceiling is `MemAvailable`-derived on purpose (§2, item 3). Raising it past
+what the kernel will actually grant just moves the failure from a clean abort to
+the OOM killer or an allocation-failure segfault. The lever that works is
+*spending less*, which is what relief does.
+
+### Tests
+
+`bidx_core::mem` adds `plan_fits_under_the_ceiling_with_a_spike_margin` (the
+invariant, swept across 4–128 GiB), `plan_scales_the_file_lru_with_the_ceiling`,
+and `soft_threshold_sits_below_the_ceiling`. `utxo.rs` adds
+`relieve_pressure_shrinks_both_caches` (asserts the exact bytes freed and the
+eviction), `relieve_pressure_stops_the_block_cache_at_its_floor`,
+`recent_cache_set_budget_evicts_down_and_ignores_growth`, and
+`open_planned_routes_the_plan_into_the_store`. `bench/mod.rs` adds
+`watchdog_reports_pressure_before_it_trips`; `pipeline.rs` adds
+`thread_file_cache_shrink_to_lowers_the_bound_and_evicts`. Per-file coverage is
+at 100% for every touched file.
+
