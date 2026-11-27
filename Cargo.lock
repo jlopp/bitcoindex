@@ -429,6 +429,7 @@ dependencies = [
  "arrow",
  "bidx-core",
  "parquet",
+ "rayon",
  "thiserror",
  "tracing",
 ]
@@ -483,6 +484,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "parquet",
+ "rayon",
  "rocksdb",
  "rustc-hash 2.1.3",
  "thiserror",

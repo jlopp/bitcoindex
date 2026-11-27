@@ -1219,5 +1219,94 @@ memory-copy overheads:
    to every file scan/open, eliminating ~38,000 redundant `xor.dat` syscalls
    across a full chain run.
 
+---
+
+## 19. Bulk-load pipeline, UTXO multi-get, Parquet SoA, & ClickHouse streaming optimizations
+
+Profiling the end-to-end bulk index path (`bidx parse` + `bidx load` +
+`bidx index rebuild address_prefix`) surfaced seven major avoidable bottlenecks
+across RocksDB point lookups, Parquet encoding/compression, per-transaction
+allocations, and ClickHouse ingestion:
+
+1. **Skip consensus-unspendable `OP_RETURN` outputs in `UtxoStore` &
+   `RecentUtxoCache` (`crates/bidx-store/src/utxo.rs`).**
+   Mainnet contains >130M `OP_RETURN` (`0x6a`, `ScriptType::OpReturn = 7`)
+   outputs that consensus forbids ever spending. `UtxoStore::apply_block` now
+   skips inserting `OP_RETURN` outputs into `pending`, `RecentUtxoCache`,
+   `WriteBatch`, `BlockUndo`, and RocksDB SSTs/Bloom filters while still
+   subtracting `out.value_sat` in the fee loop so burned-satoshi fee accounting
+   and Parquet/ClickHouse `outputs` rows remain byte-identical.
+2. **Sorted `batched_multi_get_cf`, single-lock `RecentUtxoCache` pass, reused
+   `ApplyScratch`, and RocksDB `format_version(5)` (`crates/bidx-store/src/utxo.rs`).**
+   - *Single cache lock + sorted batched multi-get:* Instead of locking
+     `RecentUtxoCache` ~3,000–10,000 times per block and issuing sequential
+     unsorted `db.get_pinned_cf` calls, `apply_block` resolves same-block
+     `pending` + `RecentUtxoCache` hits under **one** `recent.lock()` acquisition
+     per block (dropping the lock before any disk I/O), sorts unique cache-miss
+     outpoint keys in `ApplyScratch::misses` so adjacent outpoints share SST data
+     blocks and read in ascending LBA order, issues one
+     `db.batched_multi_get_cf(&cf, &sorted_keys, true)` call per block, and
+     emits `spends`/`fees`/`undo.spent` in exact original `inputs` slice order.
+   - *SST format v5:* `tuned_options` sets `block_opts.set_format_version(5)` for
+     XXH3 block checksums and faster v5 Bloom filter probes.
+3. **Selective Parquet dictionary encoding, `Zstd(1)`, concrete SoA column
+   builders, and parallel entity flush/close
+   (`crates/bidx-store/src/parquet_writers.rs`).**
+   - *Disable dictionary encoding on random 32-byte digests:* Previously
+     dictionary encoding was enabled globally, causing `ArrowWriter` to hash ~8B
+     unique `txid`/`prev_txid`/`spending_txid`/`spent_txid`/`hash`/`merkle_root`
+     digests into doomed 1 MiB hash tables before falling back to plain encoding.
+     Dictionary encoding is now off globally and enabled selectively only on low-
+     or medium-cardinality columns (`DICTIONARY_COLUMNS`: heights, versions,
+     script types/lengths, sequences, and `address_hash`/`spent_address_hash`),
+     paired with explicit `ZstdLevel::try_new(1)` (~3–4× faster than default
+     level 3 on incompressible 32-byte hashes).
+   - *Concrete SoA builders + Rayon flush:* Replaced type-erased `Vec<Col>`
+     per-cell enum dispatch and unnecessary validity bitmaps with typed
+     `BlocksTable` / `TxsTable` / `InputsTable` / `OutputsTable` / `SpendsTable` /
+     `WitnessesTable` Struct-of-Arrays builders (`Vec<T>` -> zero-copy
+     `PrimitiveArray`, `Fixed32Col` -> `FixedSizeBinaryArray` from flat
+     `Vec<u8>`) and parallelized multi-table flushes and part closes via
+     `rayon::scope`.
+4. **Block-level flat `Vec` reuse in `parse_block_full_opts` & \(O(1)\) coinbase
+   fee check (`crates/bidx-parser/src/tx.rs`, `pipeline.rs`, `bench/mod.rs`).**
+   `parse_tx` now appends directly into pre-sized block-level `&mut inputs`,
+   `&mut outputs`, and `&mut witnesses` buffers (stamping `txid` on the slice
+   tail `[inp_start..]` / `[out_start..]`), eliminating ~2.2B short-lived per-tx
+   `Vec` heap allocations across mainnet; `consume_ordered` and `bench_consume`
+   replace the per-block `vec![false; block.txs.len()]` + full-input scan with an
+   \(O(1)\) check on `block.inputs.first()`.
+5. **Bounded-memory streaming `RowBinary` `rebuild_address_prefix` & parallel
+   Rayon address rendering (`crates/bidx-loader/src/lib.rs`, `rowbinary.rs`,
+   `main.rs`).**
+   Replaced `query_scalar` (which buffered ~1B rows / ~68 GiB of TSV into a
+   single `String`) and ~2M per-500-row `clickhouse-client` process spawns with
+   a line-by-line `BufReader` over the `SELECT DISTINCT` child stdout, parallel
+   base58/bech32 chunk rendering (`rebuild_address_prefix_par`), and binary
+   `RowBinary` writes (`rowbinary::address_prefix`) into a single persistent
+   `clickhouse-client` `INSERT ... FORMAT RowBinary` stdin pipe.
+6. **Parallel ClickHouse base-entity loads, client uploads, and derived-index
+   backfills (`crates/bidx-loader/src/lib.rs`, `schema.rs`).**
+   `ChLoader::load_all_with` drops all 10 materialized views in a single
+   `--multiquery` call (`begin_streaming_load`), loads all base entities
+   concurrently in `ServerFile` mode (or streams `(entity, part_path)` tasks
+   across `UPLOAD_CONCURRENCY = 4` concurrent pipes in `Upload` mode), builds all
+   10 disjoint `[TRUNCATE, INSERT]` derived-index groups (`backfill_derived_index_groups`)
+   concurrently across `BACKFILL_CONCURRENCY = 4` connections, and recreates
+   views in a single `--multiquery` batch (`finish_streaming_load`).
+7. **Pipelined part-file ClickHouse ingestion during `bidx parse`
+   (`--stream-clickhouse` & `--unlink-loaded-parts`, `pipeline.rs`, `main.rs`,
+   `bidx-loader/src/lib.rs`).**
+   When `bidx parse --stream-clickhouse` is enabled, `run_parse` drops ClickHouse
+   materialized views up front and spawns a background part-loader fed by a
+   bounded channel (`PART_CHANNEL_DEPTH = 4`). As each Parquet part closes,
+   `ChLoader::load_part` ingests all entity files for that part into ClickHouse
+   in parallel while RocksDB/Parquet continue on subsequent heights (and while
+   `utxo.finalize_bulk_load()` compacts L0 at the end), optionally unlinking each
+   ingested Parquet part file (`--unlink-loaded-parts`) so bulk indexing needs no
+   separate `bidx load` pass and avoids keeping a duplicate Parquet copy of the
+   chain on disk.
+
+
 
 

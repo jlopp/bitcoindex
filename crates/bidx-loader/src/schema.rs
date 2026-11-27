@@ -864,104 +864,129 @@ pub fn drop_materialized_views(db: &str) -> Vec<String> {
 /// `scripthash_map` entry is not the raw MV body: it `SELECT DISTINCT`s, so it
 /// writes one row per distinct script rather than one per output, which is a
 /// large reduction on a full chain.
-pub fn backfill_derived_indexes(db: &str) -> Vec<String> {
+/// Independent `[TRUNCATE TABLE ..., INSERT INTO ...]` statement pairs for each
+/// MV-backed derived index table so `ChLoader` can execute disjoint target
+/// backfills concurrently across multiple ClickHouse connections.
+pub fn backfill_derived_index_groups(db: &str) -> Vec<Vec<String>> {
     vec![
         // 2. transactions_by_txid
-        format!("TRUNCATE TABLE {db}.transactions_by_txid"),
-        format!(
-            "INSERT INTO {db}.transactions_by_txid (txid, height, tx_index) \
-             SELECT txid, height, tx_index FROM {db}.transactions"
-        ),
+        vec![
+            format!("TRUNCATE TABLE {db}.transactions_by_txid"),
+            format!(
+                "INSERT INTO {db}.transactions_by_txid (txid, height, tx_index) \
+                 SELECT txid, height, tx_index FROM {db}.transactions"
+            ),
+        ],
         // 3. inputs_by_prev_output
-        format!("TRUNCATE TABLE {db}.inputs_by_prev_output"),
-        format!(
-            "INSERT INTO {db}.inputs_by_prev_output (prev_txid, prev_vout, height, tx_index, input_index, txid) \
-             SELECT prev_txid, prev_vout, height, tx_index, input_index, txid FROM {db}.inputs"
-        ),
+        vec![
+            format!("TRUNCATE TABLE {db}.inputs_by_prev_output"),
+            format!(
+                "INSERT INTO {db}.inputs_by_prev_output (prev_txid, prev_vout, height, tx_index, input_index, txid) \
+                 SELECT prev_txid, prev_vout, height, tx_index, input_index, txid FROM {db}.inputs"
+            ),
+        ],
         // 4. outputs_by_address
-        format!("TRUNCATE TABLE {db}.outputs_by_address"),
-        format!(
-            "INSERT INTO {db}.outputs_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat) \
-             SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat FROM {db}.outputs"
-        ),
+        vec![
+            format!("TRUNCATE TABLE {db}.outputs_by_address"),
+            format!(
+                "INSERT INTO {db}.outputs_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat) \
+                 SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat FROM {db}.outputs"
+            ),
+        ],
         // 5. spends_by_spent_outpoint
-        format!("TRUNCATE TABLE {db}.spends_by_spent_outpoint"),
-        format!(
-            "INSERT INTO {db}.spends_by_spent_outpoint (spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid) \
-             SELECT spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid FROM {db}.spends"
-        ),
+        vec![
+            format!("TRUNCATE TABLE {db}.spends_by_spent_outpoint"),
+            format!(
+                "INSERT INTO {db}.spends_by_spent_outpoint (spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid) \
+                 SELECT spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid FROM {db}.spends"
+            ),
+        ],
         // 6. spends_by_address
-        format!("TRUNCATE TABLE {db}.spends_by_address"),
-        format!(
-            "INSERT INTO {db}.spends_by_address (spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height) \
-             SELECT spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height FROM {db}.spends"
-        ),
-        // 6. address_history (fund + spend). The fund and spend halves are
-        // `UNION ALL`ed into one `INSERT` rather than issued as two statements:
-        // each `INSERT` creates its own parts, which ClickHouse then merges, so
-        // one statement halves the part count (and the merge writes) for the
-        // table. The rows are identical either way — the two live MVs insert
-        // them separately, and this only changes how they reach the target.
-        format!("TRUNCATE TABLE {db}.address_history"),
-        format!(
-            "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
-             SELECT address_hash, height, tx_index, txid, toInt64(value_sat) AS value_sat, toUInt8(0) AS kind \
-             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
-             UNION ALL \
-             SELECT spent_address_hash AS address_hash, height, spending_tx_index AS tx_index, \
-                    spending_txid AS txid, toInt64(-spent_value_sat) AS value_sat, toUInt8(1) AS kind \
-             FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
-        ),
-        // 7. utxos_by_address (fund + spend) — `UNION ALL`, see above.
-        format!("TRUNCATE TABLE {db}.utxos_by_address"),
-        format!(
-            "INSERT INTO {db}.utxos_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign) \
-             SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat, toInt8(1) AS sign \
-             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
-             UNION ALL \
-             SELECT spent_address_hash AS address_hash, spent_script_type AS script_type, height, \
-                    spending_tx_index AS tx_index, spent_vout AS output_index, spent_txid AS txid, \
-                    spent_value_sat AS value_sat, toInt8(-1) AS sign \
-             FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
-        ),
-        // 15. address_stats (fund + spend) — `UNION ALL`, see above.
-        format!("TRUNCATE TABLE {db}.address_stats"),
-        format!(
-            "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
-             SELECT address_hash, toUInt64(1) AS funded_count, value_sat AS funded_sum, \
-                    toUInt64(0) AS spent_count, toUInt64(0) AS spent_sum, toUInt64(1) AS history_count \
-             FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
-             UNION ALL \
-             SELECT spent_address_hash AS address_hash, toUInt64(0) AS funded_count, \
-                    toUInt64(0) AS funded_sum, toUInt64(1) AS spent_count, \
-                    spent_value_sat AS spent_sum, toUInt64(1) AS history_count \
-             FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
-        ),
+        vec![
+            format!("TRUNCATE TABLE {db}.spends_by_address"),
+            format!(
+                "INSERT INTO {db}.spends_by_address (spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height) \
+                 SELECT spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height FROM {db}.spends"
+            ),
+        ],
+        // 6. address_history (fund + spend) — single `UNION ALL` insert.
+        vec![
+            format!("TRUNCATE TABLE {db}.address_history"),
+            format!(
+                "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
+                 SELECT address_hash, height, tx_index, txid, toInt64(value_sat) AS value_sat, toUInt8(0) AS kind \
+                 FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
+                 UNION ALL \
+                 SELECT spent_address_hash AS address_hash, height, spending_tx_index AS tx_index, \
+                        spending_txid AS txid, toInt64(-spent_value_sat) AS value_sat, toUInt8(1) AS kind \
+                 FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+            ),
+        ],
+        // 7. utxos_by_address (fund + spend) — single `UNION ALL` insert.
+        vec![
+            format!("TRUNCATE TABLE {db}.utxos_by_address"),
+            format!(
+                "INSERT INTO {db}.utxos_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign) \
+                 SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat, toInt8(1) AS sign \
+                 FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
+                 UNION ALL \
+                 SELECT spent_address_hash AS address_hash, spent_script_type AS script_type, height, \
+                        spending_tx_index AS tx_index, spent_vout AS output_index, spent_txid AS txid, \
+                        spent_value_sat AS value_sat, toInt8(-1) AS sign \
+                 FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+            ),
+        ],
+        // 15. address_stats (fund + spend) — single `UNION ALL` insert.
+        vec![
+            format!("TRUNCATE TABLE {db}.address_stats"),
+            format!(
+                "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
+                 SELECT address_hash, toUInt64(1) AS funded_count, value_sat AS funded_sum, \
+                        toUInt64(0) AS spent_count, toUInt64(0) AS spent_sum, toUInt64(1) AS history_count \
+                 FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
+                 UNION ALL \
+                 SELECT spent_address_hash AS address_hash, toUInt64(0) AS funded_count, \
+                        toUInt64(0) AS funded_sum, toUInt64(1) AS spent_count, \
+                        spent_value_sat AS spent_sum, toUInt64(1) AS history_count \
+                 FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+            ),
+        ],
         // 17. blocks_by_miner
-        format!("TRUNCATE TABLE {db}.blocks_by_miner"),
-        format!(
-            "INSERT INTO {db}.blocks_by_miner (miner_hash, height, tx_index, coinbase_value) \
-             SELECT address_hash AS miner_hash, height, tx_index, value_sat AS coinbase_value \
-             FROM {db}.outputs WHERE tx_index = 0 AND script_type != {SCRIPT_TYPE_OP_RETURN}"
-        ),
+        vec![
+            format!("TRUNCATE TABLE {db}.blocks_by_miner"),
+            format!(
+                "INSERT INTO {db}.blocks_by_miner (miner_hash, height, tx_index, coinbase_value) \
+                 SELECT address_hash AS miner_hash, height, tx_index, value_sat AS coinbase_value \
+                 FROM {db}.outputs WHERE tx_index = 0 AND script_type != {SCRIPT_TYPE_OP_RETURN}"
+            ),
+        ],
         // 19. scripthash_map — DISTINCT, unlike the per-row MV, so it writes one
         // row per distinct script instead of one per output.
-        format!("TRUNCATE TABLE {db}.scripthash_map"),
-        format!(
-            "INSERT INTO {db}.scripthash_map (scripthash, script_type, address_hash) \
-             SELECT DISTINCT \
-               SHA256(multiIf( \
-                 script_type = 2, concat(unhex('76a914'), substring(address_hash, 1, 20), unhex('88ac')), \
-                 script_type = 3, concat(unhex('a914'), substring(address_hash, 1, 20), unhex('87')), \
-                 script_type = 4, concat(unhex('0014'), substring(address_hash, 1, 20)), \
-                 script_type = 5, concat(unhex('0020'), substring(address_hash, 1, 32)), \
-                 script_type = 6, concat(unhex('5120'), substring(address_hash, 1, 32)), \
-                 unhex(''))) AS scripthash, \
-               script_type, address_hash \
-             FROM {db}.outputs \
-             WHERE script_type IN (2, 3, 4, 5, 6)"
-        ),
+        vec![
+            format!("TRUNCATE TABLE {db}.scripthash_map"),
+            format!(
+                "INSERT INTO {db}.scripthash_map (scripthash, script_type, address_hash) \
+                 SELECT DISTINCT \
+                   SHA256(multiIf( \
+                     script_type = 2, concat(unhex('76a914'), substring(address_hash, 1, 20), unhex('88ac')), \
+                     script_type = 3, concat(unhex('a914'), substring(address_hash, 1, 20), unhex('87')), \
+                     script_type = 4, concat(unhex('0014'), substring(address_hash, 1, 20)), \
+                     script_type = 5, concat(unhex('0020'), substring(address_hash, 1, 32)), \
+                     script_type = 6, concat(unhex('5120'), substring(address_hash, 1, 32)), \
+                     unhex(''))) AS scripthash, \
+                   script_type, address_hash \
+                 FROM {db}.outputs \
+                 WHERE script_type IN (2, 3, 4, 5, 6)"
+            ),
+        ],
     ]
+}
+
+pub fn backfill_derived_indexes(db: &str) -> Vec<String> {
+    backfill_derived_index_groups(db)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

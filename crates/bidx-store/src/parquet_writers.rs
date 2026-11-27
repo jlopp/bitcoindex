@@ -1,20 +1,26 @@
-//! Buffered Parquet writers for the five entity tables.
+//! Buffered Parquet writers for the five base entity tables (plus optional
+//! witnesses).
 //!
-//! One writer instance per output part file. Rows are buffered in a
-//! type-erased column builder and flushed as a row group when `batch_size`
-//! rows have accumulated, so peak memory stays bounded regardless of input
-//! size. Hashes are written as FixedSizeBinary(32) in wire order.
+//! One writer instance per output part file. Rows accumulate directly in
+//! concrete Struct-of-Arrays (SoA) column buffers without per-cell enum
+//! dispatch or unnecessary null bitmaps, and flush as a row group when
+//! `batch_size` rows have accumulated. Full batches and part-file closes run
+//! Zstd(1) encoding in parallel across entities via Rayon, with dictionary
+//! encoding disabled on random 32-byte digests so `ArrowWriter` does not hash
+//! billions of unique txids into doomed 1 MiB dictionary pages.
 
 use arrow::array::{
-    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, Int32Builder, UInt32Builder,
-    UInt64Builder, UInt8Builder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, FixedSizeBinaryArray, Int32Array, UInt32Array,
+    UInt64Array, UInt8Array,
 };
+use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bidx_core::{BlockRow, InputRow, OutputRow, SpendRow, TxRow, WitnessRow};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -49,88 +55,122 @@ impl Default for SinkConfig {
     }
 }
 
+/// Columns whose values repeat frequently enough within a 250k-row group that
+/// Parquet dictionary encoding pays off. High-entropy 32-byte cryptographic
+/// digests (`txid`, `prev_txid`, `spending_txid`, `spent_txid`, `hash`,
+/// `merkle_root`) and raw witness blobs are left plain (`dictionary_enabled =
+/// false`) so `ArrowWriter` skips hashing ~8 billion unique digests into a
+/// dictionary `HashMap` that always overflows at 1 MiB.
+const DICTIONARY_COLUMNS: &[&str] = &[
+    "height",
+    "spent_height",
+    "version",
+    "script_type",
+    "spent_script_type",
+    "script_pubkey_len",
+    "script_sig_len",
+    "sequence",
+    "address_hash",
+    "spent_address_hash",
+];
+
 fn writer_props(batch_size: usize) -> WriterProperties {
-    // Match `max_row_group_size` to `batch_size` so each flushed `RecordBatch`
-    // closes out its row group on disk immediately instead of accumulating up
-    // to 1M rows per entity inside `ArrowWriter`'s `InMemoryRowGroup`.
-    WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
+    // Zstd level 1 gives ~2x faster compression CPU than default level 3 for
+    // only ~3-5% larger output, and matching `max_row_group_size` to
+    // `batch_size` flushes each `RecordBatch` directly to disk instead of
+    // buffering up to 1M rows in `ArrowWriter`'s `InMemoryRowGroup`.
+    let level = ZstdLevel::try_new(1).unwrap_or_default();
+    let mut b = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(level))
+        .set_dictionary_enabled(false)
         .set_max_row_group_size(batch_size.max(1))
-        .set_write_batch_size(8192)
-        .build()
+        .set_write_batch_size(8192);
+    for &col in DICTIONARY_COLUMNS {
+        b = b.set_column_dictionary_enabled(ColumnPath::from(col), true);
+    }
+    b.build()
 }
 
 /// Write-back buffer for one Parquet part file.
 ///
 /// `ArrowWriter` issues a `write` syscall for every encoded page, so an
-/// unbuffered part file pays hundreds of small syscalls per row group — a
-/// syscall storm on the single sink thread that serializes the whole write
-/// path. A 1 MiB buffer collapses those into large sequential writes. The
-/// buffer is flushed on `finish()`, which `ArrowWriter::close` routes to the
-/// inner writer (parquet's `SerializedFileWriter::finish` calls `buf.flush`),
-/// so no data is stranded when a part is closed.
+/// unbuffered part file pays hundreds of small syscalls per row group. A 1 MiB
+/// buffer collapses those into large sequential writes and is flushed on
+/// `ArrowWriter::close`.
 const PARQUET_WRITE_BUF_BYTES: usize = 1 << 20;
 
-/// The writer every entity table uses: Parquet over a buffered file. Aliased so
-/// the six `ArrowWriter<...>` fields below stay in lockstep with `create_writer`.
+/// Cap initial preallocation per column builder so tiny or synthetic configs
+/// do not over-allocate while default 250k batches grow zero times.
+const MAX_PREALLOC_ROWS: usize = 250_000;
+
+/// The writer every entity table uses: Parquet over a buffered file.
 type EntityWriter = ArrowWriter<BufWriter<File>>;
 
 fn fbin32(name: &str) -> Field {
     Field::new(name, DataType::FixedSizeBinary(32), false)
 }
 
-// ---- type-erased column builder ----
+// ---- zero-null-bitmap, zero-dispatch typed column buffers ----
 
-enum Col {
-    U32(UInt32Builder),
-    U64(UInt64Builder),
-    I32(Int32Builder),
-    U8(UInt8Builder),
-    Bool(BooleanBuilder),
-    Bin32(FixedSizeBinaryBuilder),
-    /// Variable-length binary (witness stack elements).
-    Blob(BinaryBuilder),
+struct Fixed32Col {
+    buf: Vec<u8>,
+    cap_rows: usize,
 }
 
-impl Col {
-    fn finish(&mut self) -> ArrayRef {
-        match self {
-            Col::U32(b) => Arc::new(b.finish()),
-            Col::U64(b) => Arc::new(b.finish()),
-            Col::I32(b) => Arc::new(b.finish()),
-            Col::U8(b) => Arc::new(b.finish()),
-            Col::Bool(b) => Arc::new(b.finish()),
-            Col::Bin32(b) => Arc::new(b.finish()),
-            Col::Blob(b) => Arc::new(b.finish()),
+impl Fixed32Col {
+    fn new(batch_size: usize) -> Self {
+        let cap_rows = batch_size.clamp(1, MAX_PREALLOC_ROWS);
+        Self {
+            buf: Vec::with_capacity(cap_rows * 32),
+            cap_rows,
         }
+    }
+
+    #[inline]
+    fn push(&mut self, v: &[u8; 32]) {
+        self.buf.extend_from_slice(v);
+    }
+
+    fn finish(&mut self) -> Result<ArrayRef, arrow::error::ArrowError> {
+        let raw = std::mem::replace(&mut self.buf, Vec::with_capacity(self.cap_rows * 32));
+        Ok(Arc::new(FixedSizeBinaryArray::try_new(
+            32,
+            Buffer::from_vec(raw),
+            None,
+        )?))
     }
 }
 
-macro_rules! push {
-    ($cols:expr, $i:expr, $variant:ident, $v:expr) => {{
-        match &mut $cols[$i] {
-            Col::$variant(b) => b.append_value($v),
-            _ => unreachable!("column type mismatch"),
-        }
-    }};
+#[inline]
+fn finish_u32(col: &mut Vec<u32>, cap: usize) -> ArrayRef {
+    Arc::new(UInt32Array::from(std::mem::replace(
+        col,
+        Vec::with_capacity(cap),
+    )))
 }
 
-macro_rules! push_bin {
-    ($cols:expr, $i:expr, $v:expr) => {{
-        match &mut $cols[$i] {
-            Col::Bin32(b) => b.append_value($v)?,
-            _ => unreachable!("column type mismatch"),
-        }
-    }};
+#[inline]
+fn finish_u64(col: &mut Vec<u64>, cap: usize) -> ArrayRef {
+    Arc::new(UInt64Array::from(std::mem::replace(
+        col,
+        Vec::with_capacity(cap),
+    )))
 }
 
-macro_rules! push_blob {
-    ($cols:expr, $i:expr, $v:expr) => {{
-        match &mut $cols[$i] {
-            Col::Blob(b) => b.append_value($v),
-            _ => unreachable!("column type mismatch"),
-        }
-    }};
+#[inline]
+fn finish_i32(col: &mut Vec<i32>, cap: usize) -> ArrayRef {
+    Arc::new(Int32Array::from(std::mem::replace(
+        col,
+        Vec::with_capacity(cap),
+    )))
+}
+
+#[inline]
+fn finish_u8(col: &mut Vec<u8>, cap: usize) -> ArrayRef {
+    Arc::new(UInt8Array::from(std::mem::replace(
+        col,
+        Vec::with_capacity(cap),
+    )))
 }
 
 // ---- schemas ----
@@ -227,39 +267,419 @@ pub fn witnesses_schema() -> SchemaRef {
     ]))
 }
 
-// ---- entity table definition: schema + a `push` that appends one row ----
+// ---- concrete Struct-of-Arrays builders per entity table ----
 
-struct EntityTable {
+struct BlocksTable {
     schema: SchemaRef,
-    cols: Vec<Col>,
+    cap: usize,
     buffered: usize,
+    height: Vec<u32>,
+    hash: Fixed32Col,
+    prev_hash: Fixed32Col,
+    merkle_root: Fixed32Col,
+    time: Vec<u32>,
+    bits: Vec<u32>,
+    nonce: Vec<u32>,
+    version: Vec<i32>,
+    tx_count: Vec<u32>,
+    size: Vec<u32>,
+    weight: Vec<u32>,
+    total_fee: Vec<u64>,
+    coinbase_value: Vec<u64>,
 }
 
-impl EntityTable {
-    fn new(schema: SchemaRef) -> Self {
-        let cols = schema
-            .fields()
-            .iter()
-            .map(|f| match f.data_type() {
-                DataType::UInt32 => Col::U32(UInt32Builder::new()),
-                DataType::UInt64 => Col::U64(UInt64Builder::new()),
-                DataType::Int32 => Col::I32(Int32Builder::new()),
-                DataType::UInt8 => Col::U8(UInt8Builder::new()),
-                DataType::Boolean => Col::Bool(BooleanBuilder::new()),
-                DataType::FixedSizeBinary(w) => Col::Bin32(FixedSizeBinaryBuilder::new(*w)),
-                DataType::Binary => Col::Blob(BinaryBuilder::new()),
-                other => panic!("unsupported column type {other:?}"),
-            })
-            .collect();
-        EntityTable {
-            schema,
-            cols,
+impl BlocksTable {
+    fn new(batch_size: usize) -> Self {
+        let cap = batch_size.clamp(1, MAX_PREALLOC_ROWS);
+        Self {
+            schema: blocks_schema(),
+            cap,
             buffered: 0,
+            height: Vec::with_capacity(cap),
+            hash: Fixed32Col::new(cap),
+            prev_hash: Fixed32Col::new(cap),
+            merkle_root: Fixed32Col::new(cap),
+            time: Vec::with_capacity(cap),
+            bits: Vec::with_capacity(cap),
+            nonce: Vec::with_capacity(cap),
+            version: Vec::with_capacity(cap),
+            tx_count: Vec::with_capacity(cap),
+            size: Vec::with_capacity(cap),
+            weight: Vec::with_capacity(cap),
+            total_fee: Vec::with_capacity(cap),
+            coinbase_value: Vec::with_capacity(cap),
         }
     }
 
+    #[inline]
+    fn append(&mut self, r: &BlockRow) {
+        self.height.push(r.height);
+        self.hash.push(&r.hash);
+        self.prev_hash.push(&r.prev_hash);
+        self.merkle_root.push(&r.merkle_root);
+        self.time.push(r.time);
+        self.bits.push(r.bits);
+        self.nonce.push(r.nonce);
+        self.version.push(r.version);
+        self.tx_count.push(r.tx_count);
+        self.size.push(r.size);
+        self.weight.push(r.weight);
+        self.total_fee.push(r.total_fee);
+        self.coinbase_value.push(r.coinbase_value);
+        self.buffered += 1;
+    }
+
     fn take_batch(&mut self) -> Result<RecordBatch, SinkError> {
-        let arrays: Vec<ArrayRef> = self.cols.iter_mut().map(|c| c.finish()).collect();
+        let c = self.cap;
+        let arrays: Vec<ArrayRef> = vec![
+            finish_u32(&mut self.height, c),
+            self.hash.finish()?,
+            self.prev_hash.finish()?,
+            self.merkle_root.finish()?,
+            finish_u32(&mut self.time, c),
+            finish_u32(&mut self.bits, c),
+            finish_u32(&mut self.nonce, c),
+            finish_i32(&mut self.version, c),
+            finish_u32(&mut self.tx_count, c),
+            finish_u32(&mut self.size, c),
+            finish_u32(&mut self.weight, c),
+            finish_u64(&mut self.total_fee, c),
+            finish_u64(&mut self.coinbase_value, c),
+        ];
+        self.buffered = 0;
+        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+    }
+}
+
+struct TxsTable {
+    schema: SchemaRef,
+    cap: usize,
+    buffered: usize,
+    height: Vec<u32>,
+    tx_index: Vec<u32>,
+    txid: Fixed32Col,
+    version: Vec<i32>,
+    locktime: Vec<u32>,
+    size: Vec<u32>,
+    weight: Vec<u32>,
+    fee: Vec<u64>,
+    input_count: Vec<u32>,
+    output_count: Vec<u32>,
+    has_witness: BooleanBuilder,
+}
+
+impl TxsTable {
+    fn new(batch_size: usize) -> Self {
+        let cap = batch_size.clamp(1, MAX_PREALLOC_ROWS);
+        Self {
+            schema: transactions_schema(),
+            cap,
+            buffered: 0,
+            height: Vec::with_capacity(cap),
+            tx_index: Vec::with_capacity(cap),
+            txid: Fixed32Col::new(cap),
+            version: Vec::with_capacity(cap),
+            locktime: Vec::with_capacity(cap),
+            size: Vec::with_capacity(cap),
+            weight: Vec::with_capacity(cap),
+            fee: Vec::with_capacity(cap),
+            input_count: Vec::with_capacity(cap),
+            output_count: Vec::with_capacity(cap),
+            has_witness: BooleanBuilder::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, r: &TxRow) {
+        self.height.push(r.height);
+        self.tx_index.push(r.tx_index);
+        self.txid.push(&r.txid);
+        self.version.push(r.version);
+        self.locktime.push(r.locktime);
+        self.size.push(r.size);
+        self.weight.push(r.weight);
+        self.fee.push(r.fee);
+        self.input_count.push(r.input_count);
+        self.output_count.push(r.output_count);
+        self.has_witness.append_value(r.has_witness);
+        self.buffered += 1;
+    }
+
+    fn take_batch(&mut self) -> Result<RecordBatch, SinkError> {
+        let c = self.cap;
+        let arrays: Vec<ArrayRef> = vec![
+            finish_u32(&mut self.height, c),
+            finish_u32(&mut self.tx_index, c),
+            self.txid.finish()?,
+            finish_i32(&mut self.version, c),
+            finish_u32(&mut self.locktime, c),
+            finish_u32(&mut self.size, c),
+            finish_u32(&mut self.weight, c),
+            finish_u64(&mut self.fee, c),
+            finish_u32(&mut self.input_count, c),
+            finish_u32(&mut self.output_count, c),
+            Arc::new(self.has_witness.finish()),
+        ];
+        self.buffered = 0;
+        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+    }
+}
+
+struct InputsTable {
+    schema: SchemaRef,
+    cap: usize,
+    buffered: usize,
+    height: Vec<u32>,
+    tx_index: Vec<u32>,
+    input_index: Vec<u32>,
+    txid: Fixed32Col,
+    prev_txid: Fixed32Col,
+    prev_vout: Vec<u32>,
+    script_sig_len: Vec<u32>,
+    sequence: Vec<u32>,
+    witness_items: Vec<u32>,
+    witness_bytes: Vec<u32>,
+    is_coinbase: BooleanBuilder,
+}
+
+impl InputsTable {
+    fn new(batch_size: usize) -> Self {
+        let cap = batch_size.clamp(1, MAX_PREALLOC_ROWS);
+        Self {
+            schema: inputs_schema(),
+            cap,
+            buffered: 0,
+            height: Vec::with_capacity(cap),
+            tx_index: Vec::with_capacity(cap),
+            input_index: Vec::with_capacity(cap),
+            txid: Fixed32Col::new(cap),
+            prev_txid: Fixed32Col::new(cap),
+            prev_vout: Vec::with_capacity(cap),
+            script_sig_len: Vec::with_capacity(cap),
+            sequence: Vec::with_capacity(cap),
+            witness_items: Vec::with_capacity(cap),
+            witness_bytes: Vec::with_capacity(cap),
+            is_coinbase: BooleanBuilder::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, r: &InputRow) {
+        self.height.push(r.height);
+        self.tx_index.push(r.tx_index);
+        self.input_index.push(r.input_index);
+        self.txid.push(&r.txid);
+        self.prev_txid.push(&r.prev_txid);
+        self.prev_vout.push(r.prev_vout);
+        self.script_sig_len.push(r.script_sig_len);
+        self.sequence.push(r.sequence);
+        self.witness_items.push(r.witness_items);
+        self.witness_bytes.push(r.witness_bytes);
+        self.is_coinbase.append_value(r.is_coinbase);
+        self.buffered += 1;
+    }
+
+    fn take_batch(&mut self) -> Result<RecordBatch, SinkError> {
+        let c = self.cap;
+        let arrays: Vec<ArrayRef> = vec![
+            finish_u32(&mut self.height, c),
+            finish_u32(&mut self.tx_index, c),
+            finish_u32(&mut self.input_index, c),
+            self.txid.finish()?,
+            self.prev_txid.finish()?,
+            finish_u32(&mut self.prev_vout, c),
+            finish_u32(&mut self.script_sig_len, c),
+            finish_u32(&mut self.sequence, c),
+            finish_u32(&mut self.witness_items, c),
+            finish_u32(&mut self.witness_bytes, c),
+            Arc::new(self.is_coinbase.finish()),
+        ];
+        self.buffered = 0;
+        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+    }
+}
+
+struct OutputsTable {
+    schema: SchemaRef,
+    cap: usize,
+    buffered: usize,
+    height: Vec<u32>,
+    tx_index: Vec<u32>,
+    output_index: Vec<u32>,
+    txid: Fixed32Col,
+    value_sat: Vec<u64>,
+    script_pubkey_len: Vec<u32>,
+    script_type: Vec<u8>,
+    address_hash: Fixed32Col,
+}
+
+impl OutputsTable {
+    fn new(batch_size: usize) -> Self {
+        let cap = batch_size.clamp(1, MAX_PREALLOC_ROWS);
+        Self {
+            schema: outputs_schema(),
+            cap,
+            buffered: 0,
+            height: Vec::with_capacity(cap),
+            tx_index: Vec::with_capacity(cap),
+            output_index: Vec::with_capacity(cap),
+            txid: Fixed32Col::new(cap),
+            value_sat: Vec::with_capacity(cap),
+            script_pubkey_len: Vec::with_capacity(cap),
+            script_type: Vec::with_capacity(cap),
+            address_hash: Fixed32Col::new(cap),
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, r: &OutputRow) {
+        self.height.push(r.height);
+        self.tx_index.push(r.tx_index);
+        self.output_index.push(r.output_index);
+        self.txid.push(&r.txid);
+        self.value_sat.push(r.value_sat);
+        self.script_pubkey_len.push(r.script_pubkey_len);
+        self.script_type.push(r.script_type);
+        self.address_hash.push(&r.address_hash);
+        self.buffered += 1;
+    }
+
+    fn take_batch(&mut self) -> Result<RecordBatch, SinkError> {
+        let c = self.cap;
+        let arrays: Vec<ArrayRef> = vec![
+            finish_u32(&mut self.height, c),
+            finish_u32(&mut self.tx_index, c),
+            finish_u32(&mut self.output_index, c),
+            self.txid.finish()?,
+            finish_u64(&mut self.value_sat, c),
+            finish_u32(&mut self.script_pubkey_len, c),
+            finish_u8(&mut self.script_type, c),
+            self.address_hash.finish()?,
+        ];
+        self.buffered = 0;
+        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+    }
+}
+
+struct SpendsTable {
+    schema: SchemaRef,
+    cap: usize,
+    buffered: usize,
+    height: Vec<u32>,
+    spending_tx_index: Vec<u32>,
+    spending_input_index: Vec<u32>,
+    spending_txid: Fixed32Col,
+    spent_txid: Fixed32Col,
+    spent_vout: Vec<u32>,
+    spent_value_sat: Vec<u64>,
+    spent_script_type: Vec<u8>,
+    spent_address_hash: Fixed32Col,
+    spent_height: Vec<u32>,
+}
+
+impl SpendsTable {
+    fn new(batch_size: usize) -> Self {
+        let cap = batch_size.clamp(1, MAX_PREALLOC_ROWS);
+        Self {
+            schema: spends_schema(),
+            cap,
+            buffered: 0,
+            height: Vec::with_capacity(cap),
+            spending_tx_index: Vec::with_capacity(cap),
+            spending_input_index: Vec::with_capacity(cap),
+            spending_txid: Fixed32Col::new(cap),
+            spent_txid: Fixed32Col::new(cap),
+            spent_vout: Vec::with_capacity(cap),
+            spent_value_sat: Vec::with_capacity(cap),
+            spent_script_type: Vec::with_capacity(cap),
+            spent_address_hash: Fixed32Col::new(cap),
+            spent_height: Vec::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, r: &SpendRow) {
+        self.height.push(r.height);
+        self.spending_tx_index.push(r.spending_tx_index);
+        self.spending_input_index.push(r.spending_input_index);
+        self.spending_txid.push(&r.spending_txid);
+        self.spent_txid.push(&r.spent_txid);
+        self.spent_vout.push(r.spent_vout);
+        self.spent_value_sat.push(r.spent_value_sat);
+        self.spent_script_type.push(r.spent_script_type);
+        self.spent_address_hash.push(&r.spent_address_hash);
+        self.spent_height.push(r.spent_height);
+        self.buffered += 1;
+    }
+
+    fn take_batch(&mut self) -> Result<RecordBatch, SinkError> {
+        let c = self.cap;
+        let arrays: Vec<ArrayRef> = vec![
+            finish_u32(&mut self.height, c),
+            finish_u32(&mut self.spending_tx_index, c),
+            finish_u32(&mut self.spending_input_index, c),
+            self.spending_txid.finish()?,
+            self.spent_txid.finish()?,
+            finish_u32(&mut self.spent_vout, c),
+            finish_u64(&mut self.spent_value_sat, c),
+            finish_u8(&mut self.spent_script_type, c),
+            self.spent_address_hash.finish()?,
+            finish_u32(&mut self.spent_height, c),
+        ];
+        self.buffered = 0;
+        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
+    }
+}
+
+struct WitnessesTable {
+    schema: SchemaRef,
+    cap: usize,
+    buffered: usize,
+    height: Vec<u32>,
+    tx_index: Vec<u32>,
+    input_index: Vec<u32>,
+    item_index: Vec<u32>,
+    item_len: Vec<u32>,
+    item_bytes: BinaryBuilder,
+}
+
+impl WitnessesTable {
+    fn new(batch_size: usize) -> Self {
+        let cap = batch_size.clamp(1, MAX_PREALLOC_ROWS);
+        Self {
+            schema: witnesses_schema(),
+            cap,
+            buffered: 0,
+            height: Vec::with_capacity(cap),
+            tx_index: Vec::with_capacity(cap),
+            input_index: Vec::with_capacity(cap),
+            item_index: Vec::with_capacity(cap),
+            item_len: Vec::with_capacity(cap),
+            item_bytes: BinaryBuilder::with_capacity(cap, cap * 32),
+        }
+    }
+
+    #[inline]
+    fn append(&mut self, r: &WitnessRow) {
+        self.height.push(r.height);
+        self.tx_index.push(r.tx_index);
+        self.input_index.push(r.input_index);
+        self.item_index.push(r.item_index);
+        self.item_len.push(r.item_len);
+        self.item_bytes.append_value(&r.item_bytes);
+        self.buffered += 1;
+    }
+
+    fn take_batch(&mut self) -> Result<RecordBatch, SinkError> {
+        let c = self.cap;
+        let arrays: Vec<ArrayRef> = vec![
+            finish_u32(&mut self.height, c),
+            finish_u32(&mut self.tx_index, c),
+            finish_u32(&mut self.input_index, c),
+            finish_u32(&mut self.item_index, c),
+            finish_u32(&mut self.item_len, c),
+            Arc::new(self.item_bytes.finish()),
+        ];
         self.buffered = 0;
         Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
     }
@@ -279,12 +699,12 @@ pub struct ParquetSink {
     /// Only present when `cfg.capture_witness` is set.
     witnesses_w: Option<EntityWriter>,
 
-    blocks: EntityTable,
-    txs: EntityTable,
-    inputs: EntityTable,
-    outputs: EntityTable,
-    spends: EntityTable,
-    witnesses: EntityTable,
+    blocks: BlocksTable,
+    txs: TxsTable,
+    inputs: InputsTable,
+    outputs: OutputsTable,
+    spends: SpendsTable,
+    witnesses: WitnessesTable,
 }
 
 fn create_writer(
@@ -297,14 +717,20 @@ fn create_writer(
     let pdir = dir.join(entity);
     std::fs::create_dir_all(&pdir)?;
     let file = File::create(pdir.join(format!("part-{part:05}.parquet")))?;
-    // Buffer the file: Parquet emits one write per page, so an unbuffered part
-    // file is a syscall storm on the sink thread. See `PARQUET_WRITE_BUF_BYTES`.
     let buffered = BufWriter::with_capacity(PARQUET_WRITE_BUF_BYTES, file);
     Ok(ArrowWriter::try_new(
         buffered,
         schema,
         Some(writer_props(batch_size)),
     )?)
+}
+
+fn finish_entity(batch: Option<RecordBatch>, mut w: EntityWriter) -> Result<(), SinkError> {
+    if let Some(b) = batch {
+        w.write(&b)?;
+    }
+    w.close()?;
+    Ok(())
 }
 
 impl ParquetSink {
@@ -321,6 +747,7 @@ impl ParquetSink {
         } else {
             None
         };
+        let witness_cap = if cfg.capture_witness { bs } else { 1 };
         Ok(ParquetSink {
             cfg,
             part,
@@ -330,31 +757,17 @@ impl ParquetSink {
             outputs_w: create_writer(dir, "outputs", part, outputs_schema(), bs)?,
             spends_w: create_writer(dir, "spends", part, spends_schema(), bs)?,
             witnesses_w,
-            blocks: EntityTable::new(blocks_schema()),
-            txs: EntityTable::new(transactions_schema()),
-            inputs: EntityTable::new(inputs_schema()),
-            outputs: EntityTable::new(outputs_schema()),
-            spends: EntityTable::new(spends_schema()),
-            witnesses: EntityTable::new(witnesses_schema()),
+            blocks: BlocksTable::new(bs),
+            txs: TxsTable::new(bs),
+            inputs: InputsTable::new(bs),
+            outputs: OutputsTable::new(bs),
+            spends: SpendsTable::new(bs),
+            witnesses: WitnessesTable::new(witness_cap),
         })
     }
 
     pub fn push_block(&mut self, r: &BlockRow) -> Result<(), SinkError> {
-        let c = &mut self.blocks.cols;
-        push!(c, 0, U32, r.height);
-        push_bin!(c, 1, r.hash);
-        push_bin!(c, 2, r.prev_hash);
-        push_bin!(c, 3, r.merkle_root);
-        push!(c, 4, U32, r.time);
-        push!(c, 5, U32, r.bits);
-        push!(c, 6, U32, r.nonce);
-        push!(c, 7, I32, r.version);
-        push!(c, 8, U32, r.tx_count);
-        push!(c, 9, U32, r.size);
-        push!(c, 10, U32, r.weight);
-        push!(c, 11, U64, r.total_fee);
-        push!(c, 12, U64, r.coinbase_value);
-        self.blocks.buffered += 1;
+        self.blocks.append(r);
         if self.blocks.buffered >= self.cfg.batch_size {
             let b = self.blocks.take_batch()?;
             self.blocks_w.write(&b)?;
@@ -363,19 +776,7 @@ impl ParquetSink {
     }
 
     pub fn push_tx(&mut self, r: &TxRow) -> Result<(), SinkError> {
-        let c = &mut self.txs.cols;
-        push!(c, 0, U32, r.height);
-        push!(c, 1, U32, r.tx_index);
-        push_bin!(c, 2, r.txid);
-        push!(c, 3, I32, r.version);
-        push!(c, 4, U32, r.locktime);
-        push!(c, 5, U32, r.size);
-        push!(c, 6, U32, r.weight);
-        push!(c, 7, U64, r.fee);
-        push!(c, 8, U32, r.input_count);
-        push!(c, 9, U32, r.output_count);
-        push!(c, 10, Bool, r.has_witness);
-        self.txs.buffered += 1;
+        self.txs.append(r);
         if self.txs.buffered >= self.cfg.batch_size {
             let b = self.txs.take_batch()?;
             self.txs_w.write(&b)?;
@@ -384,19 +785,7 @@ impl ParquetSink {
     }
 
     pub fn push_input(&mut self, r: &InputRow) -> Result<(), SinkError> {
-        let c = &mut self.inputs.cols;
-        push!(c, 0, U32, r.height);
-        push!(c, 1, U32, r.tx_index);
-        push!(c, 2, U32, r.input_index);
-        push_bin!(c, 3, r.txid);
-        push_bin!(c, 4, r.prev_txid);
-        push!(c, 5, U32, r.prev_vout);
-        push!(c, 6, U32, r.script_sig_len);
-        push!(c, 7, U32, r.sequence);
-        push!(c, 8, U32, r.witness_items);
-        push!(c, 9, U32, r.witness_bytes);
-        push!(c, 10, Bool, r.is_coinbase);
-        self.inputs.buffered += 1;
+        self.inputs.append(r);
         if self.inputs.buffered >= self.cfg.batch_size {
             let b = self.inputs.take_batch()?;
             self.inputs_w.write(&b)?;
@@ -405,16 +794,7 @@ impl ParquetSink {
     }
 
     pub fn push_output(&mut self, r: &OutputRow) -> Result<(), SinkError> {
-        let c = &mut self.outputs.cols;
-        push!(c, 0, U32, r.height);
-        push!(c, 1, U32, r.tx_index);
-        push!(c, 2, U32, r.output_index);
-        push_bin!(c, 3, r.txid);
-        push!(c, 4, U64, r.value_sat);
-        push!(c, 5, U32, r.script_pubkey_len);
-        push!(c, 6, U8, r.script_type);
-        push_bin!(c, 7, r.address_hash);
-        self.outputs.buffered += 1;
+        self.outputs.append(r);
         if self.outputs.buffered >= self.cfg.batch_size {
             let b = self.outputs.take_batch()?;
             self.outputs_w.write(&b)?;
@@ -423,18 +803,7 @@ impl ParquetSink {
     }
 
     pub fn push_spend(&mut self, r: &SpendRow) -> Result<(), SinkError> {
-        let c = &mut self.spends.cols;
-        push!(c, 0, U32, r.height);
-        push!(c, 1, U32, r.spending_tx_index);
-        push!(c, 2, U32, r.spending_input_index);
-        push_bin!(c, 3, r.spending_txid);
-        push_bin!(c, 4, r.spent_txid);
-        push!(c, 5, U32, r.spent_vout);
-        push!(c, 6, U64, r.spent_value_sat);
-        push!(c, 7, U8, r.spent_script_type);
-        push_bin!(c, 8, r.spent_address_hash);
-        push!(c, 9, U32, r.spent_height);
-        self.spends.buffered += 1;
+        self.spends.append(r);
         if self.spends.buffered >= self.cfg.batch_size {
             let b = self.spends.take_batch()?;
             self.spends_w.write(&b)?;
@@ -445,64 +814,248 @@ impl ParquetSink {
     /// Append one witness payload row. A no-op unless the sink was created
     /// with `capture_witness`, so callers can push unconditionally.
     pub fn push_witness(&mut self, r: &WitnessRow) -> Result<(), SinkError> {
-        if self.witnesses_w.is_none() {
+        let Some(w) = self.witnesses_w.as_mut() else {
             return Ok(());
-        }
-        let c = &mut self.witnesses.cols;
-        push!(c, 0, U32, r.height);
-        push!(c, 1, U32, r.tx_index);
-        push!(c, 2, U32, r.input_index);
-        push!(c, 3, U32, r.item_index);
-        push!(c, 4, U32, r.item_len);
-        push_blob!(c, 5, &r.item_bytes);
-        self.witnesses.buffered += 1;
+        };
+        self.witnesses.append(r);
         if self.witnesses.buffered >= self.cfg.batch_size {
             let b = self.witnesses.take_batch()?;
-            self.witnesses_w
-                .as_mut()
-                .expect("writer present when capture_witness")
-                .write(&b)?;
+            w.write(&b)?;
         }
         Ok(())
     }
 
-    /// Flush any partial batches and close all entity files.
-    pub fn finish(mut self) -> Result<(), SinkError> {
-        if self.blocks.buffered > 0 {
-            let b = self.blocks.take_batch()?;
-            self.blocks_w.write(&b)?;
-        }
-        if self.txs.buffered > 0 {
-            let b = self.txs.take_batch()?;
-            self.txs_w.write(&b)?;
-        }
-        if self.inputs.buffered > 0 {
-            let b = self.inputs.take_batch()?;
-            self.inputs_w.write(&b)?;
-        }
-        if self.outputs.buffered > 0 {
-            let b = self.outputs.take_batch()?;
-            self.outputs_w.write(&b)?;
-        }
-        if self.spends.buffered > 0 {
-            let b = self.spends.take_batch()?;
-            self.spends_w.write(&b)?;
-        }
-        if self.witnesses.buffered > 0 {
-            let b = self.witnesses.take_batch()?;
-            if let Some(w) = self.witnesses_w.as_mut() {
-                w.write(&b)?;
+    /// Push all rows of an enriched block and flush any full entity row groups
+    /// concurrently across Rayon workers so Zstd encoding on `inputs`,
+    /// `outputs`, `spends`, and `transactions` overlaps instead of serializing
+    /// on a single sink thread.
+    pub fn push_block_rows(
+        &mut self,
+        block: &BlockRow,
+        txs: &[TxRow],
+        inputs: &[InputRow],
+        outputs: &[OutputRow],
+        spends: &[SpendRow],
+        witnesses: &[WitnessRow],
+    ) -> Result<(), SinkError> {
+        let bs = self.cfg.batch_size.max(1);
+        self.blocks.append(block);
+
+        let mut tx_rem = txs;
+        let mut inp_rem = inputs;
+        let mut out_rem = outputs;
+        let mut sp_rem = spends;
+        let mut wit_rem = if self.witnesses_w.is_some() {
+            witnesses
+        } else {
+            &[]
+        };
+
+        loop {
+            let tx_take = tx_rem.len().min(bs.saturating_sub(self.txs.buffered));
+            for r in &tx_rem[..tx_take] {
+                self.txs.append(r);
+            }
+            tx_rem = &tx_rem[tx_take..];
+
+            let inp_take = inp_rem.len().min(bs.saturating_sub(self.inputs.buffered));
+            for r in &inp_rem[..inp_take] {
+                self.inputs.append(r);
+            }
+            inp_rem = &inp_rem[inp_take..];
+
+            let out_take = out_rem.len().min(bs.saturating_sub(self.outputs.buffered));
+            for r in &out_rem[..out_take] {
+                self.outputs.append(r);
+            }
+            out_rem = &out_rem[out_take..];
+
+            let sp_take = sp_rem.len().min(bs.saturating_sub(self.spends.buffered));
+            for r in &sp_rem[..sp_take] {
+                self.spends.append(r);
+            }
+            sp_rem = &sp_rem[sp_take..];
+
+            let wit_take = wit_rem
+                .len()
+                .min(bs.saturating_sub(self.witnesses.buffered));
+            for r in &wit_rem[..wit_take] {
+                self.witnesses.append(r);
+            }
+            wit_rem = &wit_rem[wit_take..];
+
+            self.flush_full_parallel(bs)?;
+
+            if tx_rem.is_empty()
+                && inp_rem.is_empty()
+                && out_rem.is_empty()
+                && sp_rem.is_empty()
+                && wit_rem.is_empty()
+            {
+                break;
             }
         }
-        self.blocks_w.close()?;
-        self.txs_w.close()?;
-        self.inputs_w.close()?;
-        self.outputs_w.close()?;
-        self.spends_w.close()?;
-        if let Some(w) = self.witnesses_w.take() {
-            w.close()?;
-        }
         Ok(())
+    }
+
+    fn flush_full_parallel(&mut self, bs: usize) -> Result<(), SinkError> {
+        let blk_b = (self.blocks.buffered >= bs)
+            .then(|| self.blocks.take_batch())
+            .transpose()?;
+        let tx_b = (self.txs.buffered >= bs)
+            .then(|| self.txs.take_batch())
+            .transpose()?;
+        let inp_b = (self.inputs.buffered >= bs)
+            .then(|| self.inputs.take_batch())
+            .transpose()?;
+        let out_b = (self.outputs.buffered >= bs)
+            .then(|| self.outputs.take_batch())
+            .transpose()?;
+        let sp_b = (self.spends.buffered >= bs)
+            .then(|| self.spends.take_batch())
+            .transpose()?;
+        let wit_b = (self.witnesses_w.is_some() && self.witnesses.buffered >= bs)
+            .then(|| self.witnesses.take_batch())
+            .transpose()?;
+
+        let ready = usize::from(blk_b.is_some())
+            + usize::from(tx_b.is_some())
+            + usize::from(inp_b.is_some())
+            + usize::from(out_b.is_some())
+            + usize::from(sp_b.is_some())
+            + usize::from(wit_b.is_some());
+        if ready == 0 {
+            return Ok(());
+        }
+        if ready == 1 {
+            if let Some(b) = blk_b {
+                self.blocks_w.write(&b)?;
+            }
+            if let Some(b) = tx_b {
+                self.txs_w.write(&b)?;
+            }
+            if let Some(b) = inp_b {
+                self.inputs_w.write(&b)?;
+            }
+            if let Some(b) = out_b {
+                self.outputs_w.write(&b)?;
+            }
+            if let Some(b) = sp_b {
+                self.spends_w.write(&b)?;
+            }
+            if let (Some(b), Some(w)) = (wit_b, self.witnesses_w.as_mut()) {
+                w.write(&b)?;
+            }
+            return Ok(());
+        }
+
+        let blocks_w = &mut self.blocks_w;
+        let txs_w = &mut self.txs_w;
+        let inputs_w = &mut self.inputs_w;
+        let outputs_w = &mut self.outputs_w;
+        let spends_w = &mut self.spends_w;
+        let witnesses_w = &mut self.witnesses_w;
+
+        let mut r_blk = Ok(());
+        let mut r_tx = Ok(());
+        let mut r_inp = Ok(());
+        let mut r_out = Ok(());
+        let mut r_sp = Ok(());
+        let mut r_wit = Ok(());
+
+        rayon::scope(|s| {
+            if let Some(b) = blk_b {
+                let out = &mut r_blk;
+                s.spawn(move |_| *out = blocks_w.write(&b).map_err(SinkError::from));
+            }
+            if let Some(b) = tx_b {
+                let out = &mut r_tx;
+                s.spawn(move |_| *out = txs_w.write(&b).map_err(SinkError::from));
+            }
+            if let Some(b) = inp_b {
+                let out = &mut r_inp;
+                s.spawn(move |_| *out = inputs_w.write(&b).map_err(SinkError::from));
+            }
+            if let Some(b) = out_b {
+                let out = &mut r_out;
+                s.spawn(move |_| *out = outputs_w.write(&b).map_err(SinkError::from));
+            }
+            if let Some(b) = sp_b {
+                let out = &mut r_sp;
+                s.spawn(move |_| *out = spends_w.write(&b).map_err(SinkError::from));
+            }
+            if let (Some(b), Some(w)) = (wit_b, witnesses_w.as_mut()) {
+                let out = &mut r_wit;
+                s.spawn(move |_| *out = w.write(&b).map_err(SinkError::from));
+            }
+        });
+        r_blk?;
+        r_tx?;
+        r_inp?;
+        r_out?;
+        r_sp?;
+        r_wit
+    }
+
+    /// Flush any partial batches and close all entity files concurrently across
+    /// Rayon workers so Zstd page/footer finalization overlaps across all
+    /// tables.
+    pub fn finish(mut self) -> Result<(), SinkError> {
+        let blk_b = (self.blocks.buffered > 0)
+            .then(|| self.blocks.take_batch())
+            .transpose()?;
+        let tx_b = (self.txs.buffered > 0)
+            .then(|| self.txs.take_batch())
+            .transpose()?;
+        let inp_b = (self.inputs.buffered > 0)
+            .then(|| self.inputs.take_batch())
+            .transpose()?;
+        let out_b = (self.outputs.buffered > 0)
+            .then(|| self.outputs.take_batch())
+            .transpose()?;
+        let sp_b = (self.spends.buffered > 0)
+            .then(|| self.spends.take_batch())
+            .transpose()?;
+        let wit_b = (self.witnesses_w.is_some() && self.witnesses.buffered > 0)
+            .then(|| self.witnesses.take_batch())
+            .transpose()?;
+
+        let blocks_w = self.blocks_w;
+        let txs_w = self.txs_w;
+        let inputs_w = self.inputs_w;
+        let outputs_w = self.outputs_w;
+        let spends_w = self.spends_w;
+        let witnesses_w = self.witnesses_w;
+
+        let mut r_blk = Ok(());
+        let mut r_tx = Ok(());
+        let mut r_inp = Ok(());
+        let mut r_out = Ok(());
+        let mut r_sp = Ok(());
+        let mut r_wit = Ok(());
+
+        rayon::scope(|s| {
+            let o_blk = &mut r_blk;
+            s.spawn(move |_| *o_blk = finish_entity(blk_b, blocks_w));
+            let o_tx = &mut r_tx;
+            s.spawn(move |_| *o_tx = finish_entity(tx_b, txs_w));
+            let o_inp = &mut r_inp;
+            s.spawn(move |_| *o_inp = finish_entity(inp_b, inputs_w));
+            let o_out = &mut r_out;
+            s.spawn(move |_| *o_out = finish_entity(out_b, outputs_w));
+            let o_sp = &mut r_sp;
+            s.spawn(move |_| *o_sp = finish_entity(sp_b, spends_w));
+            if let Some(w) = witnesses_w {
+                let o_wit = &mut r_wit;
+                s.spawn(move |_| *o_wit = finish_entity(wit_b, w));
+            }
+        });
+        r_blk?;
+        r_tx?;
+        r_inp?;
+        r_out?;
+        r_sp?;
+        r_wit
     }
 }
 
@@ -776,30 +1329,162 @@ mod tests {
     }
 
     #[test]
-    fn entity_table_new_panics_on_unsupported_column_type() {
-        // `EntityTable::new` supports a fixed set of Arrow types; anything else
-        // (here Utf8) is a programming error and must panic rather than silently
-        // building a table it cannot push into.
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
-        let res = std::panic::catch_unwind(move || {
-            let _ = EntityTable::new(schema);
-        });
-        assert!(
-            res.is_err(),
-            "expected a panic for an unsupported column type"
+    fn push_block_rows_flushes_single_and_multi_entity_batches_in_parallel() {
+        let dir = tmp_dir("push_block_rows");
+        let mut sink = ParquetSink::create(
+            &dir,
+            0,
+            SinkConfig {
+                batch_size: 2,
+                capture_witness: true,
+            },
+        )
+        .unwrap();
+
+        let wit = |h: u32, idx: u32| WitnessRow {
+            height: h,
+            tx_index: idx,
+            input_index: 0,
+            item_index: 0,
+            item_len: 2,
+            item_bytes: vec![0xAA, 0x55],
+        };
+
+        // Call 1 (`batch_size = 2`): 0 entities reach `batch_size` (`ready == 0`),
+        // except `inputs` has 2 rows (`ready == 1`, single-entity fast path).
+        sink.push_block_rows(
+            &block_row(0),
+            &[tx_row(0, 0)],
+            &[input_row(0, 0), input_row(0, 1)],
+            &[output_row(0, 0)],
+            &[spend_row(0, 0)],
+            &[wit(0, 0)],
+        )
+        .unwrap();
+
+        // Call 2: `blocks`, `txs`, `inputs`, `outputs`, `spends`, and `witnesses`
+        // ALL reach `batch_size = 2` (`ready >= 2` parallel Rayon flush), AND
+        // 3 txs / 3 outputs / 3 spends / 3 witnesses overflow into a second loop
+        // iteration (`!rem.is_empty()`), plus a 3rd call exercises single-ready
+        // arms for the remaining entities.
+        sink.push_block_rows(
+            &block_row(1),
+            &[tx_row(1, 0), tx_row(1, 1), tx_row(1, 2)],
+            &[input_row(1, 0), input_row(1, 1)],
+            &[output_row(1, 0), output_row(1, 1), output_row(1, 2)],
+            &[spend_row(1, 0), spend_row(1, 1), spend_row(1, 2)],
+            &[wit(1, 0), wit(1, 1), wit(1, 2)],
+        )
+        .unwrap();
+
+        // Exercise each single-entity `ready == 1` branch individually on a
+        // fresh sink with `batch_size = 2`.
+        sink.finish().unwrap();
+
+        let dir_single = tmp_dir("push_single_ready");
+        let mut s2 = ParquetSink::create(
+            &dir_single,
+            0,
+            SinkConfig {
+                batch_size: 2,
+                capture_witness: true,
+            },
+        )
+        .unwrap();
+        // `blocks` alone hits 2 (`ready == 1` on blocks).
+        s2.push_block_rows(&block_row(0), &[], &[], &[], &[], &[])
+            .unwrap();
+        s2.push_block_rows(&block_row(1), &[], &[], &[], &[], &[])
+            .unwrap();
+        // `txs` alone hits 2 (`ready == 1` on txs).
+        s2.push_block_rows(
+            &block_row(2),
+            &[tx_row(2, 0), tx_row(2, 1)],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        // `outputs` alone hits 2 (`ready == 1` on outputs; blocks is 1->2? No,
+        // blocks is currently 1, so push 3 outputs on call 1 where blocks=0!).
+        s2.push_block_rows(&block_row(3), &[], &[], &[], &[], &[])
+            .unwrap(); // flushes blocks (2) -> blocks buffered = 0
+        s2.push_block_rows(
+            &block_row(4),
+            &[],
+            &[],
+            &[output_row(4, 0), output_row(4, 1)],
+            &[],
+            &[],
+        )
+        .unwrap(); // blocks=1, outputs=2 -> `ready == 1` on outputs!
+        s2.push_block_rows(&block_row(5), &[], &[], &[], &[], &[])
+            .unwrap(); // blocks=2 -> flushes blocks -> blocks=0
+        s2.push_block_rows(
+            &block_row(6),
+            &[],
+            &[],
+            &[],
+            &[spend_row(6, 0), spend_row(6, 1)],
+            &[],
+        )
+        .unwrap(); // blocks=1, spends=2 -> `ready == 1` on spends!
+        s2.push_block_rows(&block_row(7), &[], &[], &[], &[], &[])
+            .unwrap(); // blocks=2 -> flushes blocks -> blocks=0
+        s2.push_block_rows(&block_row(8), &[], &[], &[], &[], &[wit(8, 0), wit(8, 1)])
+            .unwrap(); // blocks=1, witnesses=2 -> `ready == 1` on witnesses!
+                       // Also exercise `capture_witness = false` branch inside `push_block_rows`.
+        s2.finish().unwrap();
+
+        let dir_nowit = tmp_dir("push_nowit");
+        let mut s3 = ParquetSink::create(
+            &dir_nowit,
+            0,
+            SinkConfig {
+                batch_size: 4,
+                capture_witness: false,
+            },
+        )
+        .unwrap();
+        s3.push_block_rows(&block_row(0), &[tx_row(0, 0)], &[], &[], &[], &[wit(0, 0)])
+            .unwrap();
+        s3.finish().unwrap();
+
+        assert_eq!(
+            read_first_batch(dir.join("blocks/part-00000.parquet")).num_rows(),
+            2
         );
+        for entity in ["transactions", "inputs", "outputs", "spends", "witnesses"] {
+            assert_eq!(
+                read_first_batch(dir.join(entity).join("part-00000.parquet")).num_rows(),
+                4,
+                "expected 4 total rows persisted for {entity}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_single);
+        let _ = std::fs::remove_dir_all(&dir_nowit);
     }
 
     #[test]
-    fn writer_props_use_zstd_and_row_group_targets() {
-        // Pin the Parquet tuning so a change to compression or row-group size is
-        // caught here rather than only showing up as a size/throughput shift.
-        use parquet::schema::types::ColumnPath;
+    fn writer_props_use_zstd_selective_dictionary_and_row_group_targets() {
+        // Pin the Parquet tuning so a change to compression, dictionary policy,
+        // or row-group size is caught here rather than only showing up as a
+        // throughput/size regression.
         let props = writer_props(SinkConfig::default().batch_size);
         assert!(matches!(
             props.compression(&ColumnPath::from("height")),
             Compression::ZSTD(_)
         ));
+        // Repeated columns get dictionary encoding; random 32B digests do not.
+        assert!(props.dictionary_enabled(&ColumnPath::from("height")));
+        assert!(props.dictionary_enabled(&ColumnPath::from("script_type")));
+        assert!(props.dictionary_enabled(&ColumnPath::from("address_hash")));
+        assert!(!props.dictionary_enabled(&ColumnPath::from("txid")));
+        assert!(!props.dictionary_enabled(&ColumnPath::from("prev_txid")));
+        assert!(!props.dictionary_enabled(&ColumnPath::from("hash")));
         assert_eq!(props.max_row_group_size(), 250_000);
         assert_eq!(writer_props(0).max_row_group_size(), 1);
     }

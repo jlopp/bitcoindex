@@ -270,6 +270,43 @@ impl ChLoader {
         self.run_query(&sql)
     }
 
+    /// Maximum concurrent `clickhouse-client` streams when uploading Parquet
+    /// parts or backfilling independent derived index tables.
+    pub const UPLOAD_CONCURRENCY: usize = 4;
+    pub const BACKFILL_CONCURRENCY: usize = 4;
+
+    /// Upload a single Parquet file to `entity` over `clickhouse-client` stdin.
+    pub fn upload_parquet_file(&self, entity: &str, path: &Path) -> Result<(), LoadError> {
+        let sql = format!("INSERT INTO {}.{entity} FORMAT Parquet", self.cfg.database);
+        let input = std::fs::File::open(path)?;
+        let out = std::process::Command::new(&self.client)
+            .args(self.base_args())
+            .arg(format!("--query={sql}"))
+            .stdin(input)
+            .output()?;
+        if !out.status.success() {
+            return Err(LoadError::Client(format!(
+                "upload of {} failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    fn collect_parquet_files(dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
+        let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        files.sort_unstable();
+        Ok(files)
+    }
+
     /// Upload every part file for an entity from the *client* side: each file
     /// is streamed to `INSERT INTO ... FORMAT Parquet` over the client's
     /// stdin. Unlike [`load_entity`](Self::load_entity) this needs no access to
@@ -277,31 +314,9 @@ impl ChLoader {
     /// remote cluster. Files are sent in name order (part files are named by
     /// block range). Returns the number of files uploaded.
     pub fn upload_entity(&self, entity: &str, parquet_dir: &Path) -> Result<usize, LoadError> {
-        let dir = parquet_dir.join(entity);
-        let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-                .collect(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e.into()),
-        };
-        files.sort_unstable();
-        let sql = format!("INSERT INTO {}.{entity} FORMAT Parquet", self.cfg.database);
+        let files = Self::collect_parquet_files(&parquet_dir.join(entity))?;
         for path in &files {
-            let input = std::fs::File::open(path)?;
-            let out = std::process::Command::new(&self.client)
-                .args(self.base_args())
-                .arg(format!("--query={sql}"))
-                .stdin(input)
-                .output()?;
-            if !out.status.success() {
-                return Err(LoadError::Client(format!(
-                    "upload of {} failed: {}",
-                    path.display(),
-                    String::from_utf8_lossy(&out.stderr)
-                )));
-            }
+            self.upload_parquet_file(entity, path)?;
         }
         Ok(files.len())
     }
@@ -310,63 +325,106 @@ impl ChLoader {
         self.load_all_with(parquet_dir, LoadMode::ServerFile)
     }
 
-    /// Load every base entity (plus the optional witness table) using `mode`,
-    /// with the derived index tables built once at the end rather than row by
-    /// row.
-    ///
-    /// The materialized views are dropped for the duration of the load so the
-    /// base inserts are plain appends: with the views live, each base row fans
-    /// out into up to six derived-table writes, so a full-chain load performs
-    /// many times the base row count in independent insert operations. The
-    /// views are recreated and the derived tables refilled by
-    /// [`schema::backfill_derived_indexes`] after the base entities are in.
-    ///
-    /// This is valid because a bulk load starts from an empty database: the
-    /// derived tables are truncated and rebuilt from the base tables, so any
-    /// pre-existing content in them would be discarded. Live mode never calls
-    /// this path — it keeps the views live and appends through `live_insert`.
-    pub fn load_all_with(&self, parquet_dir: &Path, mode: LoadMode) -> Result<(), LoadError> {
-        let load = |entity: &str| -> Result<(), LoadError> {
+    /// Prepare ClickHouse for a bulk or pipelined-streaming load by dropping
+    /// all materialized views in one batch so base-table inserts do not fan out
+    /// into derived-table writes on every row.
+    pub fn begin_streaming_load(&self) -> Result<(), LoadError> {
+        tracing::info!("dropping materialized views for a deferred derived-index build");
+        self.run_multiquery(&schema::drop_materialized_views(&self.cfg.database))
+    }
+
+    /// Load a single completed part (`part-{part_id:05}.parquet`) across all
+    /// base entities (plus `witnesses` when `capture_witness` is set) in
+    /// parallel, optionally unlinking each part file once ClickHouse confirms
+    /// ingestion so `bidx parse --stream-clickhouse --unlink-loaded-parts`
+    /// overlaps ClickHouse ingestion with RocksDB indexing and halves disk use.
+    pub fn load_part(
+        &self,
+        parquet_dir: &Path,
+        part_id: u32,
+        capture_witness: bool,
+        mode: LoadMode,
+        unlink_after: bool,
+    ) -> Result<(), LoadError> {
+        let mut entities: Vec<&'static str> = schema::ENTITIES.to_vec();
+        if capture_witness {
+            entities.push(schema::WITNESS_ENTITY);
+        }
+        let file_name = format!("part-{part_id:05}.parquet");
+        run_parallel(entities, 6, |entity| {
+            let path = parquet_dir.join(entity).join(&file_name);
             match mode {
-                LoadMode::ServerFile => self.load_entity(entity, parquet_dir),
+                LoadMode::ServerFile => {
+                    let sql = format!(
+                        "INSERT INTO {db}.{entity} SELECT * FROM file('{p}', Parquet)",
+                        db = self.cfg.database,
+                        p = path.display(),
+                    );
+                    self.run_query(&sql)?;
+                }
                 LoadMode::Upload => {
-                    let n = self.upload_entity(entity, parquet_dir)?;
-                    tracing::info!(entity, files = n, "uploaded");
-                    Ok(())
+                    self.upload_parquet_file(entity, &path)?;
                 }
             }
-        };
+            if unlink_after {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(())
+        })
+    }
 
-        // Turn the derived-write fan-out off for the load (see the doc comment).
-        tracing::info!("dropping materialized views for a deferred derived-index build");
-        for stmt in schema::drop_materialized_views(&self.cfg.database) {
-            self.run_query(&stmt)?;
-        }
+    /// Finalize a bulk or pipelined-streaming load by building all independent
+    /// derived index tables in parallel from the base tables, then recreating
+    /// the materialized views for subsequent live tracking.
+    pub fn finish_streaming_load(&self) -> Result<(), LoadError> {
+        tracing::info!("building derived index tables in parallel from the base tables");
+        let groups = schema::backfill_derived_index_groups(&self.cfg.database);
+        run_parallel(groups, Self::BACKFILL_CONCURRENCY, |grp| {
+            self.run_multiquery(&grp)
+        })?;
+        tracing::info!("recreating materialized views for live tracking");
+        self.run_multiquery(&schema::materialized_views(&self.cfg.database))
+    }
 
-        for entity in schema::ENTITIES {
-            tracing::info!(entity, "loading into ClickHouse");
-            load(entity)?;
-        }
-        // The witness payload table is optional: a normal `parse` does not
-        // produce it, so only load it when the directory is present.
-        let wit_dir = parquet_dir.join(schema::WITNESS_ENTITY);
-        if wit_dir.is_dir() {
-            let entity = schema::WITNESS_ENTITY;
-            tracing::info!(entity, "loading optional witness payload table");
-            load(entity)?;
+    /// Load every base entity (plus the optional witness table) using `mode`,
+    /// parallelizing base-table loads/uploads and derived-index backfills across
+    /// concurrent ClickHouse connections while materialized views are dropped.
+    pub fn load_all_with(&self, parquet_dir: &Path, mode: LoadMode) -> Result<(), LoadError> {
+        self.begin_streaming_load()?;
+
+        let mut entities: Vec<&'static str> = schema::ENTITIES.to_vec();
+        if parquet_dir.join(schema::WITNESS_ENTITY).is_dir() {
+            tracing::info!("loading optional witness payload table");
+            entities.push(schema::WITNESS_ENTITY);
         } else {
             tracing::info!("no witness payload output present; skipping witnesses table");
         }
 
-        // Build every derived index table in one pass from the base tables,
-        // then restore the views so live tracking keeps them up to date.
-        tracing::info!("building derived index tables from the base tables");
-        self.run_multiquery(&schema::backfill_derived_indexes(&self.cfg.database))?;
-        tracing::info!("recreating materialized views for live tracking");
-        for stmt in schema::materialized_views(&self.cfg.database) {
-            self.run_query(&stmt)?;
+        match mode {
+            LoadMode::ServerFile => {
+                run_parallel(entities, 6, |entity| {
+                    tracing::info!(entity, "loading into ClickHouse");
+                    self.load_entity(entity, parquet_dir)
+                })?;
+            }
+            LoadMode::Upload => {
+                // Flatten `(entity, part_path)` across all entities so a pool
+                // of `UPLOAD_CONCURRENCY` streams stays saturated on the large
+                // `inputs`/`outputs`/`spends` tables instead of serializing
+                // one entity or one part file at a time.
+                let mut tasks: Vec<(&'static str, PathBuf)> = Vec::new();
+                for entity in entities {
+                    for path in Self::collect_parquet_files(&parquet_dir.join(entity))? {
+                        tasks.push((entity, path));
+                    }
+                }
+                run_parallel(tasks, Self::UPLOAD_CONCURRENCY, |(entity, path)| {
+                    self.upload_parquet_file(entity, &path)
+                })?;
+            }
         }
-        Ok(())
+
+        self.finish_streaming_load()
     }
 
     /// Refresh one backfilled index. Only the *SQL-only* backfill indexes are
@@ -388,59 +446,258 @@ impl ChLoader {
         }
     }
 
-    /// Rows per `INSERT` when rebuilding `address_prefix`. Each rendered row is
-    /// ~130 bytes of SQL, and the statement is passed to `clickhouse-client` as
-    /// a single `--query=` argv element, which Linux caps at 128 KiB
-    /// (`MAX_ARG_STRLEN`). 500 keeps the statement well under that while still
-    /// batching enough for ClickHouse to write efficiently.
+    /// Rows buffered per streaming `RowBinary` flush when rebuilding
+    /// `address_prefix`.
     pub const ADDRESS_PREFIX_BATCH: usize = 500;
 
-    /// Rebuild the `address_prefix` index. ClickHouse cannot encode
-    /// base58/bech32 addresses, so this streams the distinct
-    /// `(script_type, address_hash)` pairs out of `outputs`, renders each with
-    /// `render` (the serving layer's codec), and inserts the results back in
-    /// batches. `render` returns `None` for a pair with no address form, which
-    /// is skipped.
-    ///
-    /// Returns the number of addresses inserted. Idempotent: the table is
-    /// truncated first, so a re-run replaces its contents.
+    /// Rebuild the `address_prefix` index by streaming distinct
+    /// `(script_type, address_hash)` rows line-by-line out of `outputs` in
+    /// bounded \(O(1)\) memory and writing rendered rows in `RowBinary` format
+    /// into a single persistent `clickhouse-client` insert pipe (avoiding both
+    /// buffering ~68 GiB of TSV in RAM and spawning millions of client
+    /// processes).
     pub fn rebuild_address_prefix<F>(&self, render: F) -> Result<usize, LoadError>
     where
         F: Fn(u8, &[u8; 32]) -> Option<String>,
     {
+        self.rebuild_address_prefix_chunked(|chunk, rb_buf| {
+            let mut n = 0usize;
+            for &(ty, ref hash) in chunk {
+                if let Some(addr) = render(ty, hash) {
+                    rowbinary::address_prefix(&addr, ty, hash, rb_buf);
+                    n += 1;
+                }
+            }
+            n
+        })
+    }
+
+    /// Like [`ChLoader::rebuild_address_prefix`], but renders each chunk of
+    /// base58/bech32 addresses in parallel across Rayon worker threads.
+    pub fn rebuild_address_prefix_par<F>(&self, render: F) -> Result<usize, LoadError>
+    where
+        F: Fn(u8, &[u8; 32]) -> Option<String> + Sync,
+    {
+        use rayon::prelude::*;
+        let map_fn = |(ty, hash): &(u8, [u8; 32])| render(*ty, hash);
+        let mut rendered: Vec<Option<String>> = Vec::with_capacity(Self::ADDRESS_PREFIX_BATCH);
+        self.rebuild_address_prefix_chunked(|chunk, rb_buf| {
+            chunk.par_iter().map(map_fn).collect_into_vec(&mut rendered);
+            let mut n = 0usize;
+            for ((ty, hash), maybe_addr) in chunk.iter().zip(rendered.drain(..)) {
+                if let Some(addr) = maybe_addr {
+                    rowbinary::address_prefix(&addr, *ty, hash, rb_buf);
+                    n += 1;
+                }
+            }
+            n
+        })
+    }
+
+    fn spawn_address_prefix_sink(
+        &self,
+        db: &str,
+    ) -> Result<(std::process::Child, std::process::ChildStdin), LoadError> {
+        use std::process::{Command, Stdio};
+        let mut args = self.base_args();
+        args.push(format!(
+            "--query=INSERT INTO {db}.address_prefix ({}) FORMAT RowBinary",
+            rowbinary::ADDRESS_PREFIX_COLS
+        ));
+        let mut child = Command::new(&self.client)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // coverage-exempt — `child` is spawned with `Stdio::piped()` for stdin, so `take()` always returns `Some`.
+        let Some(stdin) = child.stdin.take() else {
+            return Err(LoadError::Client(
+                "could not open stdin for address_prefix insert".into(),
+            ));
+        };
+        Ok((child, stdin))
+    }
+
+    fn flush_address_prefix_chunk<C>(
+        &self,
+        db: &str,
+        chunk: &mut Vec<(u8, [u8; 32])>,
+        rb_buf: &mut Vec<u8>,
+        sink: &mut Option<(std::process::Child, std::process::ChildStdin)>,
+        encode_chunk: &mut C,
+    ) -> Result<usize, LoadError>
+    where
+        C: FnMut(&[(u8, [u8; 32])], &mut Vec<u8>) -> usize,
+    {
+        use std::io::Write;
+        if chunk.is_empty() {
+            return Ok(0);
+        }
+        rb_buf.clear();
+        let count = encode_chunk(chunk, rb_buf);
+        chunk.clear();
+        if count == 0 {
+            return Ok(0);
+        }
+        if sink.is_none() {
+            *sink = Some(self.spawn_address_prefix_sink(db)?);
+        }
+        if let Some((_, ref mut stdin)) = sink {
+            stdin
+                .write_all(rb_buf)
+                .map_err(|e| LoadError::Client(format!("write to address_prefix failed: {e}")))?;
+        }
+        Ok(count)
+    }
+
+    fn rebuild_address_prefix_chunked<C>(&self, mut encode_chunk: C) -> Result<usize, LoadError>
+    where
+        C: FnMut(&[(u8, [u8; 32])], &mut Vec<u8>) -> usize,
+    {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, ChildStdin, Command, Stdio};
+
         let db = self.cfg.database.clone();
         self.run_query(&format!("TRUNCATE TABLE {db}.address_prefix"))?;
-        let rows = self.query_scalar(&schema::address_prefix_source(&db))?;
 
-        let mut batch: Vec<(String, u8, String)> = Vec::with_capacity(Self::ADDRESS_PREFIX_BATCH);
+        let mut src_args = self.base_args();
+        src_args.push(format!("--query={}", schema::address_prefix_source(&db)));
+        let mut src_child = Command::new(&self.client)
+            .args(src_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // coverage-exempt — `src_child` is spawned with `Stdio::piped()` for stdout, so `take()` always returns `Some`.
+        let Some(stdout) = src_child.stdout.take() else {
+            return Err(LoadError::Client(
+                "could not open stdout for address_prefix source".into(),
+            ));
+        };
+
+        let mut sink: Option<(Child, ChildStdin)> = None;
+        let mut chunk: Vec<(u8, [u8; 32])> = Vec::with_capacity(Self::ADDRESS_PREFIX_BATCH);
+        let mut rb_buf: Vec<u8> = Vec::with_capacity(Self::ADDRESS_PREFIX_BATCH * 80);
         let mut inserted = 0usize;
-        for line in rows.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let stream_res: Result<(), LoadError> = (|| {
+            while reader.read_line(&mut line)? != 0 {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let (ty_str, hash_hex) = trimmed.split_once('\t').ok_or_else(|| {
+                        LoadError::Client(format!("malformed address_prefix row: {trimmed:?}"))
+                    })?;
+                    let ty: u8 = ty_str.trim().parse().map_err(|_| {
+                        LoadError::Client(format!(
+                            "bad script_type in address_prefix row: {trimmed:?}"
+                        ))
+                    })?;
+                    let hash = parse_hash32(hash_hex.trim())?;
+                    chunk.push((ty, hash));
+                    if chunk.len() >= Self::ADDRESS_PREFIX_BATCH {
+                        inserted += self.flush_address_prefix_chunk(
+                            &db,
+                            &mut chunk,
+                            &mut rb_buf,
+                            &mut sink,
+                            &mut encode_chunk,
+                        )?;
+                    }
+                }
+                line.clear();
             }
-            let (ty_str, hash_hex) = line.split_once('\t').ok_or_else(|| {
-                LoadError::Client(format!("malformed address_prefix row: {line:?}"))
-            })?;
-            let ty: u8 = ty_str.trim().parse().map_err(|_| {
-                LoadError::Client(format!("bad script_type in address_prefix row: {line:?}"))
-            })?;
-            let hash = parse_hash32(hash_hex.trim())?;
-            let Some(addr) = render(ty, &hash) else {
-                continue;
-            };
-            batch.push((addr, ty, hash_hex.trim().to_ascii_lowercase()));
-            if batch.len() >= Self::ADDRESS_PREFIX_BATCH {
-                self.run_query(&schema::insert_address_prefix(&db, &batch))?;
-                inserted += batch.len();
-                batch.clear();
+            inserted += self.flush_address_prefix_chunk(
+                &db,
+                &mut chunk,
+                &mut rb_buf,
+                &mut sink,
+                &mut encode_chunk,
+            )?;
+            Ok(())
+        })();
+
+        drop(reader);
+        if let Err(err) = stream_res {
+            let _ = src_child.kill();
+            let _ = src_child.wait();
+            if let Some((mut child, stdin)) = sink.take() {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
             }
+            return Err(err);
         }
-        if !batch.is_empty() {
-            self.run_query(&schema::insert_address_prefix(&db, &batch))?;
-            inserted += batch.len();
+
+        let src_out = src_child.wait_with_output()?;
+        if !src_out.status.success() {
+            if let Some((mut child, stdin)) = sink.take() {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(LoadError::Client(
+                String::from_utf8_lossy(&src_out.stderr).into_owned(),
+            ));
+        }
+
+        if let Some((child, stdin)) = sink.take() {
+            drop(stdin);
+            let sink_out = child.wait_with_output()?;
+            if !sink_out.status.success() {
+                return Err(LoadError::Client(
+                    String::from_utf8_lossy(&sink_out.stderr).into_owned(),
+                ));
+            }
         }
         Ok(inserted)
+    }
+}
+
+/// Run `items` across up to `concurrency` scoped worker threads, stopping early
+/// and returning the first error if any task fails.
+fn run_parallel<T, F>(items: Vec<T>, concurrency: usize, f: F) -> Result<(), LoadError>
+where
+    T: Send,
+    F: Fn(T) -> Result<(), LoadError> + Sync,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    if items.is_empty() {
+        return Ok(());
+    }
+    let workers = concurrency.max(1).min(items.len());
+    let queue: Mutex<std::collections::VecDeque<T>> = Mutex::new(items.into());
+    let failed = AtomicBool::new(false);
+    let first_err: Mutex<Option<LoadError>> = Mutex::new(None);
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let next = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                    let Some(item) = next else {
+                        return;
+                    };
+                    if let Err(e) = f(item) {
+                        failed.store(true, Ordering::Relaxed);
+                        let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -1201,6 +1458,7 @@ mod tests {
             format!(
                 "#!/bin/sh\n\
                  for a in \"$@\"; do case \"$a\" in --query=*DISTINCT*script_type*) printf '%s' '{rows}'; exit 0;; esac; done\n\
+                 for a in \"$@\"; do case \"$a\" in --query=*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
                  for a in \"$@\"; do case \"$a\" in --query=*) echo \"$a\";; esac; done\n\
                  exit 0\n"
             )
@@ -1374,5 +1632,201 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn run_parallel_handles_empty_success_and_concurrent_errors() {
+        run_parallel(Vec::<usize>::new(), 4, |_| Ok(())).unwrap();
+
+        let sum = std::sync::atomic::AtomicUsize::new(0);
+        run_parallel((1usize..=8).collect(), 3, |v| {
+            sum.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sum.load(std::sync::atomic::Ordering::Relaxed), 36);
+
+        // Concurrent failure path: workers 0 and 1 fail simultaneously (racing
+        // `slot.is_none()`) while worker 2 finishes `Ok(())` afterward and
+        // observes `!failed.load(...) == false` on the next loop iteration.
+        let barrier = std::sync::Barrier::new(3);
+        let err = run_parallel((0usize..16).collect(), 3, |i| {
+            if i < 3 {
+                barrier.wait();
+            }
+            if i == 2 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                return Ok(());
+            }
+            Err(LoadError::Client(format!("boom-{i}")))
+        })
+        .unwrap_err();
+        assert!(matches!(err, LoadError::Client(m) if m.starts_with("boom-")));
+    }
+
+    #[test]
+    fn load_part_streams_or_loads_server_files_and_optionally_unlinks() {
+        let _g = fork_guard();
+        let client = upload_client("part-stream", false);
+        let loader = loader_with(client.clone());
+        let root = parquet_tree("part-stream", true);
+
+        // ServerFile without unlinking keeps part-00000.parquet intact.
+        loader
+            .load_part(&root, 0, true, LoadMode::ServerFile, false)
+            .unwrap();
+        assert!(root.join("blocks/part-00000.parquet").exists());
+        assert!(root.join("witnesses/part-00000.parquet").exists());
+
+        // Upload with `unlink_after = true` deletes every loaded part-00000
+        // file while leaving part-00001 untouched.
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+        loader
+            .load_part(&root, 0, true, LoadMode::Upload, true)
+            .unwrap();
+        let log = read_log(&client);
+        for entity in schema::ENTITIES {
+            assert!(
+                log.contains(&format!(
+                    "INSERT INTO db.{entity} FORMAT Parquet|{entity}-0"
+                )),
+                "{log}"
+            );
+            assert!(!root.join(entity).join("part-00000.parquet").exists());
+            assert!(root.join(entity).join("part-00001.parquet").exists());
+        }
+        assert!(log.contains("INSERT INTO db.witnesses FORMAT Parquet|wit-0"));
+        assert!(!root.join("witnesses/part-00000.parquet").exists());
+
+        // Also cover `capture_witness = false` on part 1.
+        loader
+            .load_part(&root, 1, false, LoadMode::ServerFile, true)
+            .unwrap();
+        assert!(!root.join("blocks/part-00001.parquet").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+        let _ = std::fs::remove_file(&client);
+    }
+
+    #[test]
+    fn load_all_with_upload_handles_empty_parquet_dir_and_bad_entity_entry() {
+        let _g = fork_guard();
+        let client = upload_client("empty-all", false);
+        let loader = loader_with(client.clone());
+        let empty = std::env::temp_dir().join(format!("bidx-up-empty-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        loader.load_all_with(&empty, LoadMode::Upload).unwrap();
+
+        // A file where an entity dir should be propagates `LoadError::Io`.
+        std::fs::write(empty.join("blocks"), "not-a-dir").unwrap();
+        assert!(matches!(
+            loader.load_all_with(&empty, LoadMode::Upload),
+            Err(LoadError::Io(_))
+        ));
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_file(format!("{}.log", client.display()));
+        let _ = std::fs::remove_file(&client);
+    }
+
+    #[test]
+    fn rebuild_address_prefix_par_and_streaming_error_paths() {
+        let _g = fork_guard();
+        use std::os::unix::fs::PermissionsExt;
+
+        let row_ok = format!("2\t{}\n", "ab".repeat(32));
+        let row_skip = format!("7\t{}\n", "00".repeat(32));
+        let mut body = row_ok.repeat(ChLoader::ADDRESS_PREFIX_BATCH + 3);
+        body.push_str(&row_skip);
+
+        let client = fake_prefix_client("par-ok", &body, false);
+        let loader = loader_with(client.clone());
+        let n = loader
+            .rebuild_address_prefix_par(|ty, hash| match ty {
+                2 => Some(format!("1par{}", hash[0])),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(n, ChLoader::ADDRESS_PREFIX_BATCH + 3);
+
+        // Chunk where every row renders to `None` must not spawn an INSERT.
+        let none_n = loader.rebuild_address_prefix_par(|_, _| None).unwrap();
+        assert_eq!(none_n, 0);
+        let _ = std::fs::remove_file(&client);
+
+        let write_script = |tag: &str, script: String| -> PathBuf {
+            let p =
+                std::env::temp_dir().join(format!("bidx-prefix-err-{tag}-{}", std::process::id()));
+            let tmp = std::env::temp_dir()
+                .join(format!("bidx-prefix-err-{tag}-{}-tmp", std::process::id()));
+            std::fs::write(&tmp, script).unwrap();
+            let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&tmp, perms).unwrap();
+            std::fs::rename(&tmp, &p).unwrap();
+            p
+        };
+
+        // 1) Mid-stream malformed row AFTER batch 1 already spawned `sink`.
+        let mid_bad_rows = format!("{}garbage\n", row_ok.repeat(ChLoader::ADDRESS_PREFIX_BATCH));
+        let mid_bad = fake_prefix_client("mid-bad", &mid_bad_rows, false);
+        assert!(matches!(
+            loader_with(mid_bad.clone()).rebuild_address_prefix(|_, _| Some("1x".into())),
+            Err(LoadError::Client(m)) if m.contains("malformed")
+        ));
+        let _ = std::fs::remove_file(&mid_bad);
+
+        // 2) Source query exits non-zero AFTER batch 1 already spawned `sink`.
+        let src_fail = write_script(
+            "src-fail",
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do case \"$a\" in --query=*DISTINCT*script_type*) printf '%s' '{}'; echo 'src died' >&2; exit 1;; esac; done\n\
+                 for a in \"$@\"; do case \"$a\" in --query=*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
+                 exit 0\n",
+                row_ok.repeat(ChLoader::ADDRESS_PREFIX_BATCH)
+            ),
+        );
+        assert!(matches!(
+            loader_with(src_fail.clone()).rebuild_address_prefix(|_, _| Some("1x".into())),
+            Err(LoadError::Client(m)) if m.contains("src died")
+        ));
+        let _ = std::fs::remove_file(&src_fail);
+
+        // 3) Sink `FORMAT RowBinary` exits non-zero at EOF.
+        let sink_fail = write_script(
+            "sink-fail",
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do case \"$a\" in --query=*DISTINCT*script_type*) printf '%s' '{row_ok}'; exit 0;; esac; done\n\
+                 for a in \"$@\"; do case \"$a\" in --query=*FORMAT*RowBinary*) cat >/dev/null; echo 'sink died' >&2; exit 1;; esac; done\n\
+                 exit 0\n"
+            ),
+        );
+        assert!(matches!(
+            loader_with(sink_fail.clone()).rebuild_address_prefix(|_, _| Some("1x".into())),
+            Err(LoadError::Client(m)) if m.contains("sink died")
+        ));
+        let _ = std::fs::remove_file(&sink_fail);
+
+        // 4) Sink closes stdin immediately while >64 KiB of batches stream in
+        //    (`BrokenPipe` on `stdin.write_all`).
+        let long_addr = "1".repeat(256);
+        let many_rows = row_ok.repeat(ChLoader::ADDRESS_PREFIX_BATCH * 3);
+        let pipe_fail = write_script(
+            "pipe-fail",
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do case \"$a\" in --query=*DISTINCT*script_type*) printf '%s' '{many_rows}'; exit 0;; esac; done\n\
+                 for a in \"$@\"; do case \"$a\" in --query=*FORMAT*RowBinary*) exit 1;; esac; done\n\
+                 exit 0\n"
+            ),
+        );
+        assert!(matches!(
+            loader_with(pipe_fail.clone()).rebuild_address_prefix(|_, _| Some(long_addr.clone())),
+            Err(LoadError::Client(_))
+        ));
+        let _ = std::fs::remove_file(&pipe_fail);
     }
 }

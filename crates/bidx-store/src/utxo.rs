@@ -580,10 +580,18 @@ fn read_varint(b: &mut &[u8]) -> Option<u64> {
     }
 }
 
+#[derive(Default)]
+struct ApplyScratch {
+    pending: FxHashMap<[u8; 36], UtxoValue>,
+    misses: Vec<(usize, [u8; 36])>,
+    resolved: Vec<Option<(UtxoValue, bool)>>,
+    same_block: FxHashSet<[u8; 36]>,
+}
+
 pub struct UtxoStore {
     db: DB,
     path: PathBuf,
-    pending: Mutex<FxHashMap<[u8; 36], UtxoValue>>,
+    scratch: Mutex<ApplyScratch>,
     /// Bounded in-memory cache of the most recently created UTXOs. `None` when
     /// disabled (undo-enabled/live mode, where correctness is worth more than
     /// speed, and benchmarking the baseline). See `RecentUtxoCache`.
@@ -884,6 +892,7 @@ fn tuned_options(
     // hundreds of SSTs, and pinning all of them prevented `set_capacity` from
     // shrinking the cache under memory pressure.
     let mut block_opts = rocksdb::BlockBasedOptions::default();
+    block_opts.set_format_version(5);
     block_opts.set_block_cache(block_cache);
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_bloom_filter(10.0, false);
@@ -1172,7 +1181,7 @@ impl UtxoStore {
         Ok(UtxoStore {
             db,
             path: path.to_path_buf(),
-            pending: Mutex::new(FxHashMap::default()),
+            scratch: Mutex::new(ApplyScratch::default()),
             recent: if recent_cache_bytes > 0 {
                 Some(Mutex::new(RecentUtxoCache::new(recent_cache_bytes)))
             } else {
@@ -1208,20 +1217,35 @@ impl UtxoStore {
         inputs: &[InputRow],
         outputs: &[OutputRow],
     ) -> Result<SpendResult, UtxoError> {
-        let mut pending = self.pending.lock();
+        let mut scratch = self.scratch.lock();
+        let ApplyScratch {
+            pending,
+            misses,
+            resolved,
+            same_block,
+        } = &mut *scratch;
         pending.clear();
+        misses.clear();
+        resolved.clear();
+        resolved.resize(inputs.len(), None);
+        same_block.clear();
 
         let mut batch = WriteBatch::default();
         let mut spends = Vec::with_capacity(inputs.len());
         let mut fees = vec![0u64; txs.len()];
         let mut missing = 0u64;
         let mut undo = BlockUndo::default();
-        // Outpoints created *and* spent inside this block. Populated during the
-        // input loop, applied to `undo.created` once at the end. Using a set
-        // here is what removes the quadratic scan from the input loop.
-        let mut same_block: FxHashSet<[u8; 36]> = FxHashSet::default();
 
         for out in outputs {
+            // Consensus-unspendable OP_RETURN outputs (`0x6a`, ScriptType::OpReturn)
+            // can never be spent by any future input. Skipping them here keeps
+            // >130M permanently unspendable entries out of `RecentUtxoCache`,
+            // `WriteBatch`, `BlockUndo`, and RocksDB SSTs/Bloom filters while
+            // fee subtraction over `outputs` below still accounts for any
+            // burned satoshis on `out.value_sat`.
+            if out.script_type == bidx_core::ScriptType::OpReturn as u8 {
+                continue;
+            }
             let key = make_key(&out.txid, out.output_index);
             pending.insert(
                 key,
@@ -1237,65 +1261,72 @@ impl UtxoStore {
             }
         }
 
-        // H2 instrumentation: how many inputs needed a database read at all,
-        // and how much wall time those reads cost. This is the measurement that
-        // decides whether the prefetch below is worth having.
         let mut db_lookups = 0u64;
         let mut db_nanos = 0u64;
         let mut pending_hits = 0u64;
         let mut cache_hits = 0u64;
 
-        for inp in inputs {
-            if inp.is_coinbase {
-                continue;
+        // Pass 1: resolve same-block (`pending`) and recent-cache hits under a
+        // single cache lock acquisition, collecting only genuine DB misses.
+        {
+            let mut recent_guard = self.recent.as_ref().map(|c| c.lock());
+            for (idx, inp) in inputs.iter().enumerate() {
+                if inp.is_coinbase {
+                    continue;
+                }
+                let key = make_key(&inp.prev_txid, inp.prev_vout);
+                if let Some(v) = pending.remove(&key) {
+                    if self.undo_enabled {
+                        same_block.insert(key);
+                    }
+                    pending_hits += 1;
+                    resolved[idx] = Some((v, false));
+                } else if let Some(v) = recent_guard.as_mut().and_then(|c| c.remove(&key)) {
+                    cache_hits += 1;
+                    batch.delete(key);
+                    resolved[idx] = Some((v, false));
+                } else {
+                    misses.push((idx, key));
+                }
             }
-            let key = make_key(&inp.prev_txid, inp.prev_vout);
-            if let Some(v) = pending.remove(&key) {
-                // Same-block spend: removed from pending, never hits the DB.
-                // On disconnect, the created-outpoint deletion handles it, so
-                // we drop it from `undo.created` to avoid a dangling delete.
-                if self.undo_enabled {
-                    // Mark it spent-in-block rather than doing a linear scan of
-                    // `undo.created` here. The scan made this loop O(outputs x
-                    // spent-inputs) — quadratic in block size, on the hottest
-                    // path in the indexer (a 4k-tx block is ~16M comparisons).
-                    // `same_block` is reconciled into `created` once, below.
-                    same_block.insert(key);
-                }
-                pending_hits += 1;
-                record_spend(&mut spends, &mut fees, height, inp, v);
-            } else {
-                // Cache-first: a recently created output can be answered from
-                // memory instead of a RocksDB point lookup. On a miss we fall
-                // through to the database, which is the baseline path.
-                if let Some(ref cache) = self.recent {
-                    if let Some(v) = cache.lock().remove(&key) {
-                        cache_hits += 1;
-                        batch.delete(key);
-                        record_spend(&mut spends, &mut fees, height, inp, v);
-                        continue;
-                    }
-                }
-                db_lookups += 1;
-                let t0 = std::time::Instant::now();
-                let got = self.db.get_pinned(key);
-                db_nanos += t0.elapsed().as_nanos() as u64;
+        }
+
+        // Pass 2: issue one key-sorted `batched_multi_get_cf` across all DB
+        // misses (with `recent_guard` already dropped so no Mutex is held
+        // across NVMe I/O). Sorting lets RocksDB share SST index/Bloom checks
+        // and dispatch high-queue-depth reads across L0/bottommost files.
+        if !misses.is_empty() {
+            db_lookups = misses.len() as u64;
+            misses.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+            let sorted_unique = misses.windows(2).all(|w| w[0].1 < w[1].1);
+            let cf = self.cf_utxo();
+            let t0 = std::time::Instant::now();
+            let results =
+                self.db
+                    .batched_multi_get_cf(&cf, misses.iter().map(|(_, k)| k), sorted_unique);
+            db_nanos = t0.elapsed().as_nanos() as u64;
+            for (&(idx, key), got) in misses.iter().zip(results) {
                 match got? {
-                    Some(bytes) => {
-                        if let Some(v) = UtxoValue::decode(bytes.as_ref()) {
+                    Some(bytes) => match UtxoValue::decode(bytes.as_ref()) {
+                        Some(v) => {
                             batch.delete(key);
-                            if self.undo_enabled {
-                                undo.spent.push((key, v));
-                            }
-                            record_spend(&mut spends, &mut fees, height, inp, v);
-                        } else {
-                            missing += 1;
+                            resolved[idx] = Some((v, true));
                         }
-                    }
-                    None => {
-                        missing += 1;
-                    }
+                        None => missing += 1,
+                    },
+                    None => missing += 1,
                 }
+            }
+        }
+
+        // Pass 3: emit `spends`, `fees`, and `undo.spent` in exact input order.
+        for (idx, inp) in inputs.iter().enumerate() {
+            if let Some((v, from_db)) = resolved[idx] {
+                if from_db && self.undo_enabled {
+                    undo.spent
+                        .push((make_key(&inp.prev_txid, inp.prev_vout), v));
+                }
+                record_spend(&mut spends, &mut fees, height, inp, v);
             }
         }
 
@@ -3110,5 +3141,78 @@ mod tests {
     fn format_property_reports_unavailable_for_a_missing_value() {
         assert_eq!(format_property(Some("123".to_string())), "123");
         assert_eq!(format_property(None), "unavailable");
+    }
+
+    #[test]
+    fn op_return_outputs_skip_utxo_store_and_cache_while_preserving_fees_and_sorted_multiget_order()
+    {
+        let dir = tmp_path("opret_multiget");
+        let db = UtxoStore::open_cached(&dir, 16 * CACHE_ENTRY_COST).unwrap();
+
+        // Block 0: create two spendable outputs with reverse-lexicographic txids
+        // (`[0xEE; 32]` and `[0x11; 32]`) PLUS an OP_RETURN output (`script_type = 7`)
+        // burning 500 sat.
+        let tx_high = [0xEEu8; 32];
+        let tx_low = [0x11u8; 32];
+        let mut op_ret = out_row(0, 0, 2, tx_high, 500);
+        op_ret.script_type = bidx_core::ScriptType::OpReturn as u8;
+        let out_hi = out_row(0, 0, 0, tx_high, 10_000);
+        let out_lo = out_row(0, 1, 0, tx_low, 20_000);
+
+        db.apply_block(
+            0,
+            &[tx_row(0, 0, tx_high), tx_row(0, 1, tx_low)],
+            &[],
+            &[out_hi, op_ret, out_lo],
+        )
+        .unwrap();
+
+        // Only the 2 spendable outputs entered `RecentUtxoCache` and RocksDB;
+        // the OP_RETURN output was skipped.
+        assert_eq!(db.cache_stats().unwrap().entries, 2);
+        assert!(db.db.get_pinned(make_key(&tx_high, 2)).unwrap().is_none());
+
+        // Evict the recent cache down to 1 entry and insert a dummy block so
+        // both `tx_high:0` and `tx_low:0` must be fetched via `batched_multi_get_cf`.
+        {
+            let mut c = db.recent.as_ref().unwrap().lock();
+            c.set_budget(CACHE_ENTRY_COST);
+        }
+        let dummy_tx = [0x55u8; 32];
+        db.apply_block(
+            1,
+            &[tx_row(1, 0, dummy_tx)],
+            &[],
+            &[out_row(1, 0, 0, dummy_tx, 1_000)],
+        )
+        .unwrap();
+
+        // Block 2 spends `tx_high:0` at input 0 and `tx_low:0` at input 1
+        // (unsorted key order!), creating one spendable 25_000-sat output and
+        // one 1_000-sat burned OP_RETURN output -> fee must be
+        // (10_000 + 20_000) - (25_000 + 1_000) = 4_000 sat, and `spends` must
+        // preserve `[tx_high, tx_low]` input order despite sorted MultiGet.
+        let spend_tx = [0x99u8; 32];
+        let mut burn2 = out_row(2, 0, 1, spend_tx, 1_000);
+        burn2.script_type = bidx_core::ScriptType::OpReturn as u8;
+        let res = db
+            .apply_block(
+                2,
+                &[tx_row(2, 0, spend_tx)],
+                &[
+                    inp_row(2, 0, 0, spend_tx, tx_high, 0, false),
+                    inp_row(2, 0, 1, spend_tx, tx_low, 0, false),
+                ],
+                &[out_row(2, 0, 0, spend_tx, 25_000), burn2],
+            )
+            .unwrap();
+
+        assert_eq!(res.db_lookups, 2);
+        assert_eq!(res.fees, vec![4_000]);
+        assert_eq!(res.spends.len(), 2);
+        assert_eq!(res.spends[0].spent_txid, tx_high);
+        assert_eq!(res.spends[1].spent_txid, tx_low);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

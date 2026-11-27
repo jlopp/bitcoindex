@@ -178,6 +178,27 @@ enum Cmd {
         /// outputs without a RocksDB lookup. Ignored by `live` (undo) mode.
         #[arg(long)]
         utxo_cache_mb: Option<usize>,
+
+        /// Stream completed Parquet part files into ClickHouse in the
+        /// background while parsing continues, then build derived indexes and
+        /// materialized views at completion (eliminating a separate `bidx load`
+        /// pass).
+        #[arg(long)]
+        stream_clickhouse: bool,
+
+        /// When `--stream-clickhouse` is set, stream Parquet part files over
+        /// `clickhouse-client` stdin instead of server-side `file(...)`.
+        #[arg(long, env = "BIDX_LOAD__UPLOAD")]
+        upload: bool,
+
+        /// When `--stream-clickhouse` is set, delete each Parquet part file as
+        /// soon as ClickHouse confirms ingestion so bulk loads do not retain a
+        /// second copy of the chain on disk.
+        #[arg(long)]
+        unlink_loaded_parts: bool,
+
+        #[command(flatten)]
+        ch: ChArgs,
     },
 
     /// Create ClickHouse schema (idempotent).
@@ -409,7 +430,29 @@ fn run(cli: Cli) -> Result<()> {
             capture_witness,
             block_cache_mb,
             utxo_cache_mb,
+            stream_clickhouse,
+            upload,
+            unlink_loaded_parts,
+            ch,
         } => {
+            if unlink_loaded_parts && !stream_clickhouse {
+                anyhow::bail!("--unlink-loaded-parts requires --stream-clickhouse");
+            }
+            let stream_ch = if stream_clickhouse {
+                let loader = bidx_loader::ChLoader::new(ch.into())?;
+                let mode = if upload {
+                    bidx_loader::LoadMode::Upload
+                } else {
+                    bidx_loader::LoadMode::ServerFile
+                };
+                Some(pipeline::StreamClickHouseConfig {
+                    loader,
+                    mode,
+                    unlink_loaded_parts,
+                })
+            } else {
+                None
+            };
             pipeline::run_parse(pipeline::ParseConfig {
                 blocks_dir,
                 out,
@@ -428,6 +471,7 @@ fn run(cli: Cli) -> Result<()> {
                 capture_witness,
                 block_cache_mb,
                 utxo_cache_mb,
+                stream_clickhouse: stream_ch,
             })?;
         }
 
@@ -463,7 +507,7 @@ fn run(cli: Cli) -> Result<()> {
                 if name == "address_prefix" {
                     // Needs base58/bech32 rendering, which the loader can't do.
                     let net: Network = network.into();
-                    let n = loader.rebuild_address_prefix(|ty, hash| {
+                    let n = loader.rebuild_address_prefix_par(|ty, hash| {
                         bidx_serve::address::render_address(net, ty, hash)
                     })?;
                     println!("rebuilt index {name} ({n} addresses)");
@@ -855,6 +899,7 @@ mod tests {
         let body = format!(
             "#!/bin/sh\n\
              for a in \"$@\"; do case \"$a\" in --query=*DISTINCT*script_type*) printf '2\\t{}' ; exit 0;; esac; done\n\
+             for a in \"$@\"; do case \"$a\" in --query=*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
              for a in \"$@\"; do case \"$a\" in --query=*) echo \"$a\";; esac; done\n\
              exit 0\n",
             format!("{}{}", "62e907b15cbf27d5425399ebf6f0fb50ebb88f18", "0".repeat(24))
@@ -960,20 +1005,62 @@ mod tests {
 
     #[test]
     fn run_parse_arm_builds_config_then_fails_on_a_missing_dir() {
-        let _g = testlock::fork_guard();
-        let c = cli(&[
-            "bidx",
-            "parse",
-            "--blocks-dir",
-            "/definitely/not/here",
-            "--out",
-            "/tmp/bidx-out",
-            "--utxo",
-            "/tmp/bidx-utxo",
-            "--network",
-            "regtest",
-        ]);
-        assert!(run(c).is_err());
+        {
+            let _g = testlock::fork_guard();
+            let c = cli(&[
+                "bidx",
+                "parse",
+                "--blocks-dir",
+                "/definitely/not/here",
+                "--out",
+                "/tmp/bidx-out",
+                "--utxo",
+                "/tmp/bidx-utxo",
+                "--network",
+                "regtest",
+            ]);
+            assert!(run(c).is_err());
+
+            // `--unlink-loaded-parts` without `--stream-clickhouse` is rejected.
+            let bad = cli(&[
+                "bidx",
+                "parse",
+                "--blocks-dir",
+                "/definitely/not/here",
+                "--out",
+                "/tmp/bidx-out",
+                "--utxo",
+                "/tmp/bidx-utxo",
+                "--unlink-loaded-parts",
+            ]);
+            let err = run(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("--stream-clickhouse"),
+                "got: {err}"
+            );
+        }
+
+        // `--stream-clickhouse` resolves the ClickHouse client and maps both
+        // ServerFile and Upload modes into `StreamClickHouseConfig`.
+        with_fake_client("parse-stream", || {
+            for extra in [
+                &["--stream-clickhouse"][..],
+                &["--stream-clickhouse", "--upload", "--unlink-loaded-parts"][..],
+            ] {
+                let mut args = vec![
+                    "bidx",
+                    "parse",
+                    "--blocks-dir",
+                    "/definitely/not/here",
+                    "--out",
+                    "/tmp/bidx-out",
+                    "--utxo",
+                    "/tmp/bidx-utxo",
+                ];
+                args.extend_from_slice(extra);
+                assert!(run(cli(&args)).is_err());
+            }
+        });
     }
 
     #[test]

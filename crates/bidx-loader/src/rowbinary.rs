@@ -39,6 +39,9 @@ pub const SPENDS_COLS: &str = "height, spending_tx_index, spending_input_index, 
 /// Column list for the optional `witnesses` payload table.
 pub const WITNESSES_COLS: &str = "height, tx_index, input_index, item_index, item_len, item_bytes";
 
+/// Column list for the `address_prefix` backfill table.
+pub const ADDRESS_PREFIX_COLS: &str = "address, script_type, address_hash";
+
 #[inline]
 fn u8_(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -167,6 +170,14 @@ pub fn witness(r: &WitnessRow, out: &mut Vec<u8>) {
     u32_(out, r.item_index);
     u32_(out, r.item_len);
     str_(out, &r.item_bytes);
+}
+
+/// Encode one `address_prefix` row (`address` String, `script_type` UInt8,
+/// `address_hash` FixedString(32)).
+pub fn address_prefix(address: &str, script_type: u8, address_hash: &[u8; 32], out: &mut Vec<u8>) {
+    str_(out, address.as_bytes());
+    u8_(out, script_type);
+    bin32(out, address_hash);
 }
 
 #[cfg(test)]
@@ -364,5 +375,24 @@ mod tests {
         assert!(OUTPUTS_COLS.contains("address_hash"));
         assert!(SPENDS_COLS.contains("spent_height"));
         assert!(WITNESSES_COLS.contains("item_bytes"));
+        assert_eq!(ADDRESS_PREFIX_COLS, "address, script_type, address_hash");
+    }
+
+    #[test]
+    fn address_prefix_encodes_string_type_and_hash32() {
+        let mut out = Vec::new();
+        let hash = [0x42u8; 32];
+        address_prefix(
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            4,
+            &hash,
+            &mut out,
+        );
+        // 42-byte ASCII address: LEB128(42) = 0x2a, then 42 bytes, 1 byte ty, 32 bytes hash = 76 bytes.
+        assert_eq!(out.len(), 1 + 42 + 1 + 32);
+        assert_eq!(out[0], 42);
+        assert_eq!(&out[1..43], b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+        assert_eq!(out[43], 4);
+        assert_eq!(&out[44..], &hash);
     }
 }

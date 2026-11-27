@@ -75,27 +75,41 @@ pub fn parse_block_full_opts(
     c.skip(80)?;
 
     let tx_count = c.read_count()?;
-    let mut txs = Vec::with_capacity((tx_count as usize).min(100_000));
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-    let mut witnesses = Vec::new();
+    let est_txs = (tx_count as usize).min(100_000);
+    // Pre-size block-level row vectors once and append directly inside
+    // `parse_tx`, avoiding ~2.2B per-transaction Vec allocations, copies, and
+    // frees across a full mainnet parse.
+    let mut txs = Vec::with_capacity(est_txs);
+    let mut inputs = Vec::with_capacity(est_txs.saturating_mul(2));
+    let mut outputs = Vec::with_capacity(est_txs.saturating_mul(2));
+    let mut witnesses = if opts.capture_witness {
+        Vec::with_capacity(est_txs.saturating_mul(2))
+    } else {
+        Vec::new()
+    };
     let mut coinbase_value = 0u64;
     let mut tx_weight_sum = 0u64;
 
     for tx_index in 0..tx_count as u32 {
-        let (tx, tx_inputs, tx_outputs, tx_witnesses) =
-            parse_tx(&mut c, payload, height, tx_index, opts)?;
+        let out_start = outputs.len();
+        let tx = parse_tx(
+            &mut c,
+            payload,
+            height,
+            tx_index,
+            opts,
+            &mut inputs,
+            &mut outputs,
+            &mut witnesses,
+        )?;
         if tx_index == 0 {
-            coinbase_value = tx_outputs.iter().map(|o| o.value_sat).sum();
+            coinbase_value = outputs[out_start..].iter().map(|o| o.value_sat).sum();
         }
         tx_weight_sum += tx.weight as u64;
-        inputs.extend(tx_inputs);
-        outputs.extend(tx_outputs);
-        witnesses.extend(tx_witnesses);
         txs.push(tx);
     }
 
-    // coverage-exempt: 107-109 — unreachable by construction: the loop above
+    // coverage-exempt — unreachable by construction: the loop above
     // runs exactly `tx_count` times and pushes exactly one tx per iteration, so
     // `txs.len() == tx_count` always holds (`read_count` also bounds `tx_count`
     // to `MAX_ITEMS`, well within `u32`). Kept as a defensive check so a future
@@ -137,20 +151,17 @@ pub fn parse_block_full_opts(
     })
 }
 
-type ParsedTx = (
-    TxRow,
-    Vec<InputRow>,
-    Vec<OutputRow>,
-    Vec<bidx_core::WitnessRow>,
-);
-
+#[allow(clippy::too_many_arguments)]
 fn parse_tx<'a>(
     c: &mut Cursor<'a>,
     block: &'a [u8],
     height: u32,
     tx_index: u32,
     opts: ParseOptions,
-) -> Result<ParsedTx, TxParseError> {
+    inputs: &mut Vec<InputRow>,
+    outputs: &mut Vec<OutputRow>,
+    witnesses: &mut Vec<bidx_core::WitnessRow>,
+) -> Result<TxRow, TxParseError> {
     let abs_start = c.pos();
     let version = c.read_i32()?;
 
@@ -179,8 +190,9 @@ fn parse_tx<'a>(
         }
     };
 
+    let inp_start = inputs.len();
+    inputs.reserve((input_count as usize).min(100_000));
     let is_single_input = input_count == 1;
-    let mut inputs = Vec::with_capacity((input_count as usize).min(100_000));
     for input_index in 0..input_count as u32 {
         let prev_txid: [u8; 32] = c.read_array()?;
         let prev_vout = c.read_u32()?;
@@ -207,8 +219,9 @@ fn parse_tx<'a>(
         });
     }
 
+    let out_start = outputs.len();
     let output_count = c.read_count()?;
-    let mut outputs = Vec::with_capacity((output_count as usize).min(100_000));
+    outputs.reserve((output_count as usize).min(100_000));
     for output_index in 0..output_count as u32 {
         let value_sat = c.read_u64()?;
         if value_sat > MAX_MONEY {
@@ -232,9 +245,8 @@ fn parse_tx<'a>(
     // Position right after outputs = end of the stripped prefix.
     let stripped_prefix_end = c.pos();
 
-    let mut witnesses: Vec<bidx_core::WitnessRow> = Vec::new();
     if has_witness {
-        for inp in inputs.iter_mut() {
+        for inp in &mut inputs[inp_start..] {
             let item_count = c.read_count()?;
             inp.witness_items = item_count as u32;
             for item_index in 0..item_count as u32 {
@@ -285,10 +297,10 @@ fn parse_tx<'a>(
     };
 
     let txid_bytes = *txid.as_bytes();
-    for inp in inputs.iter_mut() {
+    for inp in &mut inputs[inp_start..] {
         inp.txid = txid_bytes;
     }
-    for out in outputs.iter_mut() {
+    for out in &mut outputs[out_start..] {
         out.txid = txid_bytes;
     }
 
@@ -302,7 +314,7 @@ fn parse_tx<'a>(
     // BIP141: weight = stripped*4 + witness = stripped*3 + total
     let weight = stripped_len * 3 + total_len;
 
-    let tx = TxRow {
+    Ok(TxRow {
         height,
         tx_index,
         txid: txid_bytes,
@@ -314,8 +326,7 @@ fn parse_tx<'a>(
         input_count: input_count as u32,
         output_count: output_count as u32,
         has_witness,
-    };
-    Ok((tx, inputs, outputs, witnesses))
+    })
 }
 
 #[cfg(test)]

@@ -62,6 +62,18 @@ pub const CHANNEL_DEPTH: usize = 64;
 /// block's rows, ~a few MB at the tip).
 pub const SINK_CHANNEL_DEPTH: usize = 8;
 
+/// Sink -> ClickHouse part-loader channel depth. Bounds the number of completed
+/// Parquet parts waiting on disk when `--stream-clickhouse --unlink-loaded-parts`
+/// is active so a slow ClickHouse server backpressures the sink cleanly.
+pub const PART_CHANNEL_DEPTH: usize = 4;
+
+/// Optional pipelined ClickHouse ingestion configuration for `bidx parse`.
+pub struct StreamClickHouseConfig {
+    pub loader: bidx_loader::ChLoader,
+    pub mode: bidx_loader::LoadMode,
+    pub unlink_loaded_parts: bool,
+}
+
 /// Resolve the two cache sizes from the optional CLI overrides and the
 /// host-derived budget. A `Some(mb)` override wins; `None` takes the planned
 /// value. Split out so both the override and auto-sized branches are unit
@@ -128,6 +140,10 @@ pub struct ParseConfig {
     /// recently created output without a RocksDB lookup at all. Only used in
     /// bulk mode (no undo); live mode ignores it.
     pub utxo_cache_mb: Option<usize>,
+    /// Optional pipelined ClickHouse part-file loader: drops materialized views
+    /// up front, streams each completed Parquet part into ClickHouse while
+    /// parsing continues, and rebuilds derived indexes + views at completion.
+    pub stream_clickhouse: Option<StreamClickHouseConfig>,
 }
 
 /// A parse-stage message: either a fully-parsed block, or a "skipped"
@@ -262,6 +278,38 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         ceiling_mb = planned.ceiling_kb / 1024,
         "opening UTXO store"
     );
+    // If pipelined ClickHouse ingestion is enabled, drop materialized views
+    // up front (failing fast before opening RocksDB if ClickHouse is down) and
+    // spawn a background worker that loads each completed Parquet part file as
+    // soon as the sink finishes writing it.
+    let (part_tx, mut ch_handle) = if let Some(stream_ch) = cfg.stream_clickhouse.take() {
+        stream_ch
+            .loader
+            .begin_streaming_load()
+            .context("prepare ClickHouse for streaming load")?;
+        let (ptx, prx) = bounded::<u32>(PART_CHANNEL_DEPTH);
+        let ch_out = cfg.out.clone();
+        let ch_wit = cfg.capture_witness;
+        let handle = std::thread::spawn(move || -> Result<StreamClickHouseConfig> {
+            while let Ok(done_part) = prx.recv() {
+                stream_ch
+                    .loader
+                    .load_part(
+                        &ch_out,
+                        done_part,
+                        ch_wit,
+                        stream_ch.mode,
+                        stream_ch.unlink_loaded_parts,
+                    )
+                    .with_context(|| format!("ClickHouse load of part {done_part:05} failed"))?;
+            }
+            Ok(stream_ch)
+        });
+        (Some(ptx), Some(handle))
+    } else {
+        (None, None)
+    };
+
     // Defer background compaction for the duration of the load. An initial
     // index is write-dominated, and leveled compaction rewrites the same data
     // through every level; deferring turns that interleaved write I/O into a
@@ -348,6 +396,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                 capture_witness,
                 &file_cache,
                 planned.file_cache_files,
+                part_tx,
             )
         }
     });
@@ -424,16 +473,36 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     drop(tx);
     parse_result?;
 
-    consumer
+    let consumer_res = consumer
         .join()
         // coverage-exempt: consumer only returns Err by panicking (not in fixtures)
-        .map_err(|_| anyhow::anyhow!("consumer panicked"))??;
+        .map_err(|_| anyhow::anyhow!("consumer panicked"))?;
+    if let Err(consumer_err) = consumer_res {
+        if let Some(h) = ch_handle.take() {
+            if let Ok(Err(ch_err)) = h.join() {
+                return Err(ch_err);
+            }
+        }
+        return Err(consumer_err);
+    }
 
     // The load is done: re-enable compaction and compact the UTXO family once,
     // paying the deferred write I/O in a single pass instead of interleaving it
-    // with the parse. Runs after the consumer has stopped writing.
+    // with the parse. Runs concurrently with the ClickHouse worker loading the
+    // final Parquet part.
     if utxo.finalize_bulk_load()? {
         info!("finalized bulk load: compacted UTXO store");
+    }
+
+    if let Some(h) = ch_handle.take() {
+        let stream_ch = h
+            .join()
+            // coverage-exempt: ClickHouse worker only panics on a fatal runtime abort
+            .map_err(|_| anyhow::anyhow!("ClickHouse streaming loader panicked"))??;
+        stream_ch
+            .loader
+            .finish_streaming_load()
+            .context("finalize ClickHouse derived indexes and views")?;
     }
 
     progress.finish_with_message("parse complete");
@@ -781,6 +850,7 @@ fn consume_ordered(
     file_cache: &ThreadFileCache,
     // The plan's starting file-LRU bound; each relief step halves from the last.
     file_cache_start: usize,
+    part_tx: Option<crossbeam_channel::Sender<u32>>,
 ) -> Result<()> {
     let mut buffer: BTreeMap<u32, FullBlock> = BTreeMap::new();
     let mut skipped_queue: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
@@ -800,7 +870,14 @@ fn consume_ordered(
     let (sink_tx, sink_rx) = bounded::<SinkMsg>(SINK_CHANNEL_DEPTH);
     let sink_out = out_dir.to_path_buf();
     let sink_handle = std::thread::spawn(move || -> Result<()> {
-        sink_thread_main(sink_rx, &sink_out, blocks_per_part, start_part, sink_cfg)
+        sink_thread_main(
+            sink_rx,
+            &sink_out,
+            blocks_per_part,
+            start_part,
+            sink_cfg,
+            part_tx,
+        )
     });
 
     'consume: while let Ok(item) = rx.recv() {
@@ -866,24 +943,17 @@ fn consume_ordered(
 
             // Enrich txs with fees and block with total fee.
             //
-            // The coinbase flag must be read from `block.inputs` *before*
-            // borrowing `block.txs` mutably, and it is computed as a boolean
-            // per tx rather than a nested scan. The previous form re-scanned
-            // every input for every tx — O(txs x inputs), ~16M comparisons on
-            // a 4k-tx block — on the single-threaded consumer.
-            let coinbase_tx: Vec<bool> = {
-                let mut flags = vec![false; block.txs.len()];
-                for inp in &block.inputs {
-                    if let Some(f) = flags.get_mut(inp.tx_index as usize) {
-                        *f |= inp.is_coinbase;
-                    }
-                }
-                flags
-            };
+            // By consensus only `tx_index == 0` can be a coinbase tx, so
+            // checking `block.inputs.first()` is O(1) with zero per-block
+            // `Vec<bool>` heap allocation or full-input scan.
+            let first_is_coinbase = block
+                .inputs
+                .first()
+                .is_some_and(|inp| inp.is_coinbase && inp.tx_index == 0);
             let mut total_fee = 0u64;
             for (i, tx) in block.txs.iter_mut().enumerate() {
                 tx.fee = res.fees[i];
-                if !coinbase_tx.get(i).copied().unwrap_or(false) {
+                if !(i == 0 && first_is_coinbase) {
                     total_fee = total_fee.saturating_add(res.fees[i]);
                 }
             }
@@ -951,13 +1021,15 @@ enum SinkMsg {
 }
 
 /// The sink thread body: owns the `ParquetSink`, rotates part files by height,
-/// and writes every row kind for each block it receives.
+/// writes every row kind for each block via concrete SoA column builders, and
+/// notifies the optional ClickHouse streaming loader as each part closes.
 fn sink_thread_main(
     rx: Receiver<SinkMsg>,
     out_dir: &Path,
     blocks_per_part: u32,
     start_part: u32,
     sink_cfg: SinkConfig,
+    part_tx: Option<crossbeam_channel::Sender<u32>>,
 ) -> Result<()> {
     let mut part_id = start_part;
     let mut sink = ParquetSink::create(out_dir, part_id, sink_cfg)?;
@@ -968,30 +1040,31 @@ fn sink_thread_main(
                 let wanted_part = block.block_row.height / blocks_per_part;
                 if wanted_part != part_id {
                     sink.finish()?;
+                    if let Some(ref tx) = part_tx {
+                        tx.send(part_id).map_err(|_| {
+                            anyhow::anyhow!("ClickHouse streaming loader stopped early")
+                        })?;
+                    }
                     part_id = wanted_part;
                     sink = ParquetSink::create(out_dir, part_id, sink_cfg)?;
                 }
-                sink.push_block(&block.block_row)?;
-                for tx in &block.txs {
-                    sink.push_tx(tx)?;
-                }
-                for inp in &block.inputs {
-                    sink.push_input(inp)?;
-                }
-                for out in &block.outputs {
-                    sink.push_output(out)?;
-                }
-                for sp in &spends {
-                    sink.push_spend(sp)?;
-                }
-                for w in &block.witnesses {
-                    sink.push_witness(w)?;
-                }
+                sink.push_block_rows(
+                    &block.block_row,
+                    &block.txs,
+                    &block.inputs,
+                    &block.outputs,
+                    &spends,
+                    &block.witnesses,
+                )?;
             }
             SinkMsg::Finish => break,
         }
     }
     sink.finish()?;
+    if let Some(ref tx) = part_tx {
+        tx.send(part_id)
+            .map_err(|_| anyhow::anyhow!("ClickHouse streaming loader stopped early"))?;
+    }
     Ok(())
 }
 
@@ -1321,6 +1394,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: None,
         })
         .expect("run_parse");
@@ -1397,6 +1471,7 @@ mod tests {
             capture_witness: true,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: None,
         })
         .expect("run_parse with witness capture");
@@ -1444,6 +1519,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: None,
         })
         .expect("run_parse without witness capture");
@@ -1480,6 +1556,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: None,
         })
         .err()
@@ -1506,7 +1583,7 @@ mod tests {
         let (tx, rx) = bounded::<SinkMsg>(4);
         let out_for_thread = out.clone();
         let handle = std::thread::spawn(move || {
-            sink_thread_main(rx, &out_for_thread, 2, 0, SinkConfig::default())
+            sink_thread_main(rx, &out_for_thread, 2, 0, SinkConfig::default(), None)
         });
 
         // Height 0 and 1 -> part 0; height 2 -> part 1 (boundary at 2/2=1).
@@ -2009,6 +2086,7 @@ mod tests {
             false,
             &file_cache,
             2,
+            None,
         )
         .unwrap_err();
         assert!(e1.to_string().contains("channel closed early"), "got {e1}");
@@ -2063,6 +2141,7 @@ mod tests {
             false,
             &file_cache,
             2,
+            None,
         )
         .unwrap_err();
         assert!(e2.to_string().contains("watchdog"), "got {e2}");
@@ -2198,6 +2277,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: Some(Box::new(transport)),
         })
         .expect("run_parse with orphan skip");
@@ -2258,6 +2338,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: None,
         })
         .expect("run_parse without rpc");
@@ -2295,6 +2376,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: None,
         })
         .err()
@@ -2354,6 +2436,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: Some(Box::new(TipsFailRpc { node_tip: 1 })),
         })
         .expect("orphan fetch failure must be non-fatal");
@@ -2431,6 +2514,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: Some(Box::new(NoTipsRpc)),
         })
         .expect("run_parse with auto-detected network and default checkpoint path");
@@ -2474,6 +2558,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: Some(Box::new(transport)),
         })
         .expect("orphan at final height must finish cleanly");
@@ -2558,6 +2643,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: Some(Box::new(NoOrphanRpc { node_tip: 2 })),
         })
         .expect("run_parse with no orphans");
@@ -2622,6 +2708,7 @@ mod tests {
             capture_witness: false,
             block_cache_mb: None,
             utxo_cache_mb: None,
+            stream_clickhouse: None,
             rpc_transport: None,
         })
         .expect("run_parse with a spend");
@@ -2661,5 +2748,293 @@ mod tests {
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
         let _ = fs::remove_dir_all(&utxo);
+    }
+
+    fn write_fake_ch_script(tag: &str, body: String) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "bidx-pipe-ch-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, body).unwrap();
+        let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn run_parse_streams_parts_to_clickhouse_and_unlinks_when_configured() {
+        let _g = crate::testlock::fork_guard();
+        let (blocks_dir, _) = make_chain(3);
+        let out = std::env::temp_dir().join(format!("bidx-streamch-out-{}", std::process::id()));
+        let utxo = std::env::temp_dir().join(format!("bidx-streamch-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+
+        let script = write_fake_ch_script(
+            "ok",
+            "#!/bin/sh\nq=''\nfor a in \"$@\"; do case \"$a\" in --query=*) q=\"$a\";; esac; done\n\
+             cat >/dev/null\necho \"$q\" >> \"$0.log\"\nexit 0\n"
+                .to_string(),
+        );
+        let ch_cfg = bidx_loader::ChConfig {
+            database: "btc".into(),
+            ..bidx_loader::ChConfig::default()
+        };
+        let loader = bidx_loader::ChLoader::with_client(ch_cfg, script.clone());
+
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out.clone(),
+            utxo: utxo.clone(),
+            start: 0,
+            end: Some(3),
+            blocks_per_part: 2, // rotates: part 0 = [0,1], part 1 = [2]
+            threads: Some(2),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("ckpts.txt")),
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: Some(StreamClickHouseConfig {
+                loader,
+                mode: bidx_loader::LoadMode::Upload,
+                unlink_loaded_parts: true,
+            }),
+            rpc_transport: None,
+        })
+        .expect("streaming parse to ClickHouse");
+
+        let log = std::fs::read_to_string(format!("{}.log", script.display())).unwrap();
+        assert!(log.contains("DROP VIEW IF EXISTS btc.outputs_by_address_mv"));
+        for entity in bidx_loader::schema::ENTITIES {
+            assert!(log.contains(&format!("INSERT INTO btc.{entity} FORMAT Parquet")));
+            assert!(
+                !out.join(entity).join("part-00000.parquet").exists(),
+                "part 0 must be unlinked for {entity}"
+            );
+            assert!(
+                !out.join(entity).join("part-00001.parquet").exists(),
+                "part 1 must be unlinked for {entity}"
+            );
+        }
+        assert!(log.contains("INSERT INTO btc.outputs_by_address "));
+        assert!(log.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS btc.outputs_by_address_mv"));
+
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&utxo);
+        let _ = fs::remove_file(format!("{}.log", script.display()));
+        let _ = fs::remove_file(&script);
+    }
+
+    #[test]
+    fn run_parse_surfaces_consumer_and_clickhouse_streaming_failures() {
+        let _g = crate::testlock::fork_guard();
+        let (blocks_dir, _) = make_chain(8);
+        let utxo = std::env::temp_dir().join(format!("bidx-cherr-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&utxo);
+        std::fs::create_dir_all(&utxo).unwrap();
+
+        // 1) Consumer fails without ClickHouse streaming (`out` is a regular file).
+        let bad_out = std::env::temp_dir().join(format!("bidx-cherr-file-{}", std::process::id()));
+        std::fs::write(&bad_out, "not-a-dir").unwrap();
+        assert!(run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: bad_out.clone(),
+            utxo: utxo.join("u1"),
+            start: 0,
+            end: Some(1),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("c1")),
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: None,
+            rpc_transport: None,
+        })
+        .is_err());
+        let _ = fs::remove_file(&bad_out);
+
+        // 2) `begin_streaming_load` fails before RocksDB opens.
+        let fail_all = write_fake_ch_script(
+            "begin-fail",
+            "#!/bin/sh\necho 'ch down' >&2\nexit 1\n".to_string(),
+        );
+        let out2 = std::env::temp_dir().join(format!("bidx-cherr-o2-{}", std::process::id()));
+        let e2 = run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out2.clone(),
+            utxo: utxo.join("u2"),
+            start: 0,
+            end: Some(2),
+            blocks_per_part: 1,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("c2")),
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: Some(StreamClickHouseConfig {
+                loader: bidx_loader::ChLoader::with_client(
+                    bidx_loader::ChConfig::default(),
+                    fail_all.clone(),
+                ),
+                mode: bidx_loader::LoadMode::ServerFile,
+                unlink_loaded_parts: false,
+            }),
+            rpc_transport: None,
+        })
+        .unwrap_err();
+        assert!(format!("{e2:#}").contains("prepare ClickHouse"), "{e2:#}");
+        let _ = fs::remove_file(&fail_all);
+
+        // 3) `load_part` fails across 8 parts (`blocks_per_part: 1`), forcing
+        //    the sink to hit `part_tx.send` error and surfacing the underlying
+        //    ClickHouse part-load error; also test 1-part failure where
+        //    `consumer` finishes cleanly before `ch_handle.join()` surfaces it.
+        let fail_insert = write_fake_ch_script(
+            "part-fail",
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --query=*INSERT*) echo 'part boom' >&2; exit 1;; esac; done\nexit 0\n"
+                .to_string(),
+        );
+        for (end_h, tag) in [(8u32, "many"), (1u32, "one")] {
+            let out_p =
+                std::env::temp_dir().join(format!("bidx-cherr-{tag}-{}", std::process::id()));
+            let ep = run_parse(ParseConfig {
+                blocks_dir: blocks_dir.clone(),
+                out: out_p.clone(),
+                utxo: utxo.join(format!("u-{tag}")),
+                start: 0,
+                end: Some(end_h),
+                blocks_per_part: 1,
+                threads: Some(1),
+                rpc_url: None,
+                rpc_cookie: None,
+                skip_disk_check: true,
+                network: Some(bidx_core::Network::Mainnet),
+                checkpoint_file: Some(utxo.join(format!("c-{tag}"))),
+                orphan_blocks: None,
+                capture_witness: false,
+                block_cache_mb: None,
+                utxo_cache_mb: None,
+                stream_clickhouse: Some(StreamClickHouseConfig {
+                    loader: bidx_loader::ChLoader::with_client(
+                        bidx_loader::ChConfig::default(),
+                        fail_insert.clone(),
+                    ),
+                    mode: bidx_loader::LoadMode::ServerFile,
+                    unlink_loaded_parts: false,
+                }),
+                rpc_transport: None,
+            })
+            .unwrap_err();
+            assert!(
+                format!("{ep:#}").contains("ClickHouse load of part"),
+                "{ep:#}"
+            );
+            let _ = fs::remove_dir_all(&out_p);
+        }
+        let _ = fs::remove_file(&fail_insert);
+
+        // 4) `finish_streaming_load` fails on backfill (`TRUNCATE TABLE`).
+        let fail_finish = write_fake_ch_script(
+            "finish-fail",
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --query=*TRUNCATE*) echo 'backfill boom' >&2; exit 1;; esac; done\nexit 0\n"
+                .to_string(),
+        );
+        let out4 = std::env::temp_dir().join(format!("bidx-cherr-o4-{}", std::process::id()));
+        let e4 = run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out4.clone(),
+            utxo: utxo.join("u4"),
+            start: 0,
+            end: Some(1),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("c4")),
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: Some(StreamClickHouseConfig {
+                loader: bidx_loader::ChLoader::with_client(
+                    bidx_loader::ChConfig::default(),
+                    fail_finish.clone(),
+                ),
+                mode: bidx_loader::LoadMode::ServerFile,
+                unlink_loaded_parts: false,
+            }),
+            rpc_transport: None,
+        })
+        .unwrap_err();
+        assert!(format!("{e4:#}").contains("finalize ClickHouse"), "{e4:#}");
+
+        let _ = fs::remove_file(&fail_finish);
+        let _ = fs::remove_dir_all(&out2);
+        let _ = fs::remove_dir_all(&out4);
+        let _ = fs::remove_dir_all(&blocks_dir);
+        let _ = fs::remove_dir_all(&utxo);
+    }
+
+    #[test]
+    fn sink_thread_surfaces_dropped_part_channel_on_rotate_and_finish() {
+        let out_rot =
+            std::env::temp_dir().join(format!("bidx-sink-pdrop-rot-{}", std::process::id()));
+        let (tx, rx) = bounded::<SinkMsg>(4);
+        let (ptx, prx) = bounded::<u32>(1);
+        drop(prx);
+        tx.send(SinkMsg::Block {
+            block: synthetic_full_block(0),
+            spends: Vec::new(),
+        })
+        .unwrap();
+        tx.send(SinkMsg::Block {
+            block: synthetic_full_block(2),
+            spends: Vec::new(),
+        })
+        .unwrap();
+        drop(tx);
+        let e_rot =
+            sink_thread_main(rx, &out_rot, 2, 0, SinkConfig::default(), Some(ptx)).unwrap_err();
+        assert!(e_rot.to_string().contains("stopped early"));
+        let _ = fs::remove_dir_all(&out_rot);
+
+        let out_fin =
+            std::env::temp_dir().join(format!("bidx-sink-pdrop-fin-{}", std::process::id()));
+        let (tx2, rx2) = bounded::<SinkMsg>(4);
+        let (ptx2, prx2) = bounded::<u32>(1);
+        drop(prx2);
+        tx2.send(SinkMsg::Finish).unwrap();
+        let e_fin =
+            sink_thread_main(rx2, &out_fin, 2, 0, SinkConfig::default(), Some(ptx2)).unwrap_err();
+        assert!(e_fin.to_string().contains("stopped early"));
+        let _ = fs::remove_dir_all(&out_fin);
     }
 }

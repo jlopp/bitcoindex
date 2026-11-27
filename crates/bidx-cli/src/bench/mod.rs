@@ -1218,22 +1218,17 @@ fn bench_consume(
                 pending_hits.fetch_add(res.pending_hits, Ordering::Relaxed);
                 cache_hits.fetch_add(res.cache_hits, Ordering::Relaxed);
                 if do_fees {
-                    // Same O(txs x inputs) fix as `pipeline::consume_ordered`:
-                    // derive the coinbase flags in one pass over inputs instead
-                    // of re-scanning inputs for every tx.
-                    let coinbase_tx: Vec<bool> = {
-                        let mut flags = vec![false; block.txs.len()];
-                        for inp in &block.inputs {
-                            if let Some(f) = flags.get_mut(inp.tx_index as usize) {
-                                *f |= inp.is_coinbase;
-                            }
-                        }
-                        flags
-                    };
+                    // By consensus only `tx_index == 0` can be a coinbase tx,
+                    // so checking `inputs.first()` is O(1) with zero per-block
+                    // `Vec<bool>` allocation or input scan.
+                    let first_is_coinbase = block
+                        .inputs
+                        .first()
+                        .is_some_and(|inp| inp.is_coinbase && inp.tx_index == 0);
                     let mut total_fee = 0u64;
                     for (i, tx) in block.txs.iter_mut().enumerate() {
                         tx.fee = res.fees[i];
-                        if !coinbase_tx.get(i).copied().unwrap_or(false) {
+                        if !(i == 0 && first_is_coinbase) {
                             total_fee = total_fee.saturating_add(res.fees[i]);
                         }
                     }
@@ -1243,21 +1238,15 @@ fn bench_consume(
 
             if let Some(sink) = sink.as_mut() {
                 let t0 = std::time::Instant::now();
-                sink.push_block(&block.block_row)?;
-                for tx in &block.txs {
-                    sink.push_tx(tx)?;
-                }
-                for inp in &block.inputs {
-                    sink.push_input(inp)?;
-                }
-                for out in &block.outputs {
-                    sink.push_output(out)?;
-                }
-                if let Some(res) = &res {
-                    for sp in &res.spends {
-                        sink.push_spend(sp)?;
-                    }
-                }
+                let spends = res.as_ref().map_or(&[][..], |r| r.spends.as_slice());
+                sink.push_block_rows(
+                    &block.block_row,
+                    &block.txs,
+                    &block.inputs,
+                    &block.outputs,
+                    spends,
+                    &block.witnesses,
+                )?;
                 sink_wall.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
 

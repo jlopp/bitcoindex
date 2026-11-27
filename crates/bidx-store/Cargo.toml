@@ -17,6 +17,7 @@ parquet.workspace = true
 byteorder.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+rayon.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
