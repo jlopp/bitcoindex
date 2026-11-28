@@ -1,5 +1,5 @@
-//! Buffered Parquet writers for the five base entity tables (plus optional
-//! witnesses).
+//! Buffered Parquet writers for the four base entity tables (`blocks`,
+//! `transactions`, `inputs`, `outputs`) plus optional `witnesses`.
 //!
 //! One writer instance per output part file. Rows accumulate directly in
 //! concrete Struct-of-Arrays (SoA) column buffers without per-cell enum
@@ -16,9 +16,9 @@ use arrow::array::{
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use bidx_core::{BlockRow, InputRow, OutputRow, SpendRow, TxRow, WitnessRow};
+use bidx_core::{BlockRow, InputRow, OutputRow, TxRow, WitnessRow};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use std::fs::File;
@@ -74,6 +74,38 @@ const DICTIONARY_COLUMNS: &[&str] = &[
     "spent_address_hash",
 ];
 
+/// Uniformly distributed 256-bit SHA-256d digests across a mainnet parse.
+/// Feeding cryptographic white noise through Zstd's LZ77 match finder burns
+/// ~65-70% of Parquet CPU to emit literal blocks at a `1.000x` ratio; storing
+/// these columns `UNCOMPRESSED` is byte-size neutral and ~3x faster.
+/// (`address_hash` / `spent_address_hash` stay Zstd+dictionary because ~78%
+/// carry 12 trailing zero bytes and addresses repeat frequently.)
+const UNCOMPRESSED_HASH_COLUMNS: &[&str] =
+    &["hash", "prev_hash", "merkle_root", "txid", "prev_txid"];
+
+/// Non-dictionary integer coordinate, count, and satoshi columns where Parquet
+/// `DELTA_BINARY_PACKED` bitpacks monotonic/small deltas before Zstd(1).
+const DELTA_INT_COLUMNS: &[&str] = &[
+    "tx_index",
+    "input_index",
+    "output_index",
+    "prev_vout",
+    "time",
+    "nonce",
+    "tx_count",
+    "size",
+    "weight",
+    "input_count",
+    "output_count",
+    "value_sat",
+    "spent_value_sat",
+    "fee",
+    "total_fee",
+    "coinbase_value",
+    "item_index",
+    "item_len",
+];
+
 fn writer_props(batch_size: usize) -> WriterProperties {
     // Zstd level 1 gives ~2x faster compression CPU than default level 3 for
     // only ~3-5% larger output, and matching `max_row_group_size` to
@@ -87,6 +119,12 @@ fn writer_props(batch_size: usize) -> WriterProperties {
         .set_write_batch_size(8192);
     for &col in DICTIONARY_COLUMNS {
         b = b.set_column_dictionary_enabled(ColumnPath::from(col), true);
+    }
+    for &col in UNCOMPRESSED_HASH_COLUMNS {
+        b = b.set_column_compression(ColumnPath::from(col), Compression::UNCOMPRESSED);
+    }
+    for &col in DELTA_INT_COLUMNS {
+        b = b.set_column_encoding(ColumnPath::from(col), Encoding::DELTA_BINARY_PACKED);
     }
     b.build()
 }
@@ -214,7 +252,6 @@ pub fn inputs_schema() -> SchemaRef {
         Field::new("height", DataType::UInt32, false),
         Field::new("tx_index", DataType::UInt32, false),
         Field::new("input_index", DataType::UInt32, false),
-        fbin32("txid"),
         fbin32("prev_txid"),
         Field::new("prev_vout", DataType::UInt32, false),
         Field::new("script_sig_len", DataType::UInt32, false),
@@ -222,6 +259,10 @@ pub fn inputs_schema() -> SchemaRef {
         Field::new("witness_items", DataType::UInt32, false),
         Field::new("witness_bytes", DataType::UInt32, false),
         Field::new("is_coinbase", DataType::Boolean, false),
+        Field::new("spent_value_sat", DataType::UInt64, false),
+        Field::new("spent_script_type", DataType::UInt8, false),
+        fbin32("spent_address_hash"),
+        Field::new("spent_height", DataType::UInt32, false),
     ]))
 }
 
@@ -230,26 +271,10 @@ pub fn outputs_schema() -> SchemaRef {
         Field::new("height", DataType::UInt32, false),
         Field::new("tx_index", DataType::UInt32, false),
         Field::new("output_index", DataType::UInt32, false),
-        fbin32("txid"),
         Field::new("value_sat", DataType::UInt64, false),
         Field::new("script_pubkey_len", DataType::UInt32, false),
         Field::new("script_type", DataType::UInt8, false),
         fbin32("address_hash"),
-    ]))
-}
-
-pub fn spends_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("height", DataType::UInt32, false),
-        Field::new("spending_tx_index", DataType::UInt32, false),
-        Field::new("spending_input_index", DataType::UInt32, false),
-        fbin32("spending_txid"),
-        fbin32("spent_txid"),
-        Field::new("spent_vout", DataType::UInt32, false),
-        Field::new("spent_value_sat", DataType::UInt64, false),
-        Field::new("spent_script_type", DataType::UInt8, false),
-        fbin32("spent_address_hash"),
-        Field::new("spent_height", DataType::UInt32, false),
     ]))
 }
 
@@ -392,7 +417,7 @@ impl TxsTable {
     #[inline]
     fn append(&mut self, r: &TxRow) {
         self.height.push(r.height);
-        self.tx_index.push(r.tx_index);
+        self.tx_index.push(r.tx_index as u32);
         self.txid.push(&r.txid);
         self.version.push(r.version);
         self.locktime.push(r.locktime);
@@ -432,7 +457,6 @@ struct InputsTable {
     height: Vec<u32>,
     tx_index: Vec<u32>,
     input_index: Vec<u32>,
-    txid: Fixed32Col,
     prev_txid: Fixed32Col,
     prev_vout: Vec<u32>,
     script_sig_len: Vec<u32>,
@@ -440,6 +464,10 @@ struct InputsTable {
     witness_items: Vec<u32>,
     witness_bytes: Vec<u32>,
     is_coinbase: BooleanBuilder,
+    spent_value_sat: Vec<u64>,
+    spent_script_type: Vec<u8>,
+    spent_address_hash: Fixed32Col,
+    spent_height: Vec<u32>,
 }
 
 impl InputsTable {
@@ -452,7 +480,6 @@ impl InputsTable {
             height: Vec::with_capacity(cap),
             tx_index: Vec::with_capacity(cap),
             input_index: Vec::with_capacity(cap),
-            txid: Fixed32Col::new(cap),
             prev_txid: Fixed32Col::new(cap),
             prev_vout: Vec::with_capacity(cap),
             script_sig_len: Vec::with_capacity(cap),
@@ -460,22 +487,29 @@ impl InputsTable {
             witness_items: Vec::with_capacity(cap),
             witness_bytes: Vec::with_capacity(cap),
             is_coinbase: BooleanBuilder::with_capacity(cap),
+            spent_value_sat: Vec::with_capacity(cap),
+            spent_script_type: Vec::with_capacity(cap),
+            spent_address_hash: Fixed32Col::new(cap),
+            spent_height: Vec::with_capacity(cap),
         }
     }
 
     #[inline]
     fn append(&mut self, r: &InputRow) {
         self.height.push(r.height);
-        self.tx_index.push(r.tx_index);
-        self.input_index.push(r.input_index);
-        self.txid.push(&r.txid);
+        self.tx_index.push(r.tx_index as u32);
+        self.input_index.push(r.input_index as u32);
         self.prev_txid.push(&r.prev_txid);
         self.prev_vout.push(r.prev_vout);
         self.script_sig_len.push(r.script_sig_len);
         self.sequence.push(r.sequence);
-        self.witness_items.push(r.witness_items);
+        self.witness_items.push(r.witness_items as u32);
         self.witness_bytes.push(r.witness_bytes);
         self.is_coinbase.append_value(r.is_coinbase);
+        self.spent_value_sat.push(r.spent_value_sat);
+        self.spent_script_type.push(r.spent_script_type);
+        self.spent_address_hash.push(&r.spent_address_hash);
+        self.spent_height.push(r.spent_height);
         self.buffered += 1;
     }
 
@@ -485,7 +519,6 @@ impl InputsTable {
             finish_u32(&mut self.height, c),
             finish_u32(&mut self.tx_index, c),
             finish_u32(&mut self.input_index, c),
-            self.txid.finish()?,
             self.prev_txid.finish()?,
             finish_u32(&mut self.prev_vout, c),
             finish_u32(&mut self.script_sig_len, c),
@@ -493,6 +526,10 @@ impl InputsTable {
             finish_u32(&mut self.witness_items, c),
             finish_u32(&mut self.witness_bytes, c),
             Arc::new(self.is_coinbase.finish()),
+            finish_u64(&mut self.spent_value_sat, c),
+            finish_u8(&mut self.spent_script_type, c),
+            self.spent_address_hash.finish()?,
+            finish_u32(&mut self.spent_height, c),
         ];
         self.buffered = 0;
         Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
@@ -506,7 +543,6 @@ struct OutputsTable {
     height: Vec<u32>,
     tx_index: Vec<u32>,
     output_index: Vec<u32>,
-    txid: Fixed32Col,
     value_sat: Vec<u64>,
     script_pubkey_len: Vec<u32>,
     script_type: Vec<u8>,
@@ -523,7 +559,6 @@ impl OutputsTable {
             height: Vec::with_capacity(cap),
             tx_index: Vec::with_capacity(cap),
             output_index: Vec::with_capacity(cap),
-            txid: Fixed32Col::new(cap),
             value_sat: Vec::with_capacity(cap),
             script_pubkey_len: Vec::with_capacity(cap),
             script_type: Vec::with_capacity(cap),
@@ -534,9 +569,8 @@ impl OutputsTable {
     #[inline]
     fn append(&mut self, r: &OutputRow) {
         self.height.push(r.height);
-        self.tx_index.push(r.tx_index);
-        self.output_index.push(r.output_index);
-        self.txid.push(&r.txid);
+        self.tx_index.push(r.tx_index as u32);
+        self.output_index.push(r.output_index as u32);
         self.value_sat.push(r.value_sat);
         self.script_pubkey_len.push(r.script_pubkey_len);
         self.script_type.push(r.script_type);
@@ -550,81 +584,10 @@ impl OutputsTable {
             finish_u32(&mut self.height, c),
             finish_u32(&mut self.tx_index, c),
             finish_u32(&mut self.output_index, c),
-            self.txid.finish()?,
             finish_u64(&mut self.value_sat, c),
             finish_u32(&mut self.script_pubkey_len, c),
             finish_u8(&mut self.script_type, c),
             self.address_hash.finish()?,
-        ];
-        self.buffered = 0;
-        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
-    }
-}
-
-struct SpendsTable {
-    schema: SchemaRef,
-    cap: usize,
-    buffered: usize,
-    height: Vec<u32>,
-    spending_tx_index: Vec<u32>,
-    spending_input_index: Vec<u32>,
-    spending_txid: Fixed32Col,
-    spent_txid: Fixed32Col,
-    spent_vout: Vec<u32>,
-    spent_value_sat: Vec<u64>,
-    spent_script_type: Vec<u8>,
-    spent_address_hash: Fixed32Col,
-    spent_height: Vec<u32>,
-}
-
-impl SpendsTable {
-    fn new(batch_size: usize) -> Self {
-        let cap = batch_size.clamp(1, MAX_PREALLOC_ROWS);
-        Self {
-            schema: spends_schema(),
-            cap,
-            buffered: 0,
-            height: Vec::with_capacity(cap),
-            spending_tx_index: Vec::with_capacity(cap),
-            spending_input_index: Vec::with_capacity(cap),
-            spending_txid: Fixed32Col::new(cap),
-            spent_txid: Fixed32Col::new(cap),
-            spent_vout: Vec::with_capacity(cap),
-            spent_value_sat: Vec::with_capacity(cap),
-            spent_script_type: Vec::with_capacity(cap),
-            spent_address_hash: Fixed32Col::new(cap),
-            spent_height: Vec::with_capacity(cap),
-        }
-    }
-
-    #[inline]
-    fn append(&mut self, r: &SpendRow) {
-        self.height.push(r.height);
-        self.spending_tx_index.push(r.spending_tx_index);
-        self.spending_input_index.push(r.spending_input_index);
-        self.spending_txid.push(&r.spending_txid);
-        self.spent_txid.push(&r.spent_txid);
-        self.spent_vout.push(r.spent_vout);
-        self.spent_value_sat.push(r.spent_value_sat);
-        self.spent_script_type.push(r.spent_script_type);
-        self.spent_address_hash.push(&r.spent_address_hash);
-        self.spent_height.push(r.spent_height);
-        self.buffered += 1;
-    }
-
-    fn take_batch(&mut self) -> Result<RecordBatch, SinkError> {
-        let c = self.cap;
-        let arrays: Vec<ArrayRef> = vec![
-            finish_u32(&mut self.height, c),
-            finish_u32(&mut self.spending_tx_index, c),
-            finish_u32(&mut self.spending_input_index, c),
-            self.spending_txid.finish()?,
-            self.spent_txid.finish()?,
-            finish_u32(&mut self.spent_vout, c),
-            finish_u64(&mut self.spent_value_sat, c),
-            finish_u8(&mut self.spent_script_type, c),
-            self.spent_address_hash.finish()?,
-            finish_u32(&mut self.spent_height, c),
         ];
         self.buffered = 0;
         Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
@@ -662,8 +625,8 @@ impl WitnessesTable {
     #[inline]
     fn append(&mut self, r: &WitnessRow) {
         self.height.push(r.height);
-        self.tx_index.push(r.tx_index);
-        self.input_index.push(r.input_index);
+        self.tx_index.push(r.tx_index as u32);
+        self.input_index.push(r.input_index as u32);
         self.item_index.push(r.item_index);
         self.item_len.push(r.item_len);
         self.item_bytes.append_value(&r.item_bytes);
@@ -695,7 +658,6 @@ pub struct ParquetSink {
     txs_w: EntityWriter,
     inputs_w: EntityWriter,
     outputs_w: EntityWriter,
-    spends_w: EntityWriter,
     /// Only present when `cfg.capture_witness` is set.
     witnesses_w: Option<EntityWriter>,
 
@@ -703,7 +665,6 @@ pub struct ParquetSink {
     txs: TxsTable,
     inputs: InputsTable,
     outputs: OutputsTable,
-    spends: SpendsTable,
     witnesses: WitnessesTable,
 }
 
@@ -755,13 +716,11 @@ impl ParquetSink {
             txs_w: create_writer(dir, "transactions", part, transactions_schema(), bs)?,
             inputs_w: create_writer(dir, "inputs", part, inputs_schema(), bs)?,
             outputs_w: create_writer(dir, "outputs", part, outputs_schema(), bs)?,
-            spends_w: create_writer(dir, "spends", part, spends_schema(), bs)?,
             witnesses_w,
             blocks: BlocksTable::new(bs),
             txs: TxsTable::new(bs),
             inputs: InputsTable::new(bs),
             outputs: OutputsTable::new(bs),
-            spends: SpendsTable::new(bs),
             witnesses: WitnessesTable::new(witness_cap),
         })
     }
@@ -802,15 +761,6 @@ impl ParquetSink {
         Ok(())
     }
 
-    pub fn push_spend(&mut self, r: &SpendRow) -> Result<(), SinkError> {
-        self.spends.append(r);
-        if self.spends.buffered >= self.cfg.batch_size {
-            let b = self.spends.take_batch()?;
-            self.spends_w.write(&b)?;
-        }
-        Ok(())
-    }
-
     /// Append one witness payload row. A no-op unless the sink was created
     /// with `capture_witness`, so callers can push unconditionally.
     pub fn push_witness(&mut self, r: &WitnessRow) -> Result<(), SinkError> {
@@ -827,15 +777,14 @@ impl ParquetSink {
 
     /// Push all rows of an enriched block and flush any full entity row groups
     /// concurrently across Rayon workers so Zstd encoding on `inputs`,
-    /// `outputs`, `spends`, and `transactions` overlaps instead of serializing
-    /// on a single sink thread.
+    /// `outputs`, and `transactions` overlaps instead of serializing on a
+    /// single sink thread.
     pub fn push_block_rows(
         &mut self,
         block: &BlockRow,
         txs: &[TxRow],
         inputs: &[InputRow],
         outputs: &[OutputRow],
-        spends: &[SpendRow],
         witnesses: &[WitnessRow],
     ) -> Result<(), SinkError> {
         let bs = self.cfg.batch_size.max(1);
@@ -844,7 +793,6 @@ impl ParquetSink {
         let mut tx_rem = txs;
         let mut inp_rem = inputs;
         let mut out_rem = outputs;
-        let mut sp_rem = spends;
         let mut wit_rem = if self.witnesses_w.is_some() {
             witnesses
         } else {
@@ -870,12 +818,6 @@ impl ParquetSink {
             }
             out_rem = &out_rem[out_take..];
 
-            let sp_take = sp_rem.len().min(bs.saturating_sub(self.spends.buffered));
-            for r in &sp_rem[..sp_take] {
-                self.spends.append(r);
-            }
-            sp_rem = &sp_rem[sp_take..];
-
             let wit_take = wit_rem
                 .len()
                 .min(bs.saturating_sub(self.witnesses.buffered));
@@ -886,12 +828,7 @@ impl ParquetSink {
 
             self.flush_full_parallel(bs)?;
 
-            if tx_rem.is_empty()
-                && inp_rem.is_empty()
-                && out_rem.is_empty()
-                && sp_rem.is_empty()
-                && wit_rem.is_empty()
-            {
+            if tx_rem.is_empty() && inp_rem.is_empty() && out_rem.is_empty() && wit_rem.is_empty() {
                 break;
             }
         }
@@ -911,9 +848,6 @@ impl ParquetSink {
         let out_b = (self.outputs.buffered >= bs)
             .then(|| self.outputs.take_batch())
             .transpose()?;
-        let sp_b = (self.spends.buffered >= bs)
-            .then(|| self.spends.take_batch())
-            .transpose()?;
         let wit_b = (self.witnesses_w.is_some() && self.witnesses.buffered >= bs)
             .then(|| self.witnesses.take_batch())
             .transpose()?;
@@ -922,7 +856,6 @@ impl ParquetSink {
             + usize::from(tx_b.is_some())
             + usize::from(inp_b.is_some())
             + usize::from(out_b.is_some())
-            + usize::from(sp_b.is_some())
             + usize::from(wit_b.is_some());
         if ready == 0 {
             return Ok(());
@@ -940,9 +873,6 @@ impl ParquetSink {
             if let Some(b) = out_b {
                 self.outputs_w.write(&b)?;
             }
-            if let Some(b) = sp_b {
-                self.spends_w.write(&b)?;
-            }
             if let (Some(b), Some(w)) = (wit_b, self.witnesses_w.as_mut()) {
                 w.write(&b)?;
             }
@@ -953,14 +883,12 @@ impl ParquetSink {
         let txs_w = &mut self.txs_w;
         let inputs_w = &mut self.inputs_w;
         let outputs_w = &mut self.outputs_w;
-        let spends_w = &mut self.spends_w;
         let witnesses_w = &mut self.witnesses_w;
 
         let mut r_blk = Ok(());
         let mut r_tx = Ok(());
         let mut r_inp = Ok(());
         let mut r_out = Ok(());
-        let mut r_sp = Ok(());
         let mut r_wit = Ok(());
 
         rayon::scope(|s| {
@@ -980,10 +908,6 @@ impl ParquetSink {
                 let out = &mut r_out;
                 s.spawn(move |_| *out = outputs_w.write(&b).map_err(SinkError::from));
             }
-            if let Some(b) = sp_b {
-                let out = &mut r_sp;
-                s.spawn(move |_| *out = spends_w.write(&b).map_err(SinkError::from));
-            }
             if let (Some(b), Some(w)) = (wit_b, witnesses_w.as_mut()) {
                 let out = &mut r_wit;
                 s.spawn(move |_| *out = w.write(&b).map_err(SinkError::from));
@@ -993,7 +917,6 @@ impl ParquetSink {
         r_tx?;
         r_inp?;
         r_out?;
-        r_sp?;
         r_wit
     }
 
@@ -1013,9 +936,6 @@ impl ParquetSink {
         let out_b = (self.outputs.buffered > 0)
             .then(|| self.outputs.take_batch())
             .transpose()?;
-        let sp_b = (self.spends.buffered > 0)
-            .then(|| self.spends.take_batch())
-            .transpose()?;
         let wit_b = (self.witnesses_w.is_some() && self.witnesses.buffered > 0)
             .then(|| self.witnesses.take_batch())
             .transpose()?;
@@ -1024,14 +944,12 @@ impl ParquetSink {
         let txs_w = self.txs_w;
         let inputs_w = self.inputs_w;
         let outputs_w = self.outputs_w;
-        let spends_w = self.spends_w;
         let witnesses_w = self.witnesses_w;
 
         let mut r_blk = Ok(());
         let mut r_tx = Ok(());
         let mut r_inp = Ok(());
         let mut r_out = Ok(());
-        let mut r_sp = Ok(());
         let mut r_wit = Ok(());
 
         rayon::scope(|s| {
@@ -1043,8 +961,6 @@ impl ParquetSink {
             s.spawn(move |_| *o_inp = finish_entity(inp_b, inputs_w));
             let o_out = &mut r_out;
             s.spawn(move |_| *o_out = finish_entity(out_b, outputs_w));
-            let o_sp = &mut r_sp;
-            s.spawn(move |_| *o_sp = finish_entity(sp_b, spends_w));
             if let Some(w) = witnesses_w {
                 let o_wit = &mut r_wit;
                 s.spawn(move |_| *o_wit = finish_entity(wit_b, w));
@@ -1054,7 +970,6 @@ impl ParquetSink {
         r_tx?;
         r_inp?;
         r_out?;
-        r_sp?;
         r_wit
     }
 }
@@ -1064,7 +979,7 @@ mod tests {
     use super::*;
     use arrow::array::{FixedSizeBinaryArray, UInt32Array, UInt64Array};
     use arrow::datatypes::DataType;
-    use bidx_core::{BlockRow, InputRow, OutputRow, SpendRow, TxRow};
+    use bidx_core::{BlockRow, InputRow, OutputRow, TxRow};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::path::PathBuf;
 
@@ -1093,7 +1008,7 @@ mod tests {
         }
     }
 
-    fn tx_row(h: u32, i: u32) -> TxRow {
+    fn tx_row(h: u32, i: u16) -> TxRow {
         TxRow {
             height: h,
             tx_index: i,
@@ -1109,12 +1024,11 @@ mod tests {
         }
     }
 
-    fn input_row(h: u32, i: u32) -> InputRow {
+    fn input_row(h: u32, i: u16) -> InputRow {
         InputRow {
             height: h,
             tx_index: i,
             input_index: 0,
-            txid: [i as u8; 32],
             prev_txid: [0xEEu8; 32],
             prev_vout: 0,
             script_sig_len: 0,
@@ -1122,34 +1036,22 @@ mod tests {
             witness_items: 0,
             witness_bytes: 0,
             is_coinbase: false,
-        }
-    }
-
-    fn output_row(h: u32, i: u32) -> OutputRow {
-        OutputRow {
-            height: h,
-            tx_index: i,
-            output_index: 0,
-            txid: [i as u8; 32],
-            value_sat: 100 + h as u64,
-            script_pubkey_len: 25,
-            script_type: 1,
-            address_hash: [0xABu8; 32],
-        }
-    }
-
-    fn spend_row(h: u32, i: u32) -> SpendRow {
-        SpendRow {
-            height: h,
-            spending_tx_index: i,
-            spending_input_index: 0,
-            spending_txid: [i as u8; 32],
-            spent_txid: [0xEEu8; 32],
-            spent_vout: 0,
             spent_value_sat: 5_000,
             spent_script_type: 1,
             spent_address_hash: [0xCDu8; 32],
             spent_height: h,
+        }
+    }
+
+    fn output_row(h: u32, i: u16) -> OutputRow {
+        OutputRow {
+            height: h,
+            tx_index: i,
+            output_index: 0,
+            value_sat: 100 + h as u64,
+            script_pubkey_len: 25,
+            script_type: 1,
+            address_hash: [0xABu8; 32],
         }
     }
 
@@ -1163,8 +1065,8 @@ mod tests {
     #[test]
     fn sink_flushes_full_batches_and_roundtrips_through_parquet() {
         // batch_size = 2 so pushing two of each entity exercises the
-        // "buffered >= batch_size" flush path for every entity, including the
-        // spend path. The remaining `finish()` branches see an empty buffer.
+        // "buffered >= batch_size" flush path for every entity. The remaining
+        // `finish()` branches see an empty buffer.
         let dir = tmp_dir("flush");
         let mut sink = ParquetSink::create(
             &dir,
@@ -1180,13 +1082,12 @@ mod tests {
             sink.push_tx(&tx_row(h, 0)).unwrap();
             sink.push_input(&input_row(h, 0)).unwrap();
             sink.push_output(&output_row(h, 0)).unwrap();
-            sink.push_spend(&spend_row(h, 0)).unwrap();
         }
         sink.finish().unwrap();
 
-        // Read the spends table back and assert the values survived the
-        // columnar write → zstd → read round-trip.
-        let batch = read_first_batch(dir.join("spends/part-00000.parquet"));
+        // Read the inputs table back and assert the enriched spend values
+        // survived the columnar write → zstd → read round-trip.
+        let batch = read_first_batch(dir.join("inputs/part-00000.parquet"));
         assert_eq!(batch.num_rows(), 2);
         let height = batch
             .column_by_name("height")
@@ -1203,13 +1104,13 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(spent_value.value(0), 5_000);
-        let spent_txid = batch
-            .column_by_name("spent_txid")
+        let prev_txid = batch
+            .column_by_name("prev_txid")
             .unwrap()
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
             .unwrap();
-        assert_eq!(spent_txid.value(0), &[0xEEu8; 32]);
+        assert_eq!(prev_txid.value(0), &[0xEEu8; 32]);
 
         // Outputs table too, to confirm the second entity's flush path wrote a
         // correct value.
@@ -1278,7 +1179,7 @@ mod tests {
     #[test]
     fn sink_finish_flushes_partial_batches_for_all_entities() {
         // batch_size larger than the row counts, so no push triggers a flush and
-        // `finish()` must flush all five partial buffers.
+        // `finish()` must flush all four partial buffers.
         let dir = tmp_dir("partial");
         let mut sink = ParquetSink::create(
             &dir,
@@ -1293,10 +1194,9 @@ mod tests {
         sink.push_tx(&tx_row(3, 0)).unwrap();
         sink.push_input(&input_row(3, 0)).unwrap();
         sink.push_output(&output_row(3, 0)).unwrap();
-        sink.push_spend(&spend_row(3, 0)).unwrap();
         sink.finish().unwrap();
 
-        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+        for entity in ["blocks", "transactions", "inputs", "outputs"] {
             let batch = read_first_batch(dir.join(format!("{entity}/part-00007.parquet")));
             assert_eq!(batch.num_rows(), 1, "{entity} should have one row");
         }
@@ -1341,7 +1241,7 @@ mod tests {
         )
         .unwrap();
 
-        let wit = |h: u32, idx: u32| WitnessRow {
+        let wit = |h: u32, idx: u16| WitnessRow {
             height: h,
             tx_index: idx,
             input_index: 0,
@@ -1357,14 +1257,13 @@ mod tests {
             &[tx_row(0, 0)],
             &[input_row(0, 0), input_row(0, 1)],
             &[output_row(0, 0)],
-            &[spend_row(0, 0)],
             &[wit(0, 0)],
         )
         .unwrap();
 
-        // Call 2: `blocks`, `txs`, `inputs`, `outputs`, `spends`, and `witnesses`
+        // Call 2: `blocks`, `txs`, `inputs`, `outputs`, and `witnesses`
         // ALL reach `batch_size = 2` (`ready >= 2` parallel Rayon flush), AND
-        // 3 txs / 3 outputs / 3 spends / 3 witnesses overflow into a second loop
+        // 3 txs / 3 outputs / 3 witnesses overflow into a second loop
         // iteration (`!rem.is_empty()`), plus a 3rd call exercises single-ready
         // arms for the remaining entities.
         sink.push_block_rows(
@@ -1372,7 +1271,6 @@ mod tests {
             &[tx_row(1, 0), tx_row(1, 1), tx_row(1, 2)],
             &[input_row(1, 0), input_row(1, 1)],
             &[output_row(1, 0), output_row(1, 1), output_row(1, 2)],
-            &[spend_row(1, 0), spend_row(1, 1), spend_row(1, 2)],
             &[wit(1, 0), wit(1, 1), wit(1, 2)],
         )
         .unwrap();
@@ -1392,23 +1290,14 @@ mod tests {
         )
         .unwrap();
         // `blocks` alone hits 2 (`ready == 1` on blocks).
-        s2.push_block_rows(&block_row(0), &[], &[], &[], &[], &[])
+        s2.push_block_rows(&block_row(0), &[], &[], &[], &[])
             .unwrap();
-        s2.push_block_rows(&block_row(1), &[], &[], &[], &[], &[])
+        s2.push_block_rows(&block_row(1), &[], &[], &[], &[])
             .unwrap();
         // `txs` alone hits 2 (`ready == 1` on txs).
-        s2.push_block_rows(
-            &block_row(2),
-            &[tx_row(2, 0), tx_row(2, 1)],
-            &[],
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
-        // `outputs` alone hits 2 (`ready == 1` on outputs; blocks is 1->2? No,
-        // blocks is currently 1, so push 3 outputs on call 1 where blocks=0!).
-        s2.push_block_rows(&block_row(3), &[], &[], &[], &[], &[])
+        s2.push_block_rows(&block_row(2), &[tx_row(2, 0), tx_row(2, 1)], &[], &[], &[])
+            .unwrap();
+        s2.push_block_rows(&block_row(3), &[], &[], &[], &[])
             .unwrap(); // flushes blocks (2) -> blocks buffered = 0
         s2.push_block_rows(
             &block_row(4),
@@ -1416,23 +1305,11 @@ mod tests {
             &[],
             &[output_row(4, 0), output_row(4, 1)],
             &[],
-            &[],
         )
         .unwrap(); // blocks=1, outputs=2 -> `ready == 1` on outputs!
-        s2.push_block_rows(&block_row(5), &[], &[], &[], &[], &[])
+        s2.push_block_rows(&block_row(5), &[], &[], &[], &[])
             .unwrap(); // blocks=2 -> flushes blocks -> blocks=0
-        s2.push_block_rows(
-            &block_row(6),
-            &[],
-            &[],
-            &[],
-            &[spend_row(6, 0), spend_row(6, 1)],
-            &[],
-        )
-        .unwrap(); // blocks=1, spends=2 -> `ready == 1` on spends!
-        s2.push_block_rows(&block_row(7), &[], &[], &[], &[], &[])
-            .unwrap(); // blocks=2 -> flushes blocks -> blocks=0
-        s2.push_block_rows(&block_row(8), &[], &[], &[], &[], &[wit(8, 0), wit(8, 1)])
+        s2.push_block_rows(&block_row(6), &[], &[], &[], &[wit(6, 0), wit(6, 1)])
             .unwrap(); // blocks=1, witnesses=2 -> `ready == 1` on witnesses!
                        // Also exercise `capture_witness = false` branch inside `push_block_rows`.
         s2.finish().unwrap();
@@ -1447,7 +1324,7 @@ mod tests {
             },
         )
         .unwrap();
-        s3.push_block_rows(&block_row(0), &[tx_row(0, 0)], &[], &[], &[], &[wit(0, 0)])
+        s3.push_block_rows(&block_row(0), &[tx_row(0, 0)], &[], &[], &[wit(0, 0)])
             .unwrap();
         s3.finish().unwrap();
 
@@ -1455,7 +1332,7 @@ mod tests {
             read_first_batch(dir.join("blocks/part-00000.parquet")).num_rows(),
             2
         );
-        for entity in ["transactions", "inputs", "outputs", "spends", "witnesses"] {
+        for entity in ["transactions", "inputs", "outputs", "witnesses"] {
             assert_eq!(
                 read_first_batch(dir.join(entity).join("part-00000.parquet")).num_rows(),
                 4,
@@ -1482,6 +1359,7 @@ mod tests {
         assert!(props.dictionary_enabled(&ColumnPath::from("height")));
         assert!(props.dictionary_enabled(&ColumnPath::from("script_type")));
         assert!(props.dictionary_enabled(&ColumnPath::from("address_hash")));
+        assert!(props.dictionary_enabled(&ColumnPath::from("spent_address_hash")));
         assert!(!props.dictionary_enabled(&ColumnPath::from("txid")));
         assert!(!props.dictionary_enabled(&ColumnPath::from("prev_txid")));
         assert!(!props.dictionary_enabled(&ColumnPath::from("hash")));
@@ -1503,7 +1381,6 @@ mod tests {
             ("transactions", transactions_schema()),
             ("inputs", inputs_schema()),
             ("outputs", outputs_schema()),
-            ("spends", spends_schema()),
             ("witnesses", witnesses_schema()),
         ] {
             assert!(!schema.fields().is_empty(), "{name} schema is empty");
@@ -1680,6 +1557,11 @@ mod tests {
         assert_eq!(builder.metadata().num_row_groups(), 2);
         assert_eq!(builder.metadata().row_group(0).num_rows(), 2);
         assert_eq!(builder.metadata().row_group(1).num_rows(), 2);
+        // Verify SHA-256d digest columns are stored UNCOMPRESSED while scalar
+        // columns stay ZSTD-compressed.
+        let rg0 = builder.metadata().row_group(0);
+        assert_eq!(rg0.column(1).compression(), Compression::UNCOMPRESSED); // hash
+        assert!(matches!(rg0.column(0).compression(), Compression::ZSTD(_))); // height
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

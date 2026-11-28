@@ -201,8 +201,10 @@ pub fn run_verify_with(loader: &ChLoader, args: &VerifyArgs) -> Result<()> {
         "SELECT count() FROM {db}.inputs WHERE is_coinbase = 1"
     ))?)
     .unwrap_or(0);
-    let spends = parse_scalar(&loader.query_scalar(&format!("SELECT count() FROM {db}.spends"))?)
-        .unwrap_or(0);
+    let spends = parse_scalar(&loader.query_scalar(&format!(
+        "SELECT count() FROM {db}.spends_by_spent_outpoint"
+    ))?)
+    .unwrap_or(0);
 
     let node_height = match &args.rpc_url {
         Some(url) => fetch_node_height(
@@ -452,7 +454,7 @@ mod tests {
              *max*) echo 99 ;;\n\
              *'FROM db.blocks'*) echo 100 ;;\n\
              *'FROM db.inputs'*) echo 300 ;;\n\
-             *'FROM db.spends'*) echo 200 ;;\n\
+             *'FROM db.spends_by_spent_outpoint'*) echo 200 ;;\n\
              *) echo 0 ;;\n\
              esac\n"
         );

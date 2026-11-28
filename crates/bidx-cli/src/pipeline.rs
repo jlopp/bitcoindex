@@ -15,10 +15,10 @@
 use crate::diskguard::{DiskGuardConfig, DiskRecorder, DEFAULT_CHECKPOINT_FILE_NAME};
 use anyhow::{Context, Result};
 use bidx_parser::{
-    parse_block_full, parse_block_full_opts, read_xor_key_from_dir, BlkFile, FullBlock,
+    parse_block_full, parse_block_full_into, read_xor_key_from_dir, BlkFile, FullBlock,
 };
-use bidx_store::{ParquetSink, SinkConfig, UtxoStore};
-use crossbeam_channel::{bounded, Receiver};
+use bidx_store::{ParquetSink, SinkConfig, UtxoStore, WindowBlock, DEFAULT_UTXO_WINDOW_BLOCKS};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -67,11 +67,29 @@ pub const SINK_CHANNEL_DEPTH: usize = 8;
 /// is active so a slow ClickHouse server backpressures the sink cleanly.
 pub const PART_CHANNEL_DEPTH: usize = 4;
 
-/// Optional pipelined ClickHouse ingestion configuration for `bidx parse`.
+/// Capacity of the `FullBlock` recycling pool shared between the sink thread
+/// and Rayon parse workers so steady-state parsing performs zero `Vec` heap
+/// allocations.
+pub const RECYCLE_POOL_DEPTH: usize =
+    CHANNEL_DEPTH + REORDER_HIGH + SINK_CHANNEL_DEPTH + DEFAULT_UTXO_WINDOW_BLOCKS;
+
+/// Transport strategy for ClickHouse bulk ingestion during `bidx parse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamChMode {
+    /// Write Parquet parts and load via ClickHouse `file(...)`.
+    ParquetServerFile { unlink_loaded_parts: bool },
+    /// Write Parquet parts and stream over `clickhouse-client` stdin.
+    ParquetUpload { unlink_loaded_parts: bool },
+    /// Bypass Parquet completely: stream `RowBinary` rows directly into
+    /// ClickHouse over persistent 8 MiB-buffered pipes (`--direct-clickhouse`).
+    DirectRowBinary,
+}
+
+/// Optional pipelined or direct ClickHouse ingestion configuration for `bidx parse`.
 pub struct StreamClickHouseConfig {
     pub loader: bidx_loader::ChLoader,
-    pub mode: bidx_loader::LoadMode,
-    pub unlink_loaded_parts: bool,
+    pub mode: StreamChMode,
+    pub profile: bidx_loader::schema::IndexProfile,
 }
 
 /// Resolve the two cache sizes from the optional CLI overrides and the
@@ -156,7 +174,7 @@ pub(crate) enum WorkItem {
 
 pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     info!(?cfg.blocks_dir, "building chain index");
-    let (index, stats) = bidx_parser::build_chain_index(&cfg.blocks_dir)?;
+    let (mut index, stats) = bidx_parser::build_chain_index(&cfg.blocks_dir)?;
     info!(
         tip = stats.tip_height,
         orphans = stats.orphans,
@@ -164,6 +182,9 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     );
 
     let tip = index.tip_height().context("empty chain")?;
+    // Free the ~64 MiB header-linking `FxHashMap<Hash32, u32>` before wrapping
+    // `ChainIndex` in `Arc`; workers and the consumer use `by_height` / `block_hashes`.
+    index.drop_hash_index();
     let start = cfg.start.min(tip);
     let end = cfg.end.unwrap_or(tip + 1).min(tip + 1);
     if start >= end {
@@ -186,11 +207,15 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         .checkpoint_file
         .clone()
         .unwrap_or_else(|| parent_of_utxo.join(DEFAULT_CHECKPOINT_FILE_NAME));
+    let mut tracked_dirs = vec![cfg.utxo.clone()];
+    if !cfg.out.as_os_str().is_empty() {
+        tracked_dirs.push(cfg.out.clone());
+    }
     let disk_cfg: DiskGuardConfig = DiskGuardConfig {
         checkpoint_file,
         network,
         index_root: parent_of_utxo.clone(),
-        tracked_dirs: vec![cfg.utxo.clone(), cfg.out.clone()],
+        tracked_dirs,
     };
 
     if !cfg.skip_disk_check {
@@ -278,36 +303,96 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         ceiling_mb = planned.ceiling_kb / 1024,
         "opening UTXO store"
     );
-    // If pipelined ClickHouse ingestion is enabled, drop materialized views
-    // up front (failing fast before opening RocksDB if ClickHouse is down) and
-    // spawn a background worker that loads each completed Parquet part file as
-    // soon as the sink finishes writing it.
-    let (part_tx, mut ch_handle) = if let Some(stream_ch) = cfg.stream_clickhouse.take() {
-        stream_ch
-            .loader
-            .begin_streaming_load()
-            .context("prepare ClickHouse for streaming load")?;
-        let (ptx, prx) = bounded::<u32>(PART_CHANNEL_DEPTH);
-        let ch_out = cfg.out.clone();
-        let ch_wit = cfg.capture_witness;
-        let handle = std::thread::spawn(move || -> Result<StreamClickHouseConfig> {
-            while let Ok(done_part) = prx.recv() {
-                stream_ch
-                    .loader
-                    .load_part(
-                        &ch_out,
-                        done_part,
-                        ch_wit,
-                        stream_ch.mode,
-                        stream_ch.unlink_loaded_parts,
+    // If ClickHouse ingestion (`--stream-clickhouse` or `--direct-clickhouse`)
+    // is enabled, drop materialized views and base-table projections up front
+    // (failing fast before opening RocksDB if ClickHouse is down).
+    let sink_cfg = SinkConfig {
+        capture_witness: cfg.capture_witness,
+        ..SinkConfig::default()
+    };
+    let start_part = start / cfg.blocks_per_part;
+    let (sink_backend, mut ch_part_handle, mut ch_direct_finalize) = match cfg
+        .stream_clickhouse
+        .take()
+    {
+        Some(stream_ch) => {
+            stream_ch
+                .loader
+                .begin_streaming_load()
+                .context("prepare ClickHouse for streaming load")?;
+            match stream_ch.mode {
+                StreamChMode::DirectRowBinary => {
+                    let writer = bidx_loader::live_insert::LiveChWriter::open_bulk(
+                        &stream_ch.loader.cfg,
+                        stream_ch.loader.client_path(),
+                        cfg.capture_witness,
                     )
-                    .with_context(|| format!("ClickHouse load of part {done_part:05} failed"))?;
+                    .context("open ClickHouse RowBinary bulk pipes")?;
+                    (
+                        SinkBackend::DirectCh(writer),
+                        None,
+                        Some((stream_ch.loader, stream_ch.profile)),
+                    )
+                }
+                StreamChMode::ParquetServerFile {
+                    unlink_loaded_parts,
+                }
+                | StreamChMode::ParquetUpload {
+                    unlink_loaded_parts,
+                } => {
+                    let load_mode = match stream_ch.mode {
+                        StreamChMode::ParquetUpload { .. } => bidx_loader::LoadMode::Upload,
+                        _ => bidx_loader::LoadMode::ServerFile,
+                    };
+                    let (ptx, prx) = bounded::<u32>(PART_CHANNEL_DEPTH);
+                    let ch_out = cfg.out.clone();
+                    let ch_wit = cfg.capture_witness;
+                    let handle = std::thread::spawn(
+                            move || -> Result<(bidx_loader::ChLoader, bidx_loader::schema::IndexProfile)> {
+                                while let Ok(done_part) = prx.recv() {
+                                    stream_ch
+                                        .loader
+                                        .load_part(
+                                            &ch_out,
+                                            done_part,
+                                            ch_wit,
+                                            load_mode,
+                                            unlink_loaded_parts,
+                                        )
+                                        .with_context(|| {
+                                            format!(
+                                                "ClickHouse load of part {done_part:05} failed"
+                                            )
+                                        })?;
+                                }
+                                Ok((stream_ch.loader, stream_ch.profile))
+                            },
+                        );
+                    (
+                        SinkBackend::Parquet {
+                            out_dir: cfg.out.clone(),
+                            blocks_per_part: cfg.blocks_per_part,
+                            start_part,
+                            sink_cfg,
+                            part_tx: Some(ptx),
+                        },
+                        Some(handle),
+                        None,
+                    )
+                }
             }
-            Ok(stream_ch)
-        });
-        (Some(ptx), Some(handle))
-    } else {
-        (None, None)
+        }
+        None => (
+            SinkBackend::Parquet {
+                out_dir: cfg.out.clone(),
+                blocks_per_part: cfg.blocks_per_part,
+                start_part,
+                sink_cfg,
+                part_tx: None,
+            },
+            None,
+            None,
+        ),
     };
 
     // Defer background compaction for the duration of the load. An initial
@@ -321,6 +406,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     // Channel carries parsed blocks from workers to the ordered consumer.
     // Bound it to keep memory in check if the consumer (RocksDB) lags.
     let (tx, rx) = bounded::<WorkItem>(CHANNEL_DEPTH);
+    let (block_recycle_tx, block_recycle_rx) = bounded::<FullBlock>(RECYCLE_POOL_DEPTH);
 
     let progress = ProgressBar::new(total);
     progress.set_style(
@@ -351,55 +437,54 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     let reorder_depth_w = Arc::clone(&reorder_depth);
 
     // Spawn the ordered consumer on its own thread.
-    let out_dir = cfg.out.clone();
-    let blocks_per_part = cfg.blocks_per_part;
-    let capture_witness = cfg.capture_witness;
     let recorder = Arc::new(DiskRecorder::new(disk_cfg.clone()));
     // The decoded-file LRU is created here, before the consumer, so the
-    // consumer can shrink it under memory pressure. It is cloned into each
-    // worker below; every clone shares one inner, so a `shrink_to` from the
-    // consumer lowers the bound for all of them.
-    let file_cache = ThreadFileCache::with_capacity(&cfg.blocks_dir, planned.file_cache_files);
+    // consumer can shrink it under memory pressure and proactively evict
+    // completed `blkNNNNN.dat` files. Seeded with `index.file_data_end` so
+    // opening a `BlkFile` skips the redundant record-walk pass.
+    let file_cache = ThreadFileCache::with_capacity_and_hints(
+        &cfg.blocks_dir,
+        planned.file_cache_files,
+        &index.file_data_end,
+    );
     // The watchdog must exist before the consumer is spawned so the consumer
     // can poll it. `Arc` because the consumer thread needs its own handle;
-    // the original binding keeps it alive for the whole run. Its ceiling is the
-    // one the memory plan was sized against, so "the plan fits under the
-    // ceiling" is the same statement as "the watchdog will not trip on a run
-    // that respects its budgets".
+    // the original binding keeps it alive for the whole run.
     let watchdog = Arc::new(crate::bench::OomWatchdog::start(planned.ceiling_kb));
     let consumer = std::thread::spawn({
         let progress = progress.clone();
+        let parsed = Arc::clone(&parsed);
         let missing_utxos = Arc::clone(&missing_utxos);
         let recorder = Arc::clone(&recorder);
         let reorder_depth = Arc::clone(&reorder_depth_w);
         let next_height = Arc::clone(&next_height);
         let watchdog = Arc::clone(&watchdog);
         let file_cache = file_cache.clone();
-        // The consumer borrows the store; the original `utxo` binding is kept
-        // for the post-run `finalize_bulk_load` call, so the thread gets a
-        // clone rather than the only handle.
+        let index_for_consumer = Arc::clone(&index);
+        let block_recycle_tx = block_recycle_tx.clone();
         let utxo = Arc::clone(&utxo);
         move || -> Result<()> {
             consume_ordered(
                 rx,
                 start,
                 end,
-                blocks_per_part,
-                &out_dir,
+                sink_backend,
                 &utxo,
                 &progress,
+                Some(&parsed),
                 &missing_utxos,
                 recorder.as_ref(),
                 &reorder_depth,
                 &next_height,
                 Some(watchdog.as_ref()),
-                capture_witness,
                 &file_cache,
                 planned.file_cache_files,
-                part_tx,
+                Some(index_for_consumer.as_ref()),
+                Some(block_recycle_tx),
             )
         }
     });
+    drop(block_recycle_tx);
 
     // Parallel parse stage. Heights are processed in parallel; each result
     // is sent into the channel tagged with its height for reordering.
@@ -412,24 +497,16 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     let parse_opts = bidx_parser::ParseOptions {
         capture_witness: cfg.capture_witness,
     };
-    // Workers need the watchdog too: when it trips, the consumer returns and
-    // drops `rx`, so every worker's next `send` fails. Reporting that as
-    // "consumer dropped" would hide the actual cause, so the send-failure path
-    // checks the watchdog first.
     let watchdog_w = Arc::clone(&watchdog);
 
     let num_workers = pool.current_num_threads();
     let parse_result: Result<()> = pool.install(|| {
-        // Workers claim heights in strict ascending order from `height_cursor`
-        // rather than binary-splitting `(start..end)` via `par_iter()`. That
-        // keeps every worker on the same 1-2 `blk*.dat` files (preventing LRU
-        // thrashing across distant chain eras) and lets `wait_for_consumer`
-        // park workers before they allocate `FullBlock`s far ahead of `next`.
         (0..num_workers)
             .into_par_iter()
             .try_for_each(|_| -> Result<()> {
                 let cache = file_cache.clone();
                 let tx = tx.clone();
+                let recycle_rx = block_recycle_rx.clone();
                 loop {
                     let height = height_cursor.fetch_add(1, Ordering::Relaxed);
                     if height >= end {
@@ -442,25 +519,23 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
                         &reorder_depth_w,
                         &watchdog_w,
                     )?;
-                    let loc = &index_for_workers.by_height[height as usize];
-                    let bytes = cache.block_bytes(loc)?;
-                    let mut header_raw = [0u8; 80];
-                    header_raw.copy_from_slice(&bytes[..80]);
-                    let header = bidx_core::BlockHeader::parse(&header_raw);
-                    let hash = bidx_core::dsha256(&header_raw);
-                    // Skip orphaned (stale / side-chain) blocks. Their UTXOs
-                    // were never part of the active chain; indexing them would
-                    // poison the UTXO set and emit duplicate rows. Notify the
-                    // ordered consumer so it advances past this height.
+                    let hash = index_for_workers.block_hashes[height as usize];
+                    // Skip orphaned (stale / side-chain) blocks before touching
+                    // `BlkFile` I/O — `hash` was already computed in the header pass.
                     if let Some(orphans) = &orphan_blocks {
                         if orphans.contains(&hash) {
-                            drop(bytes);
                             orphans_skipped.fetch_add(1, Ordering::Relaxed);
                             send_work_item(&tx, WorkItem::Skipped { height }, &watchdog_w)?;
                             continue;
                         }
                     }
-                    let block = parse_block_full_opts(&bytes, height, hash, &header, parse_opts)?;
+                    let loc = &index_for_workers.by_height[height as usize];
+                    let bytes = cache.block_bytes(loc)?;
+                    let mut header_raw = [0u8; 80];
+                    header_raw.copy_from_slice(&bytes[..80]);
+                    let header = bidx_core::BlockHeader::parse(&header_raw);
+                    let mut block = recycle_rx.try_recv().unwrap_or_default();
+                    parse_block_full_into(&bytes, height, hash, &header, parse_opts, &mut block)?;
                     // Release the `Arc<BlkFile>` reference before blocking on
                     // `tx.send` so an evicted 128 MiB file buffer can be freed
                     // immediately rather than lingering across channel backpressure.
@@ -471,6 +546,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
     });
     // Close the channel so the consumer can terminate.
     drop(tx);
+    drop(block_recycle_rx);
     parse_result?;
 
     let consumer_res = consumer
@@ -478,7 +554,7 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         // coverage-exempt: consumer only returns Err by panicking (not in fixtures)
         .map_err(|_| anyhow::anyhow!("consumer panicked"))?;
     if let Err(consumer_err) = consumer_res {
-        if let Some(h) = ch_handle.take() {
+        if let Some(h) = ch_part_handle.take() {
             if let Ok(Err(ch_err)) = h.join() {
                 return Err(ch_err);
             }
@@ -486,23 +562,59 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         return Err(consumer_err);
     }
 
-    // The load is done: re-enable compaction and compact the UTXO family once,
-    // paying the deferred write I/O in a single pass instead of interleaving it
-    // with the parse. Runs concurrently with the ClickHouse worker loading the
-    // final Parquet part.
+    // Re-enable compaction and compact the UTXO family once, paying the
+    // deferred write I/O in a single pass instead of interleaving it with the
+    // parse. Runs concurrently with the ClickHouse worker loading the final
+    // Parquet part.
     if utxo.finalize_bulk_load()? {
         info!("finalized bulk load: compacted UTXO store");
     }
 
-    if let Some(h) = ch_handle.take() {
-        let stream_ch = h
-            .join()
-            // coverage-exempt: ClickHouse worker only panics on a fatal runtime abort
-            .map_err(|_| anyhow::anyhow!("ClickHouse streaming loader panicked"))??;
-        stream_ch
-            .loader
-            .finish_streaming_load()
+    let ch_finalize = if let Some(h) = ch_part_handle.take() {
+        Some(
+            h.join()
+                // coverage-exempt: ClickHouse worker only panics on a fatal runtime abort
+                .map_err(|_| anyhow::anyhow!("ClickHouse streaming loader panicked"))??,
+        )
+    } else {
+        ch_direct_finalize.take()
+    };
+
+    if let Some((loader, profile)) = ch_finalize {
+        // When indexing from genesis with no skipped orphan gaps, `utxo` holds
+        // the exact live UTXO set (~170M entries on mainnet), so we stream it
+        // directly into `utxos_by_address` instead of scanning + collapsing
+        // 6.17B `outputs UNION ALL inputs` rows in ClickHouse.
+        let skip_utxos_by_address = if start == 0 && cfg.orphan_blocks.is_none() {
+            let live_count = export_live_utxos(&utxo, &loader)
+                .context("export live UTXOs from RocksDB to ClickHouse")?;
+            info!(
+                live_utxos = live_count,
+                "exported live UTXO snapshot to ClickHouse"
+            );
+            true
+        } else {
+            false
+        };
+        let skip_scripthash_map = true;
+        loader
+            .finish_streaming_load_with(bidx_loader::BulkLoadOptions {
+                profile,
+                skip_utxos_by_address,
+                skip_scripthash_map,
+            })
             .context("finalize ClickHouse derived indexes and views")?;
+        let (addr_n, sh_n) = loader
+            .rebuild_address_and_scripthash_par(
+                |ty, hash| bidx_serve::address::render_address(network, ty, hash),
+                bidx_serve::address::scripthash_of,
+            )
+            .context("rebuild address_prefix and scripthash_map")?;
+        info!(
+            address_prefix_rows = addr_n,
+            scripthash_map_rows = sh_n,
+            "rebuilt address_prefix and scripthash_map in fused binary pass"
+        );
     }
 
     progress.finish_with_message("parse complete");
@@ -513,6 +625,48 @@ pub fn run_parse(mut cfg: ParseConfig) -> Result<()> {
         println!("skipped {} orphaned (stale) blocks", skipped);
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum ExportLiveUtxoErr {
+    Utxo(bidx_store::UtxoError),
+    Load(bidx_loader::LoadError),
+}
+
+impl From<bidx_store::UtxoError> for ExportLiveUtxoErr {
+    fn from(e: bidx_store::UtxoError) -> Self {
+        Self::Utxo(e)
+    }
+}
+
+impl From<ExportLiveUtxoErr> for bidx_loader::LoadError {
+    fn from(e: ExportLiveUtxoErr) -> Self {
+        match e {
+            ExportLiveUtxoErr::Load(le) => le,
+            ExportLiveUtxoErr::Utxo(ue) => bidx_loader::LoadError::Client(ue.to_string()),
+        }
+    }
+}
+
+fn export_live_utxos(
+    utxo: &UtxoStore,
+    loader: &bidx_loader::ChLoader,
+) -> Result<usize, bidx_loader::LoadError> {
+    loader.stream_utxos_by_address(|emit| {
+        utxo.for_each_live_utxo(|txid, vout, val| {
+            emit(
+                txid,
+                vout,
+                val.value_sat,
+                val.script_type,
+                val.height,
+                &val.address_hash,
+            )
+            .map_err(ExportLiveUtxoErr::Load)
+        })
+        .map(|_| ())
+        .map_err(Into::into)
+    })
 }
 
 /// Default per-process bound on the number of decoded blk files held in the
@@ -570,6 +724,9 @@ struct CacheInner {
     mru_file_id: AtomicU32,
     /// Optional 8-byte `xor.dat` key resolved once for `blocks_dir`.
     xor_key: Option<[u8; 8]>,
+    /// Optional per-`file_id` known valid data end byte offsets from the
+    /// header pass so `BlkFile::open_with_key_hint` skips re-walking records.
+    file_data_end: Arc<[u64]>,
     /// Maximum resident files. A shared `AtomicUsize` so `shrink_to` (called by
     /// the consumer under memory pressure) lowers the bound for every clone —
     /// each worker holds its own `ThreadFileCache` but they share this inner.
@@ -599,6 +756,16 @@ impl ThreadFileCache {
     /// Like [`ThreadFileCache::new`] but with an explicit resident-file bound,
     /// so a memory plan can scale the decoded-file heap with the ceiling.
     pub(crate) fn with_capacity(blocks_dir: &Path, capacity: usize) -> Self {
+        Self::with_capacity_and_hints(blocks_dir, capacity, &[])
+    }
+
+    /// Construct with both an explicit resident-file bound and per-`file_id`
+    /// valid byte-end hints from [`bidx_core::ChainIndex::file_data_end`].
+    pub(crate) fn with_capacity_and_hints(
+        blocks_dir: &Path,
+        capacity: usize,
+        file_data_end: &[u64],
+    ) -> Self {
         let capacity = capacity.max(1);
         let xor_key = read_xor_key_from_dir(blocks_dir);
         ThreadFileCache {
@@ -606,13 +773,28 @@ impl ThreadFileCache {
             inner: Arc::new(CacheInner {
                 lru: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
                 map: parking_lot::RwLock::new(FxHashMap::default()),
-                inflight: parking_lot::Mutex::new(FxHashMap::default()),
+                inflight: parking_lot::Mutex::<FxHashMap<u32, InflightLoad>>::default(),
                 mru_file_id: AtomicU32::new(u32::MAX),
                 xor_key,
+                file_data_end: Arc::from(file_data_end),
                 capacity: AtomicUsize::new(capacity),
                 #[cfg(test)]
                 opens: AtomicUsize::new(0),
             }),
+        }
+    }
+
+    /// Proactively evict a completed `blkNNNNN.dat` file as soon as the ordered
+    /// consumer finishes applying its highest-height main-chain block.
+    pub(crate) fn evict_file(&self, file_id: u32) {
+        if self.inner.map.write().remove(&file_id).is_some() {
+            let mut lru = self.inner.lru.lock();
+            if let Some(pos) = lru.iter().position(|&id| id == file_id) {
+                lru.remove(pos);
+            }
+            if self.inner.mru_file_id.load(Ordering::Relaxed) == file_id {
+                self.inner.mru_file_id.store(u32::MAX, Ordering::Relaxed);
+            }
         }
     }
 
@@ -684,8 +866,14 @@ impl ThreadFileCache {
             #[cfg(test)]
             self.inner.opens.fetch_add(1, Ordering::Relaxed);
             let path = self.blocks_dir.join(format!("blk{:05}.dat", file_id));
+            let hint = self
+                .inner
+                .file_data_end
+                .get(file_id as usize)
+                .copied()
+                .filter(|&n| n > 0);
             let bf = Arc::new(
-                BlkFile::open_with_key(&path, file_id, self.inner.xor_key)
+                BlkFile::open_with_key_hint(&path, file_id, self.inner.xor_key, hint)
                     .map_err(|e| e.to_string())?,
             );
             self.inner.map.write().insert(file_id, Arc::clone(&bf));
@@ -820,37 +1008,41 @@ impl PressureState {
     }
 }
 
-/// Receives out-of-order parsed blocks, buffers until the next expected
-/// height arrives, applies UTXO changes in order, and hands each enriched block
-/// to a dedicated sink thread that writes Parquet.
-///
-/// The sink runs on its own thread so its file I/O (and zstd compression)
-/// overlaps the RocksDB apply on this thread — they are the two halves of the
-/// consumer's cost and neither depends on the other's result.
+/// Sink destination for `consume_ordered`: either local Parquet part files
+/// (optionally streamed to ClickHouse per closed part) or direct `RowBinary`
+/// pipes into ClickHouse (`--direct-clickhouse`).
+enum SinkBackend {
+    Parquet {
+        out_dir: PathBuf,
+        blocks_per_part: u32,
+        start_part: u32,
+        sink_cfg: SinkConfig,
+        part_tx: Option<Sender<u32>>,
+    },
+    DirectCh(bidx_loader::live_insert::LiveChWriter),
+}
+
+/// Receives out-of-order parsed blocks, buffers until contiguous heights
+/// arrive, applies UTXO changes in 16-block lookahead windows, and hands each
+/// enriched block to a dedicated sink thread (Parquet or direct ClickHouse).
 #[allow(clippy::too_many_arguments)]
 fn consume_ordered(
     rx: Receiver<WorkItem>,
     start: u32,
     end: u32,
-    blocks_per_part: u32,
-    out_dir: &Path,
+    sink_backend: SinkBackend,
     utxo: &UtxoStore,
     progress: &ProgressBar,
+    parsed: Option<&AtomicU64>,
     missing_utxos: &AtomicU64,
     recorder: &DiskRecorder,
     reorder_depth: &AtomicUsize,
-    // Height the consumer is waiting for; workers exempt themselves from
-    // backpressure when their own height matches (see `run_parse`). Without
-    // this the backpressure spin can deadlock: the worker holding `next`
-    // parks, so nothing ever arrives to unblock the consumer.
     next_height: &AtomicU32,
     watchdog: Option<&crate::bench::OomWatchdog>,
-    capture_witness: bool,
-    // The shared decoded-file LRU, so the consumer can shrink it under pressure.
     file_cache: &ThreadFileCache,
-    // The plan's starting file-LRU bound; each relief step halves from the last.
     file_cache_start: usize,
-    part_tx: Option<crossbeam_channel::Sender<u32>>,
+    chain_index: Option<&bidx_core::ChainIndex>,
+    block_recycle_tx: Option<Sender<FullBlock>>,
 ) -> Result<()> {
     let mut buffer: BTreeMap<u32, FullBlock> = BTreeMap::new();
     let mut skipped_queue: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
@@ -858,27 +1050,31 @@ fn consume_ordered(
     next_height.store(next, Ordering::Relaxed);
     let mut pressure = PressureState::new(file_cache_start);
 
-    let sink_cfg = SinkConfig {
-        capture_witness,
-        ..SinkConfig::default()
-    };
-    let start_part = start / blocks_per_part;
-
-    // Dedicated sink thread. Bounded so a slow sink backpressures the consumer
-    // instead of buffering unboundedly; the consumer simply blocks on `send`,
-    // which stops it draining the reorder buffer, which stops the workers.
     let (sink_tx, sink_rx) = bounded::<SinkMsg>(SINK_CHANNEL_DEPTH);
-    let sink_out = out_dir.to_path_buf();
     let sink_handle = std::thread::spawn(move || -> Result<()> {
-        sink_thread_main(
-            sink_rx,
-            &sink_out,
-            blocks_per_part,
-            start_part,
-            sink_cfg,
-            part_tx,
-        )
+        match sink_backend {
+            SinkBackend::Parquet {
+                out_dir,
+                blocks_per_part,
+                start_part,
+                sink_cfg,
+                part_tx,
+            } => sink_thread_main(
+                sink_rx,
+                &out_dir,
+                blocks_per_part,
+                start_part,
+                sink_cfg,
+                part_tx,
+                block_recycle_tx,
+            ),
+            SinkBackend::DirectCh(writer) => {
+                direct_sink_thread_main(sink_rx, writer, block_recycle_tx)
+            }
+        }
     });
+
+    let mut window: Vec<(u32, FullBlock)> = Vec::with_capacity(DEFAULT_UTXO_WINDOW_BLOCKS);
 
     'consume: while let Ok(item) = rx.recv() {
         match item {
@@ -891,37 +1087,30 @@ fn consume_ordered(
             }
         }
 
-        // First, advance the consumer past any skipped heights that are
-        // contiguous with `next`. This unlocks progress when an orphan
-        // block's legitimate data never arrives.
-        while skipped_queue.remove(&next) {
-            tracing::info!(height = next, "skipping orphan block");
-            progress.inc(1);
-            let _ = recorder.on_block_applied(next)?;
-            next += 1;
-            next_height.store(next, Ordering::Relaxed);
-            if next >= end {
-                break 'consume;
+        loop {
+            while skipped_queue.remove(&next) {
+                tracing::info!(height = next, "skipping orphan block");
+                progress.inc(1);
+                let _ = recorder.on_block_applied(next)?;
+                next += 1;
+                next_height.store(next, Ordering::Relaxed);
+                if next >= end {
+                    break 'consume;
+                }
             }
-        }
 
-        while let Some(block) = buffer.remove(&next) {
-            // Poll the RSS watchdog once per block. It is a relaxed atomic
-            // load, so the cost is nil next to apply_block.
-            //
-            // Two stages, and the order matters. First, on the *rising edge* of
-            // the soft threshold, shed cache memory (shrink the recent-UTXO
-            // cache and the block cache, and halve the decoded-file LRU) so the
-            // hard ceiling is not reached. Only if RSS has *still* crossed the
-            // hard ceiling do we abort. The soft stage is the whole point:
-            // aborting at the hard limit is too late — by then an allocation
-            // may already have failed, and RocksDB does not handle allocation
-            // failure, it segfaults.
-            //
-            // Edge-triggered, not level-triggered: the watchdog flag is sticky
-            // until RSS recovers, so shedding on every pressured block would
-            // floor the caches and wreck throughput. One step per episode, and
-            // the next episode can only start after RSS has fallen back.
+            window.clear();
+            while window.len() < DEFAULT_UTXO_WINDOW_BLOCKS && (next + window.len() as u32) < end {
+                let target_h = next + window.len() as u32;
+                let Some(block) = buffer.remove(&target_h) else {
+                    break;
+                };
+                window.push((target_h, block));
+            }
+            if window.is_empty() {
+                break;
+            }
+
             if let Some(w) = watchdog {
                 pressure.poll(
                     w.is_pressured(),
@@ -933,60 +1122,52 @@ fn consume_ordered(
                     return Err(w.tripped_error());
                 }
             }
-            // Drained one from reorder buffer — signal workers that there
-            // is space for more.
-            reorder_depth.fetch_sub(1, Ordering::Relaxed);
 
-            let mut block = block;
-            let res = utxo.apply_block(next, &block.txs, &block.inputs, &block.outputs)?;
-            missing_utxos.fetch_add(res.missing, Ordering::Relaxed);
+            let drained_n = window.len();
+            reorder_depth.fetch_sub(drained_n, Ordering::Relaxed);
 
-            // Enrich txs with fees and block with total fee.
-            //
-            // By consensus only `tx_index == 0` can be a coinbase tx, so
-            // checking `block.inputs.first()` is O(1) with zero per-block
-            // `Vec<bool>` heap allocation or full-input scan.
-            let first_is_coinbase = block
-                .inputs
-                .first()
-                .is_some_and(|inp| inp.is_coinbase && inp.tx_index == 0);
-            let mut total_fee = 0u64;
-            for (i, tx) in block.txs.iter_mut().enumerate() {
-                tx.fee = res.fees[i];
-                if !(i == 0 && first_is_coinbase) {
-                    total_fee = total_fee.saturating_add(res.fees[i]);
+            if let Some(idx) = chain_index {
+                for &(h, _) in &window {
+                    let loc = &idx.by_height[h as usize];
+                    if idx.is_last_height_in_file(h, loc.file_id) {
+                        file_cache.evict_file(loc.file_id);
+                    }
                 }
             }
-            block.block_row.total_fee = total_fee;
 
-            // Hand the fully-enriched block to the sink thread. A send error
-            // means the sink already failed; surface its error, not a generic
-            // "channel closed".
-            if sink_tx
-                .send(SinkMsg::Block {
-                    block,
-                    spends: res.spends,
-                })
-                .is_err()
-            {
-                // coverage-exempt: only reached if the background Parquet sink
-                // thread died mid-run on a filesystem fault.
-                return Err(reap_dead_sink(sink_handle));
+            let stats = {
+                let mut refs: Vec<WindowBlock<'_>> = window
+                    .iter_mut()
+                    .map(|(h, blk)| WindowBlock {
+                        height: *h,
+                        block_row: &mut blk.block_row,
+                        txs: &mut blk.txs,
+                        inputs: &mut blk.inputs,
+                        outputs: &blk.outputs,
+                    })
+                    .collect();
+                utxo.apply_window_in_place(&mut refs)?
+            };
+            missing_utxos.fetch_add(stats.missing, Ordering::Relaxed);
+            if let Some(p) = parsed {
+                p.fetch_add(drained_n as u64, Ordering::Relaxed);
             }
 
-            progress.inc(1);
-            let _ = recorder.on_block_applied(next)?;
-            next += 1;
-            next_height.store(next, Ordering::Relaxed);
+            for (h, block) in window.drain(..) {
+                if sink_tx.send(SinkMsg::Block { block }).is_err() {
+                    return Err(reap_dead_sink(sink_handle));
+                }
+                progress.inc(1);
+                let _ = recorder.on_block_applied(h)?;
+                next = h + 1;
+                next_height.store(next, Ordering::Relaxed);
+            }
             if next >= end {
                 break 'consume;
             }
         }
     }
 
-    // Ask the sink to flush its last part and close, then reap it. Join before
-    // the early-exit/truncation check so a sink failure is reported even on a
-    // complete range.
     let _ = sink_tx.send(SinkMsg::Finish);
     drop(sink_tx);
     let sink_res = sink_handle
@@ -1001,41 +1182,49 @@ fn consume_ordered(
     sink_res
 }
 
-// coverage-exempt: only reached if the background Parquet sink thread died mid-run on an I/O fault.
+// coverage-exempt: only reached if the background sink thread died mid-run on an I/O or pipe fault.
 fn reap_dead_sink(sink_handle: std::thread::JoinHandle<Result<()>>) -> anyhow::Error {
     let e = sink_handle
         .join()
         .unwrap_or_else(|_| Err(anyhow::anyhow!("sink thread panicked")));
-    e.unwrap_err().context("parquet sink thread failed")
+    e.unwrap_err().context("sink thread failed")
 }
 
 /// A message from the ordered consumer to the sink thread.
 enum SinkMsg {
-    /// An enriched block (fees filled, total_fee set) plus its spend rows.
-    Block {
-        block: FullBlock,
-        spends: Vec<bidx_core::SpendRow>,
-    },
+    /// An enriched block (fees filled, total_fee set, inputs enriched with spent_*).
+    Block { block: FullBlock },
     /// Flush the open part and stop.
     Finish,
 }
 
-/// The sink thread body: owns the `ParquetSink`, rotates part files by height,
-/// writes every row kind for each block via concrete SoA column builders, and
-/// notifies the optional ClickHouse streaming loader as each part closes.
+#[inline]
+fn recycle_buffers(mut block: FullBlock, block_recycle_tx: Option<&Sender<FullBlock>>) {
+    if let Some(btx) = block_recycle_tx {
+        block.clear_keep_capacity();
+        let _ = btx.try_send(block);
+    }
+}
+
+/// The Parquet sink thread body: owns the `ParquetSink`, rotates part files by
+/// height, writes every row kind for each block via concrete SoA column
+/// builders, recycles `FullBlock` buffers, and notifies the optional ClickHouse
+/// streaming loader as each part closes.
+#[allow(clippy::too_many_arguments)]
 fn sink_thread_main(
     rx: Receiver<SinkMsg>,
     out_dir: &Path,
     blocks_per_part: u32,
     start_part: u32,
     sink_cfg: SinkConfig,
-    part_tx: Option<crossbeam_channel::Sender<u32>>,
+    part_tx: Option<Sender<u32>>,
+    block_recycle_tx: Option<Sender<FullBlock>>,
 ) -> Result<()> {
     let mut part_id = start_part;
     let mut sink = ParquetSink::create(out_dir, part_id, sink_cfg)?;
     while let Ok(msg) = rx.recv() {
         match msg {
-            SinkMsg::Block { block, spends } => {
+            SinkMsg::Block { block } => {
                 // Rotate part file at boundaries.
                 let wanted_part = block.block_row.height / blocks_per_part;
                 if wanted_part != part_id {
@@ -1053,9 +1242,9 @@ fn sink_thread_main(
                     &block.txs,
                     &block.inputs,
                     &block.outputs,
-                    &spends,
                     &block.witnesses,
                 )?;
+                recycle_buffers(block, block_recycle_tx.as_ref());
             }
             SinkMsg::Finish => break,
         }
@@ -1066,6 +1255,44 @@ fn sink_thread_main(
             .map_err(|_| anyhow::anyhow!("ClickHouse streaming loader stopped early"))?;
     }
     Ok(())
+}
+
+/// Direct ClickHouse `RowBinary` sink thread body (`--direct-clickhouse`):
+/// streams base-entity rows into 8 MiB-buffered `clickhouse-client` pipes with
+/// zero Parquet intermediate I/O and recycles `FullBlock` buffers back to
+/// workers.
+fn direct_sink_thread_main(
+    rx: Receiver<SinkMsg>,
+    mut writer: bidx_loader::live_insert::LiveChWriter,
+    block_recycle_tx: Option<Sender<FullBlock>>,
+) -> Result<()> {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            SinkMsg::Block { block } => {
+                writer.write_block(&block.block_row);
+                for r in &block.txs {
+                    writer.write_tx(r);
+                }
+                for r in &block.inputs {
+                    writer.write_input(r);
+                }
+                for r in &block.outputs {
+                    writer.write_output(r);
+                }
+                for r in &block.witnesses {
+                    writer.write_witness(r);
+                }
+                writer
+                    .flush_if_needed()
+                    .context("ClickHouse direct RowBinary write failed")?;
+                recycle_buffers(block, block_recycle_tx.as_ref());
+            }
+            SinkMsg::Finish => break,
+        }
+    }
+    writer
+        .finish()
+        .context("ClickHouse direct RowBinary finish failed")
 }
 
 /// Debug helper: parse a single block and print its rows as JSON.
@@ -1400,9 +1627,9 @@ mod tests {
         .expect("run_parse");
         // Layout: out/<entity>/part-NNNNN.parquet, one entity dir per kind.
         // With 3 blocks and blocks_per_part=2 we expect part-000000 (b0,b1)
-        // and part-000001 (b2) to exist for each of the 5 kinds.
+        // and part-000001 (b2) to exist for each of the 4 base kinds.
         let mut walk = Vec::new();
-        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+        for entity in ["blocks", "transactions", "inputs", "outputs"] {
             let dir = out.join(entity);
             if dir.exists() {
                 for e in std::fs::read_dir(&dir).unwrap().flatten() {
@@ -1419,14 +1646,14 @@ mod tests {
             .filter(|n| n.contains("part-00001.parquet"))
             .count();
         assert_eq!(
-            has_part0, 5,
-            "expected all 5 entites to have part-00000: {:?}",
+            has_part0, 4,
+            "expected all 4 entities to have part-00000: {:?}",
             walk
         );
         // With blocks_per_part=2 the 3rd block (h=2) lands in part 1.
         assert_eq!(
-            has_part1, 5,
-            "expected all 5 entities to have part-00001: {:?}",
+            has_part1, 4,
+            "expected all 4 entities to have part-00001: {:?}",
             walk
         );
         let _ = fs::remove_dir_all(&blocks_dir);
@@ -1581,9 +1808,18 @@ mod tests {
                 .as_nanos()
         ));
         let (tx, rx) = bounded::<SinkMsg>(4);
+        let (recycle_tx, recycle_rx) = bounded::<FullBlock>(4);
         let out_for_thread = out.clone();
         let handle = std::thread::spawn(move || {
-            sink_thread_main(rx, &out_for_thread, 2, 0, SinkConfig::default(), None)
+            sink_thread_main(
+                rx,
+                &out_for_thread,
+                2,
+                0,
+                SinkConfig::default(),
+                None,
+                Some(recycle_tx),
+            )
         });
 
         // Height 0 and 1 -> part 0; height 2 -> part 1 (boundary at 2/2=1).
@@ -1607,7 +1843,6 @@ mod tests {
                 height: h,
                 tx_index: 1,
                 input_index: 0,
-                txid: [0x22; 32],
                 prev_txid: [0xEE; 32],
                 prev_vout: 0,
                 script_sig_len: 0,
@@ -1615,37 +1850,29 @@ mod tests {
                 witness_items: 0,
                 witness_bytes: 0,
                 is_coinbase: false,
+                spent_value_sat: 5,
+                spent_script_type: 1,
+                spent_address_hash: [0xCC; 32],
+                spent_height: 0,
             });
             block.outputs.push(bidx_core::OutputRow {
                 height: h,
                 tx_index: 1,
                 output_index: 0,
-                txid: [0x22; 32],
                 value_sat: 10,
                 script_pubkey_len: 0,
                 script_type: 1,
                 address_hash: [0xBB; 32],
             });
-            let spends = vec![bidx_core::SpendRow {
-                height: h,
-                spending_tx_index: 1,
-                spending_input_index: 0,
-                spending_txid: [0x22; 32],
-                spent_txid: [0xEE; 32],
-                spent_vout: 0,
-                spent_value_sat: 5,
-                spent_script_type: 1,
-                spent_address_hash: [0xCC; 32],
-                spent_height: 0,
-            }];
-            tx.send(SinkMsg::Block { block, spends }).unwrap();
+            tx.send(SinkMsg::Block { block }).unwrap();
         }
         tx.send(SinkMsg::Finish).unwrap();
         drop(tx);
         handle.join().unwrap().unwrap();
+        assert_eq!(recycle_rx.len(), 3, "all 3 FullBlocks must be recycled");
 
         for part in ["part-00000.parquet", "part-00001.parquet"] {
-            for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+            for entity in ["blocks", "transactions", "inputs", "outputs"] {
                 let p = out.join(entity).join(part);
                 assert!(p.exists(), "missing {:?}", p);
             }
@@ -1689,7 +1916,6 @@ mod tests {
                 height,
                 tx_index: 0,
                 input_index: 0,
-                txid,
                 prev_txid: [0u8; 32],
                 prev_vout: 0xFFFF_FFFF,
                 script_sig_len: 0,
@@ -1697,12 +1923,15 @@ mod tests {
                 witness_items: 0,
                 witness_bytes: 0,
                 is_coinbase: true,
+                spent_value_sat: 0,
+                spent_script_type: 0,
+                spent_address_hash: [0u8; 32],
+                spent_height: 0,
             }],
             outputs: vec![bidx_core::OutputRow {
                 height,
                 tx_index: 0,
                 output_index: 0,
-                txid,
                 value_sat: 100,
                 script_pubkey_len: 0,
                 script_type: 0,
@@ -2074,18 +2303,24 @@ mod tests {
             rx,
             0,
             2,
-            10,
-            &out_dir,
+            SinkBackend::Parquet {
+                out_dir: out_dir.clone(),
+                blocks_per_part: 10,
+                start_part: 0,
+                sink_cfg: SinkConfig::default(),
+                part_tx: None,
+            },
             &store,
             &progress,
+            None,
             &missing,
             &recorder,
             &reorder,
             &next_h,
             None,
-            false,
             &file_cache,
             2,
+            None,
             None,
         )
         .unwrap_err();
@@ -2129,18 +2364,24 @@ mod tests {
             rx2,
             0,
             1,
-            10,
-            &out_dir,
+            SinkBackend::Parquet {
+                out_dir: out_dir.clone(),
+                blocks_per_part: 10,
+                start_part: 0,
+                sink_cfg: SinkConfig::default(),
+                part_tx: None,
+            },
             &store,
             &progress,
+            None,
             &missing,
             &recorder,
             &reorder,
             &next_h,
             Some(&tripped_wd),
-            false,
             &file_cache,
             2,
+            None,
             None,
         )
         .unwrap_err();
@@ -2810,8 +3051,10 @@ mod tests {
             utxo_cache_mb: None,
             stream_clickhouse: Some(StreamClickHouseConfig {
                 loader,
-                mode: bidx_loader::LoadMode::Upload,
-                unlink_loaded_parts: true,
+                mode: StreamChMode::ParquetUpload {
+                    unlink_loaded_parts: true,
+                },
+                profile: bidx_loader::schema::IndexProfile::Full,
             }),
             rpc_transport: None,
         })
@@ -2830,8 +3073,77 @@ mod tests {
                 "part 1 must be unlinked for {entity}"
             );
         }
+        assert!(log.contains("INSERT INTO btc.utxos_by_address ("));
         assert!(log.contains("INSERT INTO btc.outputs_by_address "));
         assert!(log.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS btc.outputs_by_address_mv"));
+
+        // Direct RowBinary mode (`--direct-clickhouse`): bypasses Parquet files
+        // completely and streams directly over `FORMAT RowBinary` pipes.
+        let bin_row_path =
+            std::env::temp_dir().join(format!("bidx-directch-row-{}.bin", std::process::id()));
+        let mut raw_33 = vec![2u8];
+        raw_33.extend_from_slice(&[0x11; 32]);
+        std::fs::write(&bin_row_path, &raw_33).unwrap();
+        let direct_script = write_fake_ch_script(
+            "direct-ok",
+            format!(
+                "#!/bin/sh\nq=''\nfor a in \"$@\"; do case \"$a\" in --query=*) q=\"$a\";; esac; done\n\
+                 case \"$q\" in *SELECT*DISTINCT*script_type*) cat '{}'; exit 0;; esac\n\
+                 cat >/dev/null\necho \"$q\" >> \"$0.log\"\nexit 0\n",
+                bin_row_path.display()
+            ),
+        );
+        let direct_loader = bidx_loader::ChLoader::with_client(
+            bidx_loader::ChConfig {
+                database: "btc".into(),
+                ..bidx_loader::ChConfig::default()
+            },
+            direct_script.clone(),
+        );
+        let out_direct =
+            std::env::temp_dir().join(format!("bidx-directch-out-{}", std::process::id()));
+        let utxo_direct =
+            std::env::temp_dir().join(format!("bidx-directch-utxo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out_direct);
+        let _ = fs::remove_dir_all(&utxo_direct);
+        std::fs::create_dir_all(&utxo_direct).unwrap();
+        run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out_direct.clone(),
+            utxo: utxo_direct.clone(),
+            start: 1, // exercises non-genesis `skip_utxos_by_address = false` branch
+            end: Some(3),
+            blocks_per_part: 2,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo_direct.join("ckpts.txt")),
+            orphan_blocks: None,
+            capture_witness: true,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: Some(StreamClickHouseConfig {
+                loader: direct_loader,
+                mode: StreamChMode::DirectRowBinary,
+                profile: bidx_loader::schema::IndexProfile::Serving,
+            }),
+            rpc_transport: None,
+        })
+        .expect("direct RowBinary parse to ClickHouse");
+        assert!(
+            !out_direct.exists(),
+            "direct RowBinary mode must write zero Parquet files"
+        );
+        let dlog = std::fs::read_to_string(format!("{}.log", direct_script.display())).unwrap();
+        assert!(dlog.contains("INSERT INTO btc.blocks ("));
+        assert!(dlog.contains("INSERT INTO btc.inputs ("));
+        assert!(!dlog.contains("INSERT INTO btc.outputs_by_address "));
+        let _ = fs::remove_dir_all(&utxo_direct);
+        let _ = fs::remove_file(&bin_row_path);
+        let _ = fs::remove_file(format!("{}.log", direct_script.display()));
+        let _ = fs::remove_file(&direct_script);
 
         let _ = fs::remove_dir_all(&blocks_dir);
         let _ = fs::remove_dir_all(&out);
@@ -2902,8 +3214,10 @@ mod tests {
                     bidx_loader::ChConfig::default(),
                     fail_all.clone(),
                 ),
-                mode: bidx_loader::LoadMode::ServerFile,
-                unlink_loaded_parts: false,
+                mode: StreamChMode::ParquetServerFile {
+                    unlink_loaded_parts: false,
+                },
+                profile: bidx_loader::schema::IndexProfile::Serving,
             }),
             rpc_transport: None,
         })
@@ -2945,8 +3259,10 @@ mod tests {
                         bidx_loader::ChConfig::default(),
                         fail_insert.clone(),
                     ),
-                    mode: bidx_loader::LoadMode::ServerFile,
-                    unlink_loaded_parts: false,
+                    mode: StreamChMode::ParquetServerFile {
+                        unlink_loaded_parts: false,
+                    },
+                    profile: bidx_loader::schema::IndexProfile::Serving,
                 }),
                 rpc_transport: None,
             })
@@ -2959,10 +3275,10 @@ mod tests {
         }
         let _ = fs::remove_file(&fail_insert);
 
-        // 4) `finish_streaming_load` fails on backfill (`TRUNCATE TABLE`).
+        // 4) `finish_streaming_load_with` fails on backfill (`MATERIALIZE PROJECTION`).
         let fail_finish = write_fake_ch_script(
             "finish-fail",
-            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --query=*TRUNCATE*) echo 'backfill boom' >&2; exit 1;; esac; done\nexit 0\n"
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in *MATERIALIZE*PROJECTION*) echo 'backfill boom' >&2; exit 1;; esac; done\ncat >/dev/null\nexit 0\n"
                 .to_string(),
         );
         let out4 = std::env::temp_dir().join(format!("bidx-cherr-o4-{}", std::process::id()));
@@ -2988,15 +3304,135 @@ mod tests {
                     bidx_loader::ChConfig::default(),
                     fail_finish.clone(),
                 ),
-                mode: bidx_loader::LoadMode::ServerFile,
-                unlink_loaded_parts: false,
+                mode: StreamChMode::ParquetServerFile {
+                    unlink_loaded_parts: false,
+                },
+                profile: bidx_loader::schema::IndexProfile::Serving,
             }),
             rpc_transport: None,
         })
         .unwrap_err();
         assert!(format!("{e4:#}").contains("finalize ClickHouse"), "{e4:#}");
-
         let _ = fs::remove_file(&fail_finish);
+
+        // 5) `stream_utxos_by_address` fails on live UTXO export (`INSERT INTO ... utxos_by_address`).
+        let fail_utxo_export = write_fake_ch_script(
+            "utxo-export-fail",
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in *INSERT*utxos_by_address*) echo 'utxo export boom' >&2; exit 1;; esac; done\ncat >/dev/null\nexit 0\n"
+                .to_string(),
+        );
+        let out5 = std::env::temp_dir().join(format!("bidx-cherr-o5-{}", std::process::id()));
+        let e5 = run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: out5.clone(),
+            utxo: utxo.join("u5"),
+            start: 0,
+            end: Some(1),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("c5")),
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: Some(StreamClickHouseConfig {
+                loader: bidx_loader::ChLoader::with_client(
+                    bidx_loader::ChConfig::default(),
+                    fail_utxo_export.clone(),
+                ),
+                mode: StreamChMode::DirectRowBinary,
+                profile: bidx_loader::schema::IndexProfile::Serving,
+            }),
+            rpc_transport: None,
+        })
+        .unwrap_err();
+        assert!(format!("{e5:#}").contains("export live UTXOs"), "{e5:#}");
+        let _ = fs::remove_file(&fail_utxo_export);
+        let _ = fs::remove_dir_all(&out5);
+
+        // 6) `direct_sink_thread_main` fails on `writer.finish()` when a RowBinary pipe exits non-zero.
+        let fail_direct_pipe = write_fake_ch_script(
+            "direct-pipe-fail",
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in *FORMAT*RowBinary*) cat >/dev/null; echo 'pipe boom' >&2; exit 1;; esac; done\nexit 0\n"
+                .to_string(),
+        );
+        let e6 = run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: PathBuf::new(),
+            utxo: utxo.join("u6"),
+            start: 0,
+            end: Some(1),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("c6")),
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: Some(StreamClickHouseConfig {
+                loader: bidx_loader::ChLoader::with_client(
+                    bidx_loader::ChConfig::default(),
+                    fail_direct_pipe.clone(),
+                ),
+                mode: StreamChMode::DirectRowBinary,
+                profile: bidx_loader::schema::IndexProfile::Serving,
+            }),
+            rpc_transport: None,
+        })
+        .unwrap_err();
+        assert!(
+            format!("{e6:#}").contains("ClickHouse direct RowBinary finish failed"),
+            "{e6:#}"
+        );
+        let _ = fs::remove_file(&fail_direct_pipe);
+
+        // 7) `rebuild_address_and_scripthash_par` fails after `finish_streaming_load_with`.
+        let fail_addr_rebuild = write_fake_ch_script(
+            "addr-rebuild-fail",
+            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in *SELECT*DISTINCT*script_type*) echo 'addr rebuild boom' >&2; exit 1;; esac; done\ncat >/dev/null\nexit 0\n"
+                .to_string(),
+        );
+        let e7 = run_parse(ParseConfig {
+            blocks_dir: blocks_dir.clone(),
+            out: PathBuf::new(),
+            utxo: utxo.join("u7"),
+            start: 0,
+            end: Some(1),
+            blocks_per_part: 10,
+            threads: Some(1),
+            rpc_url: None,
+            rpc_cookie: None,
+            skip_disk_check: true,
+            network: Some(bidx_core::Network::Mainnet),
+            checkpoint_file: Some(utxo.join("c7")),
+            orphan_blocks: None,
+            capture_witness: false,
+            block_cache_mb: None,
+            utxo_cache_mb: None,
+            stream_clickhouse: Some(StreamClickHouseConfig {
+                loader: bidx_loader::ChLoader::with_client(
+                    bidx_loader::ChConfig::default(),
+                    fail_addr_rebuild.clone(),
+                ),
+                mode: StreamChMode::DirectRowBinary,
+                profile: bidx_loader::schema::IndexProfile::Serving,
+            }),
+            rpc_transport: None,
+        })
+        .unwrap_err();
+        assert!(
+            format!("{e7:#}").contains("rebuild address_prefix and scripthash_map"),
+            "{e7:#}"
+        );
+        let _ = fs::remove_file(&fail_addr_rebuild);
         let _ = fs::remove_dir_all(&out2);
         let _ = fs::remove_dir_all(&out4);
         let _ = fs::remove_dir_all(&blocks_dir);
@@ -3012,17 +3448,15 @@ mod tests {
         drop(prx);
         tx.send(SinkMsg::Block {
             block: synthetic_full_block(0),
-            spends: Vec::new(),
         })
         .unwrap();
         tx.send(SinkMsg::Block {
             block: synthetic_full_block(2),
-            spends: Vec::new(),
         })
         .unwrap();
         drop(tx);
-        let e_rot =
-            sink_thread_main(rx, &out_rot, 2, 0, SinkConfig::default(), Some(ptx)).unwrap_err();
+        let e_rot = sink_thread_main(rx, &out_rot, 2, 0, SinkConfig::default(), Some(ptx), None)
+            .unwrap_err();
         assert!(e_rot.to_string().contains("stopped early"));
         let _ = fs::remove_dir_all(&out_rot);
 
@@ -3032,9 +3466,44 @@ mod tests {
         let (ptx2, prx2) = bounded::<u32>(1);
         drop(prx2);
         tx2.send(SinkMsg::Finish).unwrap();
-        let e_fin =
-            sink_thread_main(rx2, &out_fin, 2, 0, SinkConfig::default(), Some(ptx2)).unwrap_err();
+        let e_fin = sink_thread_main(rx2, &out_fin, 2, 0, SinkConfig::default(), Some(ptx2), None)
+            .unwrap_err();
         assert!(e_fin.to_string().contains("stopped early"));
         let _ = fs::remove_dir_all(&out_fin);
+
+        // Also cover `direct_sink_thread_main` writing witness rows + recycling buffers.
+        let _g = crate::testlock::fork_guard();
+        let w_script =
+            write_fake_ch_script("direct-wit", "#!/bin/sh\ncat >/dev/null\nexit 0\n".into());
+        let writer = bidx_loader::live_insert::LiveChWriter::open_bulk(
+            &bidx_loader::ChConfig::default(),
+            w_script.clone(),
+            true,
+        )
+        .unwrap();
+        let (dtx, drx) = bounded::<SinkMsg>(4);
+        let (rtx, rrx) = bounded::<FullBlock>(4);
+        let mut blk = synthetic_full_block(0);
+        blk.witnesses.push(bidx_core::WitnessRow {
+            height: 0,
+            tx_index: 0,
+            input_index: 0,
+            item_index: 0,
+            item_len: 2,
+            item_bytes: vec![0xAA, 0xBB],
+        });
+        dtx.send(SinkMsg::Block { block: blk }).unwrap();
+        dtx.send(SinkMsg::Finish).unwrap();
+        direct_sink_thread_main(drx, writer, Some(rtx)).unwrap();
+        assert!(rrx.try_recv().is_ok());
+        let _ = fs::remove_file(&w_script);
+
+        // Exercise `ExportLiveUtxoErr` conversions on both `Load` and `Utxo` variants.
+        let ue = ExportLiveUtxoErr::from(bidx_store::UtxoError::NoTip);
+        let le_from_utxo: bidx_loader::LoadError = ue.into();
+        assert!(le_from_utxo.to_string().contains("tip state missing"));
+        let le_from_load: bidx_loader::LoadError =
+            ExportLiveUtxoErr::Load(bidx_loader::LoadError::NoClient).into();
+        assert!(matches!(le_from_load, bidx_loader::LoadError::NoClient));
     }
 }

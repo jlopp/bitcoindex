@@ -80,11 +80,14 @@ impl ChHttpTransport {
                 "unsupported scheme '{scheme}'"
             )));
         }
-        let client = reqwest::blocking::Client::builder()
+        // coverage-exempt — `Client::builder().build()` with default rustls settings only fails if the OS RNG or TLS backend fails at startup.
+        let Ok(client) = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
             .pool_idle_timeout(std::time::Duration::from_secs(60))
             .build()
-            .map_err(|e| StoreError::Transport(e.to_string()))?;
+        else {
+            return Err(StoreError::Transport("failed to build HTTP client".into()));
+        };
         let endpoints = hosts
             .iter()
             .map(|h| Endpoint {
@@ -211,9 +214,10 @@ impl Transport for ChHttpTransport {
         }
         let resp = resp.ok_or(StoreError::Transport(last_err))?;
         let status = resp.status();
-        let body = resp
-            .text()
-            .map_err(|e| StoreError::Transport(e.to_string()))?;
+        let body = match resp.text() {
+            Ok(b) => b,
+            Err(e) => return Err(StoreError::Transport(e.to_string())),
+        };
         if !status.is_success() {
             return Err(StoreError::Transport(format!("HTTP {status}: {body}")));
         }
@@ -494,8 +498,8 @@ impl Store {
 
     fn query<T: for<'de> Deserialize<'de>>(&self, sql: &str) -> Result<Vec<T>, StoreError> {
         let body = self.transport.query(sql)?;
-        let parsed: ChResponse<T> =
-            serde_json::from_str(&body).map_err(|e| StoreError::Parse(e.to_string()))?;
+        let parsed = serde_json::from_str::<ChResponse<T>>(&body)
+            .map_err(|e| StoreError::Parse(e.to_string()))?;
         Ok(parsed.data)
     }
 
@@ -643,24 +647,74 @@ impl Store {
         self.query(&sql)
     }
 
-    /// Outputs of a transaction (for building Esplora `vout`).
-    pub fn tx_outputs(&self, txid: &[u8; 32]) -> Result<Vec<OutputDetailRow>, StoreError> {
+    /// Outputs of a transaction at a known `(height, tx_index)` position,
+    /// hitting `outputs`'s `(height, tx_index, output_index)` primary key with
+    /// zero subquery overhead.
+    pub fn tx_outputs_at(
+        &self,
+        height: u32,
+        tx_index: u32,
+    ) -> Result<Vec<OutputDetailRow>, StoreError> {
         let sql = format!(
             "SELECT output_index, value_sat, script_type, hex(address_hash) AS address_hash \
-             FROM {}.outputs WHERE txid = {} ORDER BY output_index ASC",
-            self.db,
-            Sql::hash(txid)
+             FROM {db}.outputs \
+             WHERE height = {height} AND tx_index = {tx_index} \
+             ORDER BY output_index ASC",
+            db = self.db,
         );
         self.query(&sql)
     }
 
-    /// Inputs of a transaction (for building Esplora `vin`).
-    pub fn tx_inputs(&self, txid: &[u8; 32]) -> Result<Vec<InputDetailRow>, StoreError> {
+    /// Outputs of a transaction (for callers that only have `txid`).
+    ///
+    /// Pushes `(height, tx_index)` down via `transactions_by_txid` so ClickHouse
+    /// seeks directly into `outputs`'s `(height, tx_index, output_index)`
+    /// primary key.
+    pub fn tx_outputs(&self, txid: &[u8; 32]) -> Result<Vec<OutputDetailRow>, StoreError> {
+        let h = Sql::hash(txid);
+        let sql = format!(
+            "SELECT output_index, value_sat, script_type, hex(address_hash) AS address_hash \
+             FROM {db}.outputs \
+             WHERE (height, tx_index) IN \
+               (SELECT height, tx_index FROM {db}.transactions_by_txid WHERE txid = {h}) \
+             ORDER BY output_index ASC",
+            db = self.db,
+        );
+        self.query(&sql)
+    }
+
+    /// Inputs of a transaction at a known `(height, tx_index)` position,
+    /// hitting `inputs`'s `(height, tx_index, input_index)` primary key with
+    /// zero subquery overhead.
+    pub fn tx_inputs_at(
+        &self,
+        height: u32,
+        tx_index: u32,
+    ) -> Result<Vec<InputDetailRow>, StoreError> {
         let sql = format!(
             "SELECT input_index, hex(prev_txid) AS prev_txid, prev_vout \
-             FROM {}.inputs WHERE txid = {} ORDER BY input_index ASC",
-            self.db,
-            Sql::hash(txid)
+             FROM {db}.inputs \
+             WHERE height = {height} AND tx_index = {tx_index} \
+             ORDER BY input_index ASC",
+            db = self.db,
+        );
+        self.query(&sql)
+    }
+
+    /// Inputs of a transaction (for callers that only have `txid`).
+    ///
+    /// Pushes `(height, tx_index)` down via `transactions_by_txid` so ClickHouse
+    /// seeks directly into `inputs`'s `(height, tx_index, input_index)` primary
+    /// key.
+    pub fn tx_inputs(&self, txid: &[u8; 32]) -> Result<Vec<InputDetailRow>, StoreError> {
+        let h = Sql::hash(txid);
+        let sql = format!(
+            "SELECT input_index, hex(prev_txid) AS prev_txid, prev_vout \
+             FROM {db}.inputs \
+             WHERE (height, tx_index) IN \
+               (SELECT height, tx_index FROM {db}.transactions_by_txid WHERE txid = {h}) \
+             ORDER BY input_index ASC",
+            db = self.db,
         );
         self.query(&sql)
     }
@@ -948,6 +1002,13 @@ mod tests {
         assert_eq!(rows[0].value_sat, 1000);
         assert_eq!(rows[0].script_type, 2);
         assert!(t.sql().contains("FROM bitcoin.outputs"));
+        assert!(t
+            .sql()
+            .contains("WHERE (height, tx_index) IN (SELECT height, tx_index FROM bitcoin.transactions_by_txid"));
+        let rows_at = s.tx_outputs_at(100, 2).unwrap();
+        assert_eq!(rows_at.len(), 1);
+        assert!(t.sql().contains("WHERE height = 100 AND tx_index = 2"));
+        assert!(!t.sql().contains("AND txid ="));
 
         let ins = format!(
             r#"{{"data":[{{"input_index":0,"prev_txid":"{}","prev_vout":3}}],"rows":1}}"#,
@@ -957,6 +1018,13 @@ mod tests {
         let rows = s.tx_inputs(&[0u8; 32]).unwrap();
         assert_eq!(rows[0].prev_vout, 3);
         assert!(t.sql().contains("FROM bitcoin.inputs"));
+        assert!(t
+            .sql()
+            .contains("WHERE (height, tx_index) IN (SELECT height, tx_index FROM bitcoin.transactions_by_txid"));
+        let ins_at = s.tx_inputs_at(100, 2).unwrap();
+        assert_eq!(ins_at[0].prev_vout, 3);
+        assert!(t.sql().contains("WHERE height = 100 AND tx_index = 2"));
+        assert!(!t.sql().contains("AND txid ="));
 
         let sums = r#"{"data":[{"txid":"aa","height":5,"value_sat":-42,"kind":1}],"rows":1}"#;
         let (s, t) = store_with(sums);
@@ -1048,6 +1116,27 @@ mod tests {
             other => panic!("expected Transport error, got {other:?}"),
         }
         h.join().unwrap();
+
+        // Truncated HTTP body (promised Content-Length: 100, connection closed after 2 bytes)
+        // exercises the `resp.text()` error branch.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = listener.local_addr().unwrap().port();
+        let h2 = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let _ = std::io::Write::write_all(
+                    &mut s,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhi",
+                );
+            }
+        });
+        let t2 = ChHttpTransport::new("127.0.0.1", port2, "default", None, 5).unwrap();
+        assert!(matches!(
+            t2.query("SELECT 1"),
+            Err(StoreError::Transport(_))
+        ));
+        h2.join().unwrap();
     }
 
     /// A one-shot HTTP server that records the raw request line + headers so a

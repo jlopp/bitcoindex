@@ -19,12 +19,16 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+/// Default per-table `RowBinary` buffer threshold (`8 MiB`) before a bulk
+/// `--direct-clickhouse` pipe flushes to `clickhouse-client` stdin.
+pub const BULK_PIPE_FLUSH_BYTES: usize = 8 << 20;
+
 /// A single open `INSERT ... FORMAT RowBinary` pipe to one ClickHouse table.
 struct Pipe {
     table: &'static str,
     child: Child,
     stdin: ChildStdin,
-    /// Rows buffered for the current block; written to `stdin` on `flush`.
+    /// Rows buffered prior to writing to `stdin` on `flush`.
     buf: Vec<u8>,
 }
 
@@ -34,6 +38,7 @@ impl Pipe {
         cfg: &ChConfig,
         table: &'static str,
         cols: &str,
+        buf_cap: usize,
     ) -> Result<Self, LoadError> {
         let mut args = cfg.client_args();
         args.push(format!(
@@ -46,18 +51,20 @@ impl Pipe {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            // coverage-exempt: 54 — unreachable: the child is spawned with
-            // `Stdio::piped()` for stdin, so `take()` always yields `Some`.
-            // Kept as a defensive `ok_or_else` rather than `.unwrap()` (no
-            // panics in production paths).
-            LoadError::Client(format!("could not open stdin for table {table}"))
-        })?;
+        // coverage-exempt — unreachable: the child is spawned with
+        // `Stdio::piped()` for stdin, so `take()` always yields `Some`.
+        // Kept as a defensive `ok_or_else` rather than `.unwrap()` (no
+        // panics in production paths).
+        let Some(stdin) = child.stdin.take() else {
+            return Err(LoadError::Client(format!(
+                "could not open stdin for table {table}"
+            )));
+        };
         Ok(Pipe {
             table,
             child,
             stdin,
-            buf: Vec::new(),
+            buf: Vec::with_capacity(buf_cap),
         })
     }
 
@@ -71,6 +78,14 @@ impl Pipe {
             .write_all(&self.buf)
             .map_err(|e| LoadError::Client(format!("write to {} failed: {e}", self.table)))?;
         self.buf.clear();
+        Ok(())
+    }
+
+    #[inline]
+    fn flush_if_at_least(&mut self, min_bytes: usize) -> Result<(), LoadError> {
+        if self.buf.len() >= min_bytes {
+            self.flush()?;
+        }
         Ok(())
     }
 
@@ -91,33 +106,62 @@ impl Pipe {
     }
 }
 
-/// Streams base-entity rows into ClickHouse for live mode, one open insert pipe
-/// per table. The `witnesses` pipe exists only when witness capture is enabled.
+/// Streams base-entity rows into ClickHouse for live or direct-bulk mode, one
+/// open insert pipe per table. The `witnesses` pipe exists only when witness
+/// capture is enabled.
 pub struct LiveChWriter {
     blocks: Pipe,
     txs: Pipe,
     inputs: Pipe,
     outputs: Pipe,
-    spends: Pipe,
     witnesses: Option<Pipe>,
+    flush_threshold: usize,
 }
 
 impl LiveChWriter {
-    /// Open one `RowBinary` insert pipe per base table. `capture_witness` also
-    /// opens the optional `witnesses` pipe.
+    /// Open one `RowBinary` insert pipe per base table for per-block live mode.
+    /// `capture_witness` also opens the optional `witnesses` pipe.
     pub fn open(cfg: &ChConfig, client: PathBuf, capture_witness: bool) -> Result<Self, LoadError> {
+        Self::open_with_flush_threshold(cfg, client, capture_witness, 0)
+    }
+
+    /// Open `RowBinary` insert pipes configured for high-throughput bulk ingest
+    /// (`8 MiB` per-table buffers flushed lazily via [`Self::flush_if_needed`]).
+    pub fn open_bulk(
+        cfg: &ChConfig,
+        client: PathBuf,
+        capture_witness: bool,
+    ) -> Result<Self, LoadError> {
+        Self::open_with_flush_threshold(cfg, client, capture_witness, BULK_PIPE_FLUSH_BYTES)
+    }
+
+    /// Open `RowBinary` insert pipes with an explicit per-table byte threshold
+    /// for [`Self::flush_if_needed`].
+    pub fn open_with_flush_threshold(
+        cfg: &ChConfig,
+        client: PathBuf,
+        capture_witness: bool,
+        flush_threshold: usize,
+    ) -> Result<Self, LoadError> {
+        let cap = flush_threshold.min(BULK_PIPE_FLUSH_BYTES);
         let witnesses = if capture_witness {
-            Some(Pipe::spawn(&client, cfg, "witnesses", rb::WITNESSES_COLS)?)
+            Some(Pipe::spawn(
+                &client,
+                cfg,
+                "witnesses",
+                rb::WITNESSES_COLS,
+                cap,
+            )?)
         } else {
             None
         };
         Ok(LiveChWriter {
-            blocks: Pipe::spawn(&client, cfg, "blocks", rb::BLOCKS_COLS)?,
-            txs: Pipe::spawn(&client, cfg, "transactions", rb::TXS_COLS)?,
-            inputs: Pipe::spawn(&client, cfg, "inputs", rb::INPUTS_COLS)?,
-            outputs: Pipe::spawn(&client, cfg, "outputs", rb::OUTPUTS_COLS)?,
-            spends: Pipe::spawn(&client, cfg, "spends", rb::SPENDS_COLS)?,
+            blocks: Pipe::spawn(&client, cfg, "blocks", rb::BLOCKS_COLS, cap.min(1 << 20))?,
+            txs: Pipe::spawn(&client, cfg, "transactions", rb::TXS_COLS, cap)?,
+            inputs: Pipe::spawn(&client, cfg, "inputs", rb::INPUTS_COLS, cap)?,
+            outputs: Pipe::spawn(&client, cfg, "outputs", rb::OUTPUTS_COLS, cap)?,
             witnesses,
+            flush_threshold,
         })
     }
 
@@ -137,10 +181,6 @@ impl LiveChWriter {
         rb::output(r, &mut self.outputs.buf);
     }
 
-    pub fn write_spend(&mut self, r: &bidx_core::SpendRow) {
-        rb::spend(r, &mut self.spends.buf);
-    }
-
     /// Buffer one witness payload row. A no-op unless the writer was opened
     /// with `capture_witness`, so callers can push unconditionally.
     pub fn write_witness(&mut self, r: &bidx_core::WitnessRow) {
@@ -149,15 +189,30 @@ impl LiveChWriter {
         }
     }
 
-    /// Push every buffered row set to its table. Called once per applied block.
+    /// Push every buffered row set to its table. Called once per applied block
+    /// in live mode.
     pub fn flush(&mut self) -> Result<(), LoadError> {
         self.blocks.flush()?;
         self.txs.flush()?;
         self.inputs.flush()?;
         self.outputs.flush()?;
-        self.spends.flush()?;
         if let Some(w) = self.witnesses.as_mut() {
             w.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Flush only those table pipes whose buffered byte count has reached
+    /// `flush_threshold` (used in `--direct-clickhouse` bulk mode to batch
+    /// thousands of rows into multi-MiB writes).
+    pub fn flush_if_needed(&mut self) -> Result<(), LoadError> {
+        let min = self.flush_threshold;
+        self.blocks.flush_if_at_least(min)?;
+        self.txs.flush_if_at_least(min)?;
+        self.inputs.flush_if_at_least(min)?;
+        self.outputs.flush_if_at_least(min)?;
+        if let Some(w) = self.witnesses.as_mut() {
+            w.flush_if_at_least(min)?;
         }
         Ok(())
     }
@@ -170,14 +225,13 @@ impl LiveChWriter {
             txs,
             inputs,
             outputs,
-            spends,
             witnesses,
+            flush_threshold: _,
         } = self;
         blocks.finish()?;
         txs.finish()?;
         inputs.finish()?;
         outputs.finish()?;
-        spends.finish()?;
         if let Some(w) = witnesses {
             w.finish()?;
         }
@@ -259,7 +313,6 @@ mod tests {
             height: 42,
             tx_index: 0,
             input_index: 0,
-            txid: [0x11; 32],
             prev_txid: [0; 32],
             prev_vout: 0xFFFF_FFFF,
             script_sig_len: 0,
@@ -267,6 +320,10 @@ mod tests {
             witness_items: 0,
             witness_bytes: 0,
             is_coinbase: true,
+            spent_value_sat: 0,
+            spent_script_type: 0,
+            spent_address_hash: [0; 32],
+            spent_height: 0,
         }
     }
 
@@ -275,26 +332,10 @@ mod tests {
             height: 42,
             tx_index: 0,
             output_index: 0,
-            txid: [0x11; 32],
             value_sat: 50,
             script_pubkey_len: 0,
             script_type: 0,
             address_hash: [0; 32],
-        }
-    }
-
-    fn sample_spend() -> bidx_core::SpendRow {
-        bidx_core::SpendRow {
-            height: 42,
-            spending_tx_index: 0,
-            spending_input_index: 0,
-            spending_txid: [0x11; 32],
-            spent_txid: [0x22; 32],
-            spent_vout: 0,
-            spent_value_sat: 10,
-            spent_script_type: 1,
-            spent_address_hash: [0x33; 32],
-            spent_height: 0,
         }
     }
 
@@ -307,7 +348,6 @@ mod tests {
         w.write_tx(&sample_tx());
         w.write_input(&sample_input());
         w.write_output(&sample_output());
-        w.write_spend(&sample_spend());
         // No witness pipe when capture is off: the call must be a silent no-op.
         w.write_witness(&bidx_core::WitnessRow {
             height: 42,
@@ -328,28 +368,17 @@ mod tests {
         );
         assert_eq!(
             read_out(&client, "inputs").len(),
-            4 + 4 + 4 + 32 + 32 + 4 + 4 + 4 + 4 + 4 + 1
+            4 + 4 + 4 + 32 + 4 + 4 + 4 + 4 + 4 + 1 + 8 + 1 + 32 + 4
         );
         assert_eq!(
             read_out(&client, "outputs").len(),
-            4 + 4 + 4 + 32 + 8 + 4 + 1 + 32
-        );
-        assert_eq!(
-            read_out(&client, "spends").len(),
-            4 + 4 + 4 + 32 + 32 + 4 + 8 + 1 + 32 + 4
+            4 + 4 + 4 + 8 + 4 + 1 + 32
         );
         // No witnesses file was produced.
         let wit = PathBuf::from(format!("{}.witnesses.out", client.display()));
         assert!(!wit.exists());
 
-        for t in [
-            "blocks",
-            "transactions",
-            "inputs",
-            "outputs",
-            "spends",
-            "witnesses",
-        ] {
+        for t in ["blocks", "transactions", "inputs", "outputs", "witnesses"] {
             let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
         }
         let _ = std::fs::remove_file(&client);
@@ -377,14 +406,7 @@ mod tests {
             "five u32s + a 1-byte length + payload"
         );
         assert_eq!(&bytes[20..23], &[0x02, 0xDE, 0xAD]);
-        for t in [
-            "blocks",
-            "transactions",
-            "inputs",
-            "outputs",
-            "spends",
-            "witnesses",
-        ] {
+        for t in ["blocks", "transactions", "inputs", "outputs", "witnesses"] {
             let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
         }
         let _ = std::fs::remove_file(&client);
@@ -400,14 +422,7 @@ mod tests {
         // Empty buffers mean no bytes written; the fake client still creates
         // the (empty) output files on EOF.
         assert!(read_out(&client, "blocks").is_empty());
-        for t in [
-            "blocks",
-            "transactions",
-            "inputs",
-            "outputs",
-            "spends",
-            "witnesses",
-        ] {
+        for t in ["blocks", "transactions", "inputs", "outputs", "witnesses"] {
             let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
         }
         let _ = std::fs::remove_file(&client);
@@ -519,5 +534,52 @@ mod tests {
             "got: {e:?}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bulk_writer_and_threshold_flush_only_pipes_at_or_above_threshold() {
+        let _g = crate::tests::fork_guard();
+        let client = fake_client("bulk-thresh", false);
+        let mut w = LiveChWriter::open_with_flush_threshold(
+            &ChConfig::default(),
+            client.clone(),
+            true,
+            200,
+        )
+        .unwrap();
+
+        // 1 block row = 144 bytes (< 200): stays buffered across `flush_if_needed`.
+        w.write_block(&sample_block());
+        w.write_tx(&sample_tx());
+        w.write_input(&sample_input());
+        w.write_output(&sample_output());
+        w.write_witness(&bidx_core::WitnessRow {
+            height: 1,
+            tx_index: 0,
+            input_index: 0,
+            item_index: 0,
+            item_len: 2,
+            item_bytes: vec![0xAA, 0xBB],
+        });
+        w.flush_if_needed().unwrap();
+        assert_eq!(w.blocks.buf.len(), 144);
+
+        // 2nd block row brings `blocks.buf` to 288 bytes (>= 200) -> flushed!
+        w.write_block(&sample_block());
+        w.flush_if_needed().unwrap();
+        assert!(w.blocks.buf.is_empty());
+        assert!(!w.txs.buf.is_empty());
+        w.finish().unwrap();
+        assert_eq!(read_out(&client, "blocks").len(), 288);
+
+        // Also exercise `open_bulk` constructor directly.
+        let bulk = LiveChWriter::open_bulk(&ChConfig::default(), client.clone(), false).unwrap();
+        assert_eq!(bulk.flush_threshold, BULK_PIPE_FLUSH_BYTES);
+        bulk.finish().unwrap();
+
+        for t in ["blocks", "transactions", "inputs", "outputs", "witnesses"] {
+            let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
+        }
+        let _ = std::fs::remove_file(&client);
     }
 }

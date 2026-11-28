@@ -47,22 +47,10 @@ impl Default for TrackerConfig {
 /// What happened on a given step; surfaced to the CLI / future sink stage.
 #[derive(Debug)]
 pub enum TrackerEvent {
-    Applied {
-        height: u32,
-        hash: Hash32,
-        /// Spend rows produced by applying this block (input→prevout links).
-        spends: Vec<bidx_core::SpendRow>,
-    },
-    Disconnected {
-        height: u32,
-        hash: Hash32,
-    },
-    ReorgStart {
-        depth: u32,
-    },
-    CaughtUp {
-        height: u32,
-    },
+    Applied { height: u32, hash: Hash32 },
+    Disconnected { height: u32, hash: Hash32 },
+    ReorgStart { depth: u32 },
+    CaughtUp { height: u32 },
 }
 
 pub struct LiveTracker {
@@ -91,7 +79,7 @@ impl LiveTracker {
     /// `on_event` is called after each applied/disconnected block so the
     /// caller can persist rows to the Parquet/ClickHouse sink.
     ///
-    /// coverage-exempt: 102-103 — `run` is a thin wrapper whose `catch_up` half
+    /// coverage-exempt — `run` is a thin wrapper whose `catch_up` half
     /// is fully covered; the `live_loop` half is an infinite loop by design and
     /// cannot return under test (see `live_loop`).
     pub fn run<F>(&self, mut on_event: F) -> Result<(), TrackerError>
@@ -205,18 +193,13 @@ impl LiveTracker {
                 },
             )?;
 
-            let res =
-                self.utxo
-                    .apply_block(next_height, &block.txs, &block.inputs, &block.outputs)?;
-            // Fill fees + block total_fee so downstream sinks see final data.
-            let mut total_fee = 0u64;
-            for (i, tx) in block.txs.iter_mut().enumerate() {
-                tx.fee = res.fees[i];
-                if i != 0 {
-                    total_fee = total_fee.saturating_add(res.fees[i]);
-                }
-            }
-            block.block_row.total_fee = total_fee;
+            let stats = self.utxo.apply_block_in_place(
+                next_height,
+                &mut block.block_row,
+                &mut block.txs,
+                &mut block.inputs,
+                &block.outputs,
+            )?;
 
             let new_tip = TipState {
                 height: next_height,
@@ -224,13 +207,13 @@ impl LiveTracker {
             };
             self.utxo.set_tip(&new_tip)?;
             local = new_tip;
-            if res.missing > 0 {
-                // coverage-exempt: 232-234 — `warn!` field expressions are only
+            if stats.missing > 0 {
+                // coverage-exempt — `warn!` field expressions are only
                 // evaluated when a subscriber is installed; tests run without
                 // one. The branch itself is reached by the missing-prevout tests.
                 warn!(
                     height = next_height,
-                    missing = res.missing,
+                    missing = stats.missing,
                     "missing prevouts"
                 );
             }
@@ -238,7 +221,6 @@ impl LiveTracker {
                 TrackerEvent::Applied {
                     height: next_height,
                     hash,
-                    spends: res.spends,
                 },
                 Some(&block),
             );
@@ -253,7 +235,7 @@ impl LiveTracker {
         Ok(())
     }
 
-    // coverage-exempt: `live_loop` is the long-running tip watcher. In
+    // coverage-exempt — `live_loop` is the long-running tip watcher. In
     // the no-ZMQ branch it polls forever, and with ZMQ it loops forever, so it
     // cannot return inside a test (it is exited by killing the process). Its
     // logic is exercised indirectly: `catch_up` (the body of each iteration) has

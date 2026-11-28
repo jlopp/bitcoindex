@@ -13,7 +13,7 @@
 //! Hashes are the raw wire-order 32 bytes the Parquet files store, which is
 //! exactly what the ClickHouse `FixedString(32)` columns hold.
 
-use bidx_core::{BlockRow, InputRow, OutputRow, SpendRow, TxRow, WitnessRow};
+use bidx_core::{BlockRow, InputRow, OutputRow, TxRow, WitnessRow};
 
 /// Column list for `blocks`, in schema order. `fee_rate` is omitted: it is a
 /// materialized column ClickHouse computes itself.
@@ -24,17 +24,14 @@ pub const BLOCKS_COLS: &str = "height, hash, prev_hash, merkle_root, time, bits,
 pub const TXS_COLS: &str = "height, tx_index, txid, version, locktime, size, weight, fee, \
      input_count, output_count, has_witness";
 
-/// Column list for `inputs`.
-pub const INPUTS_COLS: &str = "height, tx_index, input_index, txid, prev_txid, prev_vout, \
-     script_sig_len, sequence, witness_items, witness_bytes, is_coinbase";
+/// Column list for `inputs` (schema v3: enriched in place with `spent_*` fields, `txid` pruned).
+pub const INPUTS_COLS: &str = "height, tx_index, input_index, prev_txid, prev_vout, \
+     script_sig_len, sequence, witness_items, witness_bytes, is_coinbase, \
+     spent_value_sat, spent_script_type, spent_address_hash, spent_height";
 
-/// Column list for `outputs`.
-pub const OUTPUTS_COLS: &str = "height, tx_index, output_index, txid, value_sat, \
+/// Column list for `outputs` (schema v3: `txid` pruned).
+pub const OUTPUTS_COLS: &str = "height, tx_index, output_index, value_sat, \
      script_pubkey_len, script_type, address_hash";
-
-/// Column list for `spends`.
-pub const SPENDS_COLS: &str = "height, spending_tx_index, spending_input_index, spending_txid, \
-     spent_txid, spent_vout, spent_value_sat, spent_script_type, spent_address_hash, spent_height";
 
 /// Column list for the optional `witnesses` payload table.
 pub const WITNESSES_COLS: &str = "height, tx_index, input_index, item_index, item_len, item_bytes";
@@ -42,9 +39,21 @@ pub const WITNESSES_COLS: &str = "height, tx_index, input_index, item_index, ite
 /// Column list for the `address_prefix` backfill table.
 pub const ADDRESS_PREFIX_COLS: &str = "address, script_type, address_hash";
 
+/// Column list for the `utxos_by_address` live snapshot / CollapsingMergeTree table.
+pub const UTXOS_BY_ADDRESS_COLS: &str =
+    "address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign";
+
+/// Column list for the `scripthash_map` Electrum lookup table.
+pub const SCRIPTHASH_MAP_COLS: &str = "scripthash, script_type, address_hash";
+
 #[inline]
 fn u8_(out: &mut Vec<u8>, v: u8) {
     out.push(v);
+}
+
+#[inline]
+fn i8_(out: &mut Vec<u8>, v: i8) {
+    out.push(v as u8);
 }
 
 #[inline]
@@ -109,7 +118,7 @@ pub fn block(r: &BlockRow, out: &mut Vec<u8>) {
 /// Encode one `transactions` row. `bool` maps to `UInt8` (0/1).
 pub fn tx(r: &TxRow, out: &mut Vec<u8>) {
     u32_(out, r.height);
-    u32_(out, r.tx_index);
+    u32_(out, r.tx_index as u32);
     bin32(out, &r.txid);
     i32_(out, r.version);
     u32_(out, r.locktime);
@@ -121,52 +130,40 @@ pub fn tx(r: &TxRow, out: &mut Vec<u8>) {
     u8_(out, r.has_witness as u8);
 }
 
-/// Encode one `inputs` row. `bool` maps to `UInt8` (0/1).
+/// Encode one `inputs` row (schema v3: `txid` pruned, `spent_*` appended). `bool` maps to `UInt8` (0/1).
 pub fn input(r: &InputRow, out: &mut Vec<u8>) {
     u32_(out, r.height);
-    u32_(out, r.tx_index);
-    u32_(out, r.input_index);
-    bin32(out, &r.txid);
+    u32_(out, r.tx_index as u32);
+    u32_(out, r.input_index as u32);
     bin32(out, &r.prev_txid);
     u32_(out, r.prev_vout);
     u32_(out, r.script_sig_len);
     u32_(out, r.sequence);
-    u32_(out, r.witness_items);
+    u32_(out, r.witness_items as u32);
     u32_(out, r.witness_bytes);
     u8_(out, r.is_coinbase as u8);
-}
-
-/// Encode one `outputs` row.
-pub fn output(r: &OutputRow, out: &mut Vec<u8>) {
-    u32_(out, r.height);
-    u32_(out, r.tx_index);
-    u32_(out, r.output_index);
-    bin32(out, &r.txid);
-    u64_(out, r.value_sat);
-    u32_(out, r.script_pubkey_len);
-    u8_(out, r.script_type);
-    bin32(out, &r.address_hash);
-}
-
-/// Encode one `spends` row.
-pub fn spend(r: &SpendRow, out: &mut Vec<u8>) {
-    u32_(out, r.height);
-    u32_(out, r.spending_tx_index);
-    u32_(out, r.spending_input_index);
-    bin32(out, &r.spending_txid);
-    bin32(out, &r.spent_txid);
-    u32_(out, r.spent_vout);
     u64_(out, r.spent_value_sat);
     u8_(out, r.spent_script_type);
     bin32(out, &r.spent_address_hash);
     u32_(out, r.spent_height);
 }
 
+/// Encode one `outputs` row (schema v3: `txid` pruned).
+pub fn output(r: &OutputRow, out: &mut Vec<u8>) {
+    u32_(out, r.height);
+    u32_(out, r.tx_index as u32);
+    u32_(out, r.output_index as u32);
+    u64_(out, r.value_sat);
+    u32_(out, r.script_pubkey_len);
+    u8_(out, r.script_type);
+    bin32(out, &r.address_hash);
+}
+
 /// Encode one `witnesses` row (`item_bytes` is a `String`).
 pub fn witness(r: &WitnessRow, out: &mut Vec<u8>) {
     u32_(out, r.height);
-    u32_(out, r.tx_index);
-    u32_(out, r.input_index);
+    u32_(out, r.tx_index as u32);
+    u32_(out, r.input_index as u32);
     u32_(out, r.item_index);
     u32_(out, r.item_len);
     str_(out, &r.item_bytes);
@@ -176,6 +173,44 @@ pub fn witness(r: &WitnessRow, out: &mut Vec<u8>) {
 /// `address_hash` FixedString(32)).
 pub fn address_prefix(address: &str, script_type: u8, address_hash: &[u8; 32], out: &mut Vec<u8>) {
     str_(out, address.as_bytes());
+    u8_(out, script_type);
+    bin32(out, address_hash);
+}
+
+/// Encode one `utxos_by_address` row (`address_hash` FixedString(32),
+/// `script_type` UInt8, `height` UInt32, `tx_index` UInt32, `output_index`
+/// UInt32, `txid` FixedString(32), `value_sat` UInt64, `sign` Int8).
+#[allow(clippy::too_many_arguments)]
+pub fn utxo_by_address(
+    address_hash: &[u8; 32],
+    script_type: u8,
+    height: u32,
+    tx_index: u32,
+    output_index: u32,
+    txid: &[u8; 32],
+    value_sat: u64,
+    sign: i8,
+    out: &mut Vec<u8>,
+) {
+    bin32(out, address_hash);
+    u8_(out, script_type);
+    u32_(out, height);
+    u32_(out, tx_index);
+    u32_(out, output_index);
+    bin32(out, txid);
+    u64_(out, value_sat);
+    i8_(out, sign);
+}
+
+/// Encode one `scripthash_map` row (`scripthash` FixedString(32),
+/// `script_type` UInt8, `address_hash` FixedString(32)).
+pub fn scripthash_map(
+    scripthash: &[u8; 32],
+    script_type: u8,
+    address_hash: &[u8; 32],
+    out: &mut Vec<u8>,
+) {
+    bin32(out, scripthash);
     u8_(out, script_type);
     bin32(out, address_hash);
 }
@@ -223,7 +258,6 @@ mod tests {
             height: 1,
             tx_index: 2,
             input_index: 3,
-            txid: [0x22; 32],
             prev_txid: [0x33; 32],
             prev_vout: 4,
             script_sig_len: 5,
@@ -231,6 +265,10 @@ mod tests {
             witness_items: 7,
             witness_bytes: 8,
             is_coinbase: true,
+            spent_value_sat: 50_000,
+            spent_script_type: 4,
+            spent_address_hash: [0x88; 32],
+            spent_height: 9,
         }
     }
 
@@ -239,26 +277,10 @@ mod tests {
             height: 1,
             tx_index: 2,
             output_index: 3,
-            txid: [0x44; 32],
             value_sat: 4,
             script_pubkey_len: 5,
             script_type: 6,
             address_hash: [0x55; 32],
-        }
-    }
-
-    fn sample_spend() -> SpendRow {
-        SpendRow {
-            height: 1,
-            spending_tx_index: 2,
-            spending_input_index: 3,
-            spending_txid: [0x66; 32],
-            spent_txid: [0x77; 32],
-            spent_vout: 4,
-            spent_value_sat: 5,
-            spent_script_type: 6,
-            spent_address_hash: [0x88; 32],
-            spent_height: 7,
         }
     }
 
@@ -291,22 +313,33 @@ mod tests {
     }
 
     #[test]
-    fn input_row_encodes_coinbase_flag() {
+    fn input_row_encodes_coinbase_flag_and_spent_fields() {
         let mut out = Vec::new();
         input(&sample_input(), &mut out);
-        assert_eq!(out.len(), 4 + 4 + 4 + 32 + 32 + 4 + 4 + 4 + 4 + 4 + 1);
-        assert_eq!(*out.last().unwrap(), 1);
+        // 3×4 (height, tx_index, input_index) + 32 (prev_txid) + 5×4 (prev_vout..witness_bytes)
+        // + 1 (is_coinbase) + 8 (spent_value_sat) + 1 (spent_script_type) + 32 (spent_address_hash) + 4 (spent_height) = 110
+        assert_eq!(
+            out.len(),
+            4 + 4 + 4 + 32 + 4 + 4 + 4 + 4 + 4 + 1 + 8 + 1 + 32 + 4
+        );
+        assert_eq!(out[64], 1, "is_coinbase at offset 64");
+        assert_eq!(&out[65..73], &50_000u64.to_le_bytes());
+        assert_eq!(out[73], 4);
+        assert_eq!(&out[74..106], &[0x88; 32]);
+        assert_eq!(&out[106..110], &9u32.to_le_bytes());
     }
 
     #[test]
-    fn output_and_spend_rows_match_schema_widths() {
+    fn output_row_matches_schema_v3_width() {
         let mut o = Vec::new();
         output(&sample_output(), &mut o);
-        assert_eq!(o.len(), 4 + 4 + 4 + 32 + 8 + 4 + 1 + 32);
-        assert_eq!(&o[44..52], &4u64.to_le_bytes(), "value_sat follows txid");
-        let mut s = Vec::new();
-        spend(&sample_spend(), &mut s);
-        assert_eq!(s.len(), 4 + 4 + 4 + 32 + 32 + 4 + 8 + 1 + 32 + 4);
+        // 3×4 (height, tx_index, output_index) + 8 (value_sat) + 4 (script_pubkey_len) + 1 (script_type) + 32 (address_hash) = 57
+        assert_eq!(o.len(), 4 + 4 + 4 + 8 + 4 + 1 + 32);
+        assert_eq!(
+            &o[12..20],
+            &4u64.to_le_bytes(),
+            "value_sat follows output_index"
+        );
     }
 
     #[test]
@@ -369,11 +402,17 @@ mod tests {
         for col in ["has_witness", "output_count"] {
             assert!(TXS_COLS.contains(col));
         }
-        for col in ["is_coinbase", "witness_bytes"] {
+        for col in [
+            "is_coinbase",
+            "witness_bytes",
+            "spent_value_sat",
+            "spent_height",
+        ] {
             assert!(INPUTS_COLS.contains(col));
         }
+        assert!(!INPUTS_COLS.contains(", txid,"));
         assert!(OUTPUTS_COLS.contains("address_hash"));
-        assert!(SPENDS_COLS.contains("spent_height"));
+        assert!(!OUTPUTS_COLS.contains("txid"));
         assert!(WITNESSES_COLS.contains("item_bytes"));
         assert_eq!(ADDRESS_PREFIX_COLS, "address, script_type, address_hash");
     }
@@ -394,5 +433,44 @@ mod tests {
         assert_eq!(&out[1..43], b"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
         assert_eq!(out[43], 4);
         assert_eq!(&out[44..], &hash);
+    }
+
+    #[test]
+    fn utxo_by_address_and_scripthash_map_match_schema_widths() {
+        assert_eq!(
+            UTXOS_BY_ADDRESS_COLS,
+            "address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign"
+        );
+        assert_eq!(SCRIPTHASH_MAP_COLS, "scripthash, script_type, address_hash");
+
+        let mut u = Vec::new();
+        utxo_by_address(
+            &[0x11; 32],
+            4,
+            800_000,
+            2,
+            7,
+            &[0x22; 32],
+            50_000,
+            -1,
+            &mut u,
+        );
+        // 32 + 1 + 4 + 4 + 4 + 32 + 8 + 1 = 86 bytes.
+        assert_eq!(u.len(), 86);
+        assert_eq!(&u[0..32], &[0x11; 32]);
+        assert_eq!(u[32], 4);
+        assert_eq!(&u[33..37], &800_000u32.to_le_bytes());
+        assert_eq!(&u[37..41], &2u32.to_le_bytes());
+        assert_eq!(&u[41..45], &7u32.to_le_bytes());
+        assert_eq!(&u[45..77], &[0x22; 32]);
+        assert_eq!(&u[77..85], &50_000u64.to_le_bytes());
+        assert_eq!(u[85] as i8, -1);
+
+        let mut s = Vec::new();
+        scripthash_map(&[0xAA; 32], 6, &[0xBB; 32], &mut s);
+        assert_eq!(s.len(), 65);
+        assert_eq!(&s[0..32], &[0xAA; 32]);
+        assert_eq!(s[32], 6);
+        assert_eq!(&s[33..65], &[0xBB; 32]);
     }
 }

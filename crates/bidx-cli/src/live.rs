@@ -62,7 +62,6 @@ struct BufferedBlock {
     txs: Vec<bidx_core::TxRow>,
     inputs: Vec<bidx_core::InputRow>,
     outputs: Vec<bidx_core::OutputRow>,
-    spends: Vec<bidx_core::SpendRow>,
     witnesses: Vec<bidx_core::WitnessRow>,
 }
 
@@ -115,9 +114,6 @@ impl LiveSink {
             for o in &b.outputs {
                 sink.push_output(o)?;
             }
-            for sp in &b.spends {
-                sink.push_spend(sp)?;
-            }
             for w in &b.witnesses {
                 sink.push_witness(w)?;
             }
@@ -136,18 +132,13 @@ impl LiveSink {
         Ok(())
     }
 
-    fn write_block(
-        &mut self,
-        block: &bidx_parser::FullBlock,
-        spends: &[bidx_core::SpendRow],
-    ) -> Result<()> {
+    fn write_block(&mut self, block: &bidx_parser::FullBlock) -> Result<()> {
         self.rotate_if_needed(block.block_row.height)?;
         self.window.push(BufferedBlock {
             block: block.block_row.clone(),
             txs: block.txs.clone(),
             inputs: block.inputs.clone(),
             outputs: block.outputs.clone(),
-            spends: spends.to_vec(),
             witnesses: block.witnesses.clone(),
         });
         Ok(())
@@ -198,13 +189,9 @@ enum LiveOutput {
 }
 
 impl LiveOutput {
-    fn write_block(
-        &mut self,
-        block: &bidx_parser::FullBlock,
-        spends: &[bidx_core::SpendRow],
-    ) -> Result<()> {
+    fn write_block(&mut self, block: &bidx_parser::FullBlock) -> Result<()> {
         match self {
-            LiveOutput::Parquet(s) => s.write_block(block, spends),
+            LiveOutput::Parquet(s) => s.write_block(block),
             LiveOutput::ClickHouse { writer, .. } => {
                 writer.write_block(&block.block_row);
                 for tx in &block.txs {
@@ -215,9 +202,6 @@ impl LiveOutput {
                 }
                 for o in &block.outputs {
                     writer.write_output(o);
-                }
-                for sp in spends {
-                    writer.write_spend(sp);
                 }
                 for w in &block.witnesses {
                     writer.write_witness(w);
@@ -310,7 +294,6 @@ mod tests {
                 height,
                 tx_index: 0,
                 input_index: 0,
-                txid: coinbase_txid,
                 prev_txid: [0u8; 32],
                 prev_vout: 0xFFFF_FFFF,
                 script_sig_len: 0,
@@ -318,12 +301,15 @@ mod tests {
                 witness_items: 0,
                 witness_bytes: 0,
                 is_coinbase: true,
+                spent_value_sat: 0,
+                spent_script_type: 0,
+                spent_address_hash: [0u8; 32],
+                spent_height: 0,
             }],
             outputs: vec![bidx_core::OutputRow {
                 height,
                 tx_index: 0,
                 output_index: 0,
-                txid: coinbase_txid,
                 value_sat: 100,
                 script_pubkey_len: 0,
                 script_type: 0,
@@ -338,17 +324,17 @@ mod tests {
         let dir = tmp("rotate");
         let mut sink = LiveSink::create(&dir, 0).unwrap();
         // First block at h=0 lands in part-0.
-        sink.write_block(&synthetic_block(0), &[]).unwrap();
+        sink.write_block(&synthetic_block(0)).unwrap();
         assert_eq!(sink.part, 0);
         // Still part-0 while height < LIVE_BLOCKS_PER_PART.
-        sink.write_block(&synthetic_block(500), &[]).unwrap();
+        sink.write_block(&synthetic_block(500)).unwrap();
         assert_eq!(
             sink.part, 0,
             "h=500 still part 0 (< {})",
             LIVE_BLOCKS_PER_PART
         );
         // h = LIVE_BLOCKS_PER_PART rolls to part 1, flushing part 0 first.
-        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART), &[])
+        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART))
             .unwrap();
         assert_eq!(sink.part, 1);
         assert!(
@@ -356,14 +342,14 @@ mod tests {
             "part 0 flushed on rotate"
         );
         // h = 2 × LIVE_BLOCKS_PER_PART rolls to part 2.
-        sink.write_block(&synthetic_block(2 * LIVE_BLOCKS_PER_PART), &[])
+        sink.write_block(&synthetic_block(2 * LIVE_BLOCKS_PER_PART))
             .unwrap();
         assert_eq!(sink.part, 2);
         sink.finish().unwrap();
         // Walk entity dirs and count part files across them (files are named
         // part-NNNNN.parquet with 5 digits).
         let mut parts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+        for entity in ["blocks", "transactions", "inputs", "outputs"] {
             for e in std::fs::read_dir(dir.join(entity)).unwrap().flatten() {
                 parts.insert(e.file_name().to_string_lossy().to_string());
             }
@@ -384,7 +370,7 @@ mod tests {
         let dir = tmp("kinds");
         let mut sink = LiveSink::create(&dir, 0).unwrap();
         let mut block = synthetic_block(7);
-        // Add a 2nd tx + regular input + spend row so every sink's write loop
+        // Add a 2nd tx + regular enriched input so every sink's write loop
         // is exercised.
         block.block_row.tx_count = 2;
         let txid_s = [0x22u8; 32];
@@ -405,7 +391,6 @@ mod tests {
             height: 7,
             tx_index: 1,
             input_index: 0,
-            txid: txid_s,
             prev_txid: [0xEE; 32],
             prev_vout: 3,
             script_sig_len: 0,
@@ -413,33 +398,24 @@ mod tests {
             witness_items: 0,
             witness_bytes: 0,
             is_coinbase: false,
+            spent_value_sat: 55,
+            spent_script_type: 1,
+            spent_address_hash: [0xCC; 32],
+            spent_height: 0,
         });
         block.outputs.push(bidx_core::OutputRow {
             height: 7,
             tx_index: 1,
             output_index: 0,
-            txid: txid_s,
             value_sat: 50,
             script_pubkey_len: 0,
             script_type: 1,
             address_hash: [0xBB; 32],
         });
-        let spends = vec![bidx_core::SpendRow {
-            height: 7,
-            spending_tx_index: 1,
-            spending_input_index: 0,
-            spending_txid: txid_s,
-            spent_txid: [0xEE; 32],
-            spent_vout: 3,
-            spent_value_sat: 55,
-            spent_script_type: 1,
-            spent_address_hash: [0xCC; 32],
-            spent_height: 0,
-        }];
-        sink.write_block(&block, &spends).unwrap();
+        sink.write_block(&block).unwrap();
         sink.finish().unwrap();
-        // Each of the 5 entities must have produced its part-00000 file.
-        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+        // Each of the 4 base entities must have produced its part-00000 file.
+        for entity in ["blocks", "transactions", "inputs", "outputs"] {
             let p = dir.join(entity).join("part-00000.parquet");
             assert!(p.exists(), "missing {:?}", p);
         }
@@ -467,7 +443,7 @@ mod tests {
             item_len: 2,
             item_bytes: vec![0xAA, 0xBB],
         });
-        sink.write_block(&block, &[]).unwrap();
+        sink.write_block(&block).unwrap();
         sink.finish().unwrap();
         let p = dir.join("witnesses").join("part-00000.parquet");
         assert!(p.exists(), "witnesses part file must exist: {:?}", p);
@@ -500,7 +476,7 @@ mod tests {
         let dir = tmp("retract-open");
         let mut sink = LiveSink::create(&dir, 0).unwrap();
         for h in 0..5 {
-            sink.write_block(&synthetic_block(h), &[]).unwrap();
+            sink.write_block(&synthetic_block(h)).unwrap();
         }
         // Reorg at height 3: heights 3 and 4 (still buffered) must vanish.
         sink.retract_from(3).unwrap();
@@ -536,7 +512,7 @@ mod tests {
         let dir = tmp("retract-closed");
         let mut sink = LiveSink::create(&dir, 0).unwrap();
         // Roll to part 1 (h=1000), so h < 1000 now lives in a closed part.
-        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART), &[])
+        sink.write_block(&synthetic_block(LIVE_BLOCKS_PER_PART))
             .unwrap();
         assert_eq!(sink.part, 1);
         sink.retract_from(42).unwrap();
@@ -550,6 +526,16 @@ mod tests {
         sink2.finish().unwrap();
         let floor = std::fs::read_to_string(dir.join(REORG_FLOOR_FILE)).unwrap();
         assert_eq!(floor.trim(), "7");
+
+        // Writing the floor sidecar fails cleanly if a directory occupies its path.
+        let _ = std::fs::remove_file(dir.join(REORG_FLOOR_FILE));
+        std::fs::create_dir_all(dir.join(REORG_FLOOR_FILE)).unwrap();
+        let mut sink3 = LiveSink::create_with(&dir, 1, SinkConfig::default()).unwrap();
+        let err = sink3.retract_from(5).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("writing reorg floor"),
+            "{err:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -566,8 +552,8 @@ mod tests {
     fn live_output_parquet_writes_and_retracts_through_the_enum() {
         let dir = tmp("output-parquet");
         let mut out = LiveOutput::Parquet(LiveSink::create(&dir, 0).unwrap());
-        out.write_block(&synthetic_block(0), &[]).unwrap();
-        out.write_block(&synthetic_block(1), &[]).unwrap();
+        out.write_block(&synthetic_block(0)).unwrap();
+        out.write_block(&synthetic_block(1)).unwrap();
         out.retract_from(1).unwrap();
         out.finish().unwrap();
         assert!(dir.join("blocks/part-00000.parquet").exists());
@@ -630,19 +616,7 @@ mod tests {
             item_len: 1,
             item_bytes: vec![0xAA],
         });
-        let spends = vec![bidx_core::SpendRow {
-            height: 5,
-            spending_tx_index: 0,
-            spending_input_index: 0,
-            spending_txid: [0x11; 32],
-            spent_txid: [0xEE; 32],
-            spent_vout: 0,
-            spent_value_sat: 5,
-            spent_script_type: 1,
-            spent_address_hash: [0xCC; 32],
-            spent_height: 0,
-        }];
-        out.write_block(&block, &spends).unwrap();
+        out.write_block(&block).unwrap();
         // A disconnect at height 5 deletes it back out by height.
         out.retract_from(5).unwrap();
         out.finish().unwrap();
@@ -652,14 +626,14 @@ mod tests {
         assert_eq!(blocks_out.len(), 144);
         // The retraction issued deletes for every base table at the floor.
         let log = std::fs::read_to_string(format!("{}.log", client.display())).unwrap_or_default();
-        for table in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+        for table in ["blocks", "transactions", "inputs", "outputs"] {
             assert!(
                 log.contains(&format!("DELETE FROM db.{table} WHERE height >= 5")),
                 "missing retraction for {table}: {log}"
             );
         }
 
-        for t in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+        for t in ["blocks", "transactions", "inputs", "outputs"] {
             let _ = std::fs::remove_file(format!("{}.{t}.out", client.display()));
         }
         let _ = std::fs::remove_file(format!("{}.log", client.display()));
@@ -667,7 +641,7 @@ mod tests {
     }
 }
 
-// coverage-exempt: `run_live` wires up RPC/ZMQ/UTXO and then enters
+// coverage-exempt — `run_live` wires up RPC/ZMQ/UTXO and then enters
 // `LiveTracker::run`, which is an infinite tip-watching loop that cannot return
 // under test. Its early failure paths (a bad `--utxo` path) are exercised by
 // `main.rs`'s `run_live_arm_builds_config_then_fails_on_a_bad_utxo_path`; the
@@ -791,14 +765,10 @@ pub fn run_live(cfg: LiveConfig) -> Result<()> {
 
     tracker.run(|event, block| {
         match &event {
-            TrackerEvent::Applied {
-                height,
-                hash,
-                spends,
-            } => {
+            TrackerEvent::Applied { height, hash } => {
                 info!(height, %hash, "applied block");
                 if let (Some(out), Some(b)) = (&mut output, block) {
-                    if let Err(e) = out.write_block(b, spends) {
+                    if let Err(e) = out.write_block(b) {
                         warn!(error = %e, "failed to write applied block");
                     }
                 }

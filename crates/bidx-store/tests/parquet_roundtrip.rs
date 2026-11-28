@@ -1,7 +1,7 @@
 //! Roundtrip: build rows for the genesis block, write them through the
 //! Parquet sink, and read them back, asserting field-level fidelity.
 
-use bidx_core::{BlockRow, Hash32, InputRow, OutputRow, ScriptType, SpendRow, TxRow};
+use bidx_core::{BlockRow, Hash32, InputRow, OutputRow, ScriptType, TxRow};
 use bidx_store::{ParquetSink, SinkConfig};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::PathBuf;
@@ -30,6 +30,9 @@ fn parquet_roundtrip_genesis() {
             .unwrap();
     let txid = Hash32::from_hex("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")
         .unwrap();
+
+    let mut addr = [0u8; 32];
+    addr[..20].copy_from_slice(&hex::decode("62e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap());
 
     sink.push_block(&BlockRow {
         height: 0,
@@ -67,7 +70,6 @@ fn parquet_roundtrip_genesis() {
         height: 0,
         tx_index: 0,
         input_index: 0,
-        txid: *txid.as_bytes(),
         prev_txid: [0u8; 32],
         prev_vout: 0xFFFF_FFFF,
         script_sig_len: 77,
@@ -75,32 +77,25 @@ fn parquet_roundtrip_genesis() {
         witness_items: 0,
         witness_bytes: 0,
         is_coinbase: true,
+        spent_value_sat: 0,
+        spent_script_type: 0,
+        spent_address_hash: [0u8; 32],
+        spent_height: 0,
     })
     .unwrap();
 
-    let mut addr = [0u8; 32];
-    addr[..20].copy_from_slice(&hex::decode("62e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap());
-    sink.push_output(&OutputRow {
-        height: 0,
-        tx_index: 0,
-        output_index: 0,
-        txid: *txid.as_bytes(),
-        value_sat: 5_000_000_000,
-        script_pubkey_len: 67,
-        script_type: ScriptType::P2PK as u8,
-        address_hash: addr,
-    })
-    .unwrap();
-
-    // No spends in the genesis block, but write one synthetic row to prove
-    // the spends file is well-formed.
-    sink.push_spend(&SpendRow {
+    // Also push one enriched non-coinbase input row to verify the v3 spent_* columns roundtrip.
+    sink.push_input(&InputRow {
         height: 1,
-        spending_tx_index: 0,
-        spending_input_index: 0,
-        spending_txid: [0x11; 32],
-        spent_txid: *txid.as_bytes(),
-        spent_vout: 0,
+        tx_index: 1,
+        input_index: 0,
+        prev_txid: *txid.as_bytes(),
+        prev_vout: 0,
+        script_sig_len: 72,
+        sequence: 0xFFFF_FFFE,
+        witness_items: 0,
+        witness_bytes: 0,
+        is_coinbase: false,
         spent_value_sat: 5_000_000_000,
         spent_script_type: ScriptType::P2PK as u8,
         spent_address_hash: addr,
@@ -108,7 +103,21 @@ fn parquet_roundtrip_genesis() {
     })
     .unwrap();
 
+    sink.push_output(&OutputRow {
+        height: 0,
+        tx_index: 0,
+        output_index: 0,
+        value_sat: 5_000_000_000,
+        script_pubkey_len: 67,
+        script_type: ScriptType::P2PK as u8,
+        address_hash: addr,
+    })
+    .unwrap();
+
     sink.finish().unwrap();
+
+    // No `spends` directory is created in schema v3.
+    assert!(!dir.join("spends").exists());
 
     // Read back blocks and verify.
     let blocks_path = dir.join("blocks").join("part-00000.parquet");
@@ -118,7 +127,7 @@ fn parquet_roundtrip_genesis() {
     let batch = reader.next().unwrap().unwrap();
     assert_eq!(batch.num_rows(), 1);
 
-    use arrow::array::{FixedSizeBinaryArray, UInt32Array, UInt64Array};
+    use arrow::array::{FixedSizeBinaryArray, UInt32Array, UInt64Array, UInt8Array};
     let heights = batch
         .column(0)
         .as_any()
@@ -138,7 +147,36 @@ fn parquet_roundtrip_genesis() {
         .unwrap();
     assert_eq!(coinbase.value(0), 5_000_000_000);
 
-    // Verify outputs file round-trips address hash + value.
+    // Verify inputs file round-trips v3 enriched spent_* columns.
+    let inputs_path = dir.join("inputs").join("part-00000.parquet");
+    let file = std::fs::File::open(&inputs_path).unwrap();
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let in_batch = reader.next().unwrap().unwrap();
+    assert_eq!(in_batch.num_rows(), 2);
+    let spent_vals = in_batch
+        .column(10)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(spent_vals.value(0), 0);
+    assert_eq!(spent_vals.value(1), 5_000_000_000);
+    let spent_types = in_batch
+        .column(11)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap();
+    assert_eq!(spent_types.value(1), ScriptType::P2PK as u8);
+    let spent_addrs = in_batch
+        .column(12)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(spent_addrs.value(1), &addr);
+
+    // Verify outputs file round-trips address hash + value (7 columns, no txid).
     let outputs_path = dir.join("outputs").join("part-00000.parquet");
     let file = std::fs::File::open(&outputs_path).unwrap();
     let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -146,14 +184,15 @@ fn parquet_roundtrip_genesis() {
         .build()
         .unwrap();
     let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_columns(), 7);
     let values = batch
-        .column(4)
+        .column(3)
         .as_any()
         .downcast_ref::<UInt64Array>()
         .unwrap();
     assert_eq!(values.value(0), 5_000_000_000);
     let addrs = batch
-        .column(7)
+        .column(6)
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
         .unwrap();

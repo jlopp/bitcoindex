@@ -51,7 +51,7 @@
 
 use bidx_core::Network;
 
-pub const ENTITIES: [&str; 5] = ["blocks", "transactions", "inputs", "outputs", "spends"];
+pub const ENTITIES: [&str; 4] = ["blocks", "transactions", "inputs", "outputs"];
 
 /// Optional witness payload table. Not part of [`ENTITIES`] (a normal `parse`
 /// does not produce it), so `load` treats it separately and tolerates its
@@ -62,6 +62,19 @@ pub const WITNESS_ENTITY: &str = "witnesses";
 /// every address-keyed index because its `address_hash` is all zeros and it
 /// carries no spendable value.
 const SCRIPT_TYPE_OP_RETURN: u8 = 7;
+
+/// Controls which MV-backed derived index tables are populated during bulk load
+/// and maintained in live mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexProfile {
+    /// Populate and maintain only the indexes queried by `bidx serve` (Esplora +
+    /// Electrum), skipping `inputs_by_prev_output`, `outputs_by_address`, and
+    /// `spends_by_address` (~565 GB of unqueried duplicate tables on mainnet).
+    #[default]
+    Serving,
+    /// Populate and maintain all 19 catalogued indexes plus `inputs_by_prev_output`.
+    Full,
+}
 
 /// One entry in the query-index catalogue, for `bidx index list` and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +100,7 @@ pub fn index_catalog() -> Vec<IndexSpec> {
         IndexSpec {
             name: "spends_by_spent_outpoint",
             mechanism: "table+mv",
-            target: "spends",
+            target: "inputs",
         },
         IndexSpec {
             name: "outputs_by_address",
@@ -97,17 +110,17 @@ pub fn index_catalog() -> Vec<IndexSpec> {
         IndexSpec {
             name: "spends_by_address",
             mechanism: "table+mv",
-            target: "spends",
+            target: "inputs",
         },
         IndexSpec {
             name: "address_history",
             mechanism: "table+mv",
-            target: "outputs+spends",
+            target: "outputs+inputs",
         },
         IndexSpec {
             name: "utxos_by_address",
             mechanism: "collapsing+mv",
-            target: "outputs+spends",
+            target: "outputs+inputs",
         },
         IndexSpec {
             name: "outputs_by_script_type",
@@ -142,17 +155,17 @@ pub fn index_catalog() -> Vec<IndexSpec> {
         IndexSpec {
             name: "spends_by_spent_height",
             mechanism: "projection",
-            target: "spends",
+            target: "inputs",
         },
         IndexSpec {
             name: "address_stats",
             mechanism: "summing+mv",
-            target: "outputs+spends",
+            target: "outputs+inputs",
         },
         IndexSpec {
             name: "coinstats_by_height",
             mechanism: "backfill",
-            target: "outputs+spends",
+            target: "outputs+inputs",
         },
         IndexSpec {
             name: "blocks_by_miner",
@@ -182,7 +195,6 @@ pub fn all_ddl(db: &str) -> Vec<String> {
         transactions(db),
         inputs(db),
         outputs(db),
-        spends(db),
         witnesses(db),
         // --- indexes added in place on base tables (projections, skip
         //     indexes, materialized column) ---
@@ -223,7 +235,6 @@ pub fn all_table_names() -> Vec<&'static str> {
         "transactions",
         "inputs",
         "outputs",
-        "spends",
         "witnesses",
         "transactions_by_txid",
         "inputs_by_prev_output",
@@ -250,7 +261,7 @@ pub fn all_table_names() -> Vec<&'static str> {
 /// Additive, `IF NOT EXISTS`-guarded DDL in [`all_ddl`] does not need a version
 /// bump — re-running `init-db` already applies it — but anything an operator
 /// must *migrate* rather than merely re-create does.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Ordered, forward-only migrations applied after [`all_ddl`]. Each entry is
 /// `(version, statements)`; a fresh database starts at version
@@ -304,13 +315,13 @@ fn migrate_address_stats_to_summing(db: &str) -> Vec<String> {
              FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
              GROUP BY address_hash"
         ),
-        // ...and spends from `spends` (same shape as the spend MV).
+        // ...and spends from `inputs` (same shape as the spend MV).
         format!(
             "INSERT INTO {db}.address_stats_new \
              (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
              SELECT spent_address_hash, toUInt64(0), toUInt64(0), \
                     toUInt64(count()), sum(spent_value_sat), toUInt64(count()) \
-             FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN} \
+             FROM {db}.inputs WHERE is_coinbase = 0 AND spent_script_type != {SCRIPT_TYPE_OP_RETURN} \
              GROUP BY spent_address_hash"
         ),
         // 4. Swap in the new table. Rename last so a failure leaves the old
@@ -392,9 +403,11 @@ fn transactions(db: &str) -> String {
 fn inputs(db: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {db}.inputs \
-         (height UInt32, tx_index UInt32, input_index UInt32, txid FixedString(32), \
+         (height UInt32, tx_index UInt32, input_index UInt32, \
           prev_txid FixedString(32), prev_vout UInt32, script_sig_len UInt32, \
-          sequence UInt32, witness_items UInt32, witness_bytes UInt32, is_coinbase UInt8) \
+          sequence UInt32, witness_items UInt32, witness_bytes UInt32, is_coinbase UInt8, \
+          spent_value_sat UInt64, spent_script_type UInt8, \
+          spent_address_hash FixedString(32), spent_height UInt32) \
          ENGINE = MergeTree \
          PARTITION BY intDiv(height, 10000) \
          ORDER BY (height, tx_index, input_index)"
@@ -404,25 +417,12 @@ fn inputs(db: &str) -> String {
 fn outputs(db: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {db}.outputs \
-         (height UInt32, tx_index UInt32, output_index UInt32, txid FixedString(32), \
+         (height UInt32, tx_index UInt32, output_index UInt32, \
           value_sat UInt64, script_pubkey_len UInt32, script_type UInt8, \
           address_hash FixedString(32)) \
          ENGINE = MergeTree \
          PARTITION BY intDiv(height, 10000) \
          ORDER BY (height, tx_index, output_index)"
-    )
-}
-
-fn spends(db: &str) -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS {db}.spends \
-         (height UInt32, spending_tx_index UInt32, spending_input_index UInt32, \
-          spending_txid FixedString(32), spent_txid FixedString(32), spent_vout UInt32, \
-          spent_value_sat UInt64, spent_script_type UInt8, \
-          spent_address_hash FixedString(32), spent_height UInt32) \
-         ENGINE = MergeTree \
-         PARTITION BY intDiv(height, 10000) \
-         ORDER BY (height, spending_tx_index, spending_input_index)"
     )
 }
 
@@ -452,11 +452,12 @@ fn proj_blocks_by_hash(db: &str) -> String {
     format!("ALTER TABLE {db}.blocks ADD PROJECTION IF NOT EXISTS blocks_by_hash (SELECT * ORDER BY hash)")
 }
 
-/// #8 group outputs by script type over time.
+/// #8 group outputs by script type over time (compact aggregate projection
+/// rather than a full-row copy of `outputs`).
 fn proj_outputs_by_script_type(db: &str) -> String {
     format!(
         "ALTER TABLE {db}.outputs ADD PROJECTION IF NOT EXISTS outputs_by_script_type \
-         (SELECT * ORDER BY (script_type, height))"
+         (SELECT script_type, height, count(), sum(value_sat) GROUP BY script_type, height)"
     )
 }
 
@@ -489,12 +490,57 @@ fn col_fee_rate(db: &str) -> String {
     )
 }
 
-/// #14 output lifespan / coin-days-destroyed grouping by creation height.
+/// #14 output lifespan / coin-days-destroyed grouping by creation height
+/// (compact aggregate projection on `inputs` rather than a duplicate `spends` table).
 fn proj_spends_by_spent_height(db: &str) -> String {
     format!(
-        "ALTER TABLE {db}.spends ADD PROJECTION IF NOT EXISTS spends_by_spent_height \
-         (SELECT * ORDER BY (spent_height, height))"
+        "ALTER TABLE {db}.inputs ADD PROJECTION IF NOT EXISTS spends_by_spent_height \
+         (SELECT spent_height, height, count(), sum(spent_value_sat) GROUP BY spent_height, height)"
     )
+}
+
+/// Drop base-table projections before a bulk load so base-table inserts do not
+/// sort and write secondary projection parts inline on every inserted block.
+pub fn drop_bulk_projections(db: &str) -> Vec<String> {
+    vec![
+        format!("ALTER TABLE {db}.blocks DROP PROJECTION IF EXISTS blocks_by_hash"),
+        format!("ALTER TABLE {db}.blocks DROP PROJECTION IF EXISTS blocks_by_time"),
+        format!("ALTER TABLE {db}.outputs DROP PROJECTION IF EXISTS outputs_by_script_type"),
+        format!("ALTER TABLE {db}.inputs DROP PROJECTION IF EXISTS spends_by_spent_height"),
+    ]
+}
+
+/// Per-base-table `[ADD PROJECTION ..., MATERIALIZE PROJECTION ...]` groups run
+/// after a bulk load finishes to rebuild base-table projections in parallel.
+pub fn restore_bulk_projection_groups(db: &str) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            proj_blocks_by_hash(db),
+            proj_blocks_by_time(db),
+            format!(
+                "ALTER TABLE {db}.blocks MATERIALIZE PROJECTION blocks_by_hash \
+                 SETTINGS mutations_sync = 1"
+            ),
+            format!(
+                "ALTER TABLE {db}.blocks MATERIALIZE PROJECTION blocks_by_time \
+                 SETTINGS mutations_sync = 1"
+            ),
+        ],
+        vec![
+            proj_outputs_by_script_type(db),
+            format!(
+                "ALTER TABLE {db}.outputs MATERIALIZE PROJECTION outputs_by_script_type \
+                 SETTINGS mutations_sync = 1"
+            ),
+        ],
+        vec![
+            proj_spends_by_spent_height(db),
+            format!(
+                "ALTER TABLE {db}.inputs MATERIALIZE PROJECTION spends_by_spent_height \
+                 SETTINGS mutations_sync = 1"
+            ),
+        ],
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -665,7 +711,10 @@ fn mv_inputs_by_prev_output(db: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.inputs_by_prev_output_mv \
          TO {db}.inputs_by_prev_output AS \
-         SELECT prev_txid, prev_vout, height, tx_index, input_index, txid FROM {db}.inputs"
+         SELECT i.prev_txid AS prev_txid, i.prev_vout AS prev_vout, i.height AS height, \
+                i.tx_index AS tx_index, i.input_index AS input_index, t.txid AS txid \
+         FROM {db}.inputs AS i \
+         INNER JOIN {db}.transactions AS t ON i.height = t.height AND i.tx_index = t.tx_index"
     )
 }
 
@@ -673,8 +722,11 @@ fn mv_outputs_by_address(db: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.outputs_by_address_mv \
          TO {db}.outputs_by_address AS \
-         SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat \
-         FROM {db}.outputs"
+         SELECT o.address_hash AS address_hash, o.script_type AS script_type, o.height AS height, \
+                o.tx_index AS tx_index, o.output_index AS output_index, t.txid AS txid, \
+                o.value_sat AS value_sat \
+         FROM {db}.outputs AS o \
+         INNER JOIN {db}.transactions AS t ON o.height = t.height AND o.tx_index = t.tx_index"
     )
 }
 
@@ -682,8 +734,12 @@ fn mv_spends_by_spent_outpoint(db: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.spends_by_spent_outpoint_mv \
          TO {db}.spends_by_spent_outpoint AS \
-         SELECT spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid \
-         FROM {db}.spends"
+         SELECT i.prev_txid AS spent_txid, i.prev_vout AS spent_vout, i.height AS height, \
+                i.tx_index AS spending_tx_index, i.input_index AS spending_input_index, \
+                t.txid AS spending_txid \
+         FROM {db}.inputs AS i \
+         INNER JOIN {db}.transactions AS t ON i.height = t.height AND i.tx_index = t.tx_index \
+         WHERE i.is_coinbase = 0"
     )
 }
 
@@ -691,9 +747,10 @@ fn mv_spends_by_address(db: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.spends_by_address_mv \
          TO {db}.spends_by_address AS \
-         SELECT spent_address_hash, height, spending_tx_index, spending_input_index, \
-                spent_txid, spent_vout, spent_value_sat, spent_height \
-         FROM {db}.spends"
+         SELECT spent_address_hash, height, tx_index AS spending_tx_index, \
+                input_index AS spending_input_index, prev_txid AS spent_txid, \
+                prev_vout AS spent_vout, spent_value_sat, spent_height \
+         FROM {db}.inputs WHERE is_coinbase = 0"
     )
 }
 
@@ -701,9 +758,11 @@ fn mv_address_history_fund(db: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.address_history_fund_mv \
          TO {db}.address_history AS \
-         SELECT address_hash, height, tx_index, txid, toInt64(value_sat) AS value_sat, \
-                toUInt8(0) AS kind \
-         FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
+         SELECT o.address_hash AS address_hash, o.height AS height, o.tx_index AS tx_index, \
+                t.txid AS txid, toInt64(o.value_sat) AS value_sat, toUInt8(0) AS kind \
+         FROM {db}.outputs AS o \
+         INNER JOIN {db}.transactions AS t ON o.height = t.height AND o.tx_index = t.tx_index \
+         WHERE o.script_type != {SCRIPT_TYPE_OP_RETURN}"
     )
 }
 
@@ -711,9 +770,11 @@ fn mv_address_history_spend(db: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.address_history_spend_mv \
          TO {db}.address_history AS \
-         SELECT spent_address_hash AS address_hash, height, spending_tx_index AS tx_index, \
-                spending_txid AS txid, toInt64(-spent_value_sat) AS value_sat, toUInt8(1) AS kind \
-         FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+         SELECT i.spent_address_hash AS address_hash, i.height AS height, i.tx_index AS tx_index, \
+                t.txid AS txid, toInt64(-i.spent_value_sat) AS value_sat, toUInt8(1) AS kind \
+         FROM {db}.inputs AS i \
+         INNER JOIN {db}.transactions AS t ON i.height = t.height AND i.tx_index = t.tx_index \
+         WHERE i.is_coinbase = 0 AND i.spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
     )
 }
 
@@ -721,9 +782,12 @@ fn mv_utxos_fund(db: &str) -> String {
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.utxos_fund_mv \
          TO {db}.utxos_by_address AS \
-         SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat, \
-                toInt8(1) AS sign \
-         FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN}"
+         SELECT o.address_hash AS address_hash, o.script_type AS script_type, o.height AS height, \
+                o.tx_index AS tx_index, o.output_index AS output_index, t.txid AS txid, \
+                o.value_sat AS value_sat, toInt8(1) AS sign \
+         FROM {db}.outputs AS o \
+         INNER JOIN {db}.transactions AS t ON o.height = t.height AND o.tx_index = t.tx_index \
+         WHERE o.script_type != {SCRIPT_TYPE_OP_RETURN}"
     )
 }
 
@@ -732,9 +796,9 @@ fn mv_utxos_spend(db: &str) -> String {
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.utxos_spend_mv \
          TO {db}.utxos_by_address AS \
          SELECT spent_address_hash AS address_hash, spent_script_type AS script_type, height, \
-                spending_tx_index AS tx_index, spent_vout AS output_index, spent_txid AS txid, \
+                tx_index, prev_vout AS output_index, prev_txid AS txid, \
                 spent_value_sat AS value_sat, toInt8(-1) AS sign \
-         FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+         FROM {db}.inputs WHERE is_coinbase = 0 AND spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
     )
 }
 
@@ -755,7 +819,7 @@ fn mv_address_stats_spend(db: &str) -> String {
          SELECT spent_address_hash AS address_hash, toUInt64(0) AS funded_count, \
                 toUInt64(0) AS funded_sum, toUInt64(1) AS spent_count, \
                 spent_value_sat AS spent_sum, toUInt64(1) AS history_count \
-         FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+         FROM {db}.inputs WHERE is_coinbase = 0 AND spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
     )
 }
 
@@ -799,21 +863,33 @@ fn mv_scripthash_map(db: &str) -> String {
 /// the bulk-load path can drop and recreate exactly the set the schema
 /// defines, without a second hardcoded list drifting out of sync.
 pub fn materialized_views(db: &str) -> Vec<String> {
-    vec![
-        mv_transactions_by_txid(db), // 2
-        mv_inputs_by_prev_output(db),
-        mv_outputs_by_address(db),       // 4
-        mv_spends_by_spent_outpoint(db), // 3
-        mv_spends_by_address(db),        // 5
-        mv_address_history_fund(db),     // 6
-        mv_address_history_spend(db),    // 6
-        mv_utxos_fund(db),               // 7
-        mv_utxos_spend(db),              // 7
-        mv_address_stats_fund(db),       // 15
-        mv_address_stats_spend(db),      // 15
-        mv_blocks_by_miner(db),          // 17
-        mv_scripthash_map(db),           // 19
-    ]
+    materialized_views_for_profile(db, IndexProfile::Full)
+}
+
+/// Materialized views active under `profile`. [`IndexProfile::Serving`] omits
+/// the three unqueried duplicate tables (`inputs_by_prev_output`,
+/// `outputs_by_address`, `spends_by_address`).
+pub fn materialized_views_for_profile(db: &str, profile: IndexProfile) -> Vec<String> {
+    let mut out = vec![mv_transactions_by_txid(db)]; // 2
+    if profile == IndexProfile::Full {
+        out.push(mv_inputs_by_prev_output(db));
+        out.push(mv_outputs_by_address(db)); // 4
+    }
+    out.push(mv_spends_by_spent_outpoint(db)); // 3
+    if profile == IndexProfile::Full {
+        out.push(mv_spends_by_address(db)); // 5
+    }
+    out.extend([
+        mv_address_history_fund(db),  // 6
+        mv_address_history_spend(db), // 6
+        mv_utxos_fund(db),            // 7
+        mv_utxos_spend(db),           // 7
+        mv_address_stats_fund(db),    // 15
+        mv_address_stats_spend(db),   // 15
+        mv_blocks_by_miner(db),       // 17
+        mv_scripthash_map(db),        // 19
+    ]);
+    out
 }
 
 /// The materialized-view *names*, in creation order, so the bulk-load path can
@@ -864,105 +940,135 @@ pub fn drop_materialized_views(db: &str) -> Vec<String> {
 /// `scripthash_map` entry is not the raw MV body: it `SELECT DISTINCT`s, so it
 /// writes one row per distinct script rather than one per output, which is a
 /// large reduction on a full chain.
-/// Independent `[TRUNCATE TABLE ..., INSERT INTO ...]` statement pairs for each
-/// MV-backed derived index table so `ChLoader` can execute disjoint target
-/// backfills concurrently across multiple ClickHouse connections.
-pub fn backfill_derived_index_groups(db: &str) -> Vec<Vec<String>> {
-    vec![
-        // 2. transactions_by_txid
-        vec![
-            format!("TRUNCATE TABLE {db}.transactions_by_txid"),
-            format!(
-                "INSERT INTO {db}.transactions_by_txid (txid, height, tx_index) \
-                 SELECT txid, height, tx_index FROM {db}.transactions"
-            ),
-        ],
-        // 3. inputs_by_prev_output
-        vec![
+/// Two-wave `[TRUNCATE TABLE ..., INSERT INTO ...]` backfill plan:
+/// * **Wave 1** populates disjoint derived index tables from the base tables in
+///   parallel (optionally skipping `utxos_by_address` when streamed directly
+///   from `UtxoStore` and `scripthash_map` when fused with `address_prefix`).
+/// * **Wave 2** aggregates `address_stats` **in primary-key order**
+///   (`optimize_aggregation_in_order = 1`) directly from `address_history`
+///   (`ORDER BY (address_hash, height, tx_index)`), bounding ClickHouse RAM to
+///   \(O(1)\) and writing one pre-summed row per distinct address instead of
+///   6.17B unaggregated rows.
+pub fn backfill_derived_index_waves(
+    db: &str,
+    profile: IndexProfile,
+    skip_utxos_by_address: bool,
+    skip_scripthash_map: bool,
+) -> [Vec<Vec<String>>; 2] {
+    let mut wave1 = Vec::with_capacity(9);
+
+    // 2. transactions_by_txid
+    wave1.push(vec![
+        format!("TRUNCATE TABLE {db}.transactions_by_txid"),
+        format!(
+            "INSERT INTO {db}.transactions_by_txid (txid, height, tx_index) \
+             SELECT txid, height, tx_index FROM {db}.transactions"
+        ),
+    ]);
+
+    if profile == IndexProfile::Full {
+        // inputs_by_prev_output
+        wave1.push(vec![
             format!("TRUNCATE TABLE {db}.inputs_by_prev_output"),
             format!(
                 "INSERT INTO {db}.inputs_by_prev_output (prev_txid, prev_vout, height, tx_index, input_index, txid) \
-                 SELECT prev_txid, prev_vout, height, tx_index, input_index, txid FROM {db}.inputs"
+                 SELECT i.prev_txid, i.prev_vout, i.height, i.tx_index, i.input_index, t.txid \
+                 FROM {db}.inputs AS i \
+                 INNER JOIN {db}.transactions AS t ON i.height = t.height AND i.tx_index = t.tx_index \
+                 SETTINGS join_algorithm = 'direct,prefer_partial_merge,hash'"
             ),
-        ],
+        ]);
         // 4. outputs_by_address
-        vec![
+        wave1.push(vec![
             format!("TRUNCATE TABLE {db}.outputs_by_address"),
             format!(
                 "INSERT INTO {db}.outputs_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat) \
-                 SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat FROM {db}.outputs"
+                 SELECT o.address_hash, o.script_type, o.height, o.tx_index, o.output_index, t.txid, o.value_sat \
+                 FROM {db}.outputs AS o \
+                 INNER JOIN {db}.transactions AS t ON o.height = t.height AND o.tx_index = t.tx_index \
+                 SETTINGS join_algorithm = 'direct,prefer_partial_merge,hash'"
             ),
-        ],
-        // 5. spends_by_spent_outpoint
-        vec![
-            format!("TRUNCATE TABLE {db}.spends_by_spent_outpoint"),
-            format!(
-                "INSERT INTO {db}.spends_by_spent_outpoint (spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid) \
-                 SELECT spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid FROM {db}.spends"
-            ),
-        ],
-        // 6. spends_by_address
-        vec![
+        ]);
+    }
+
+    // 3. spends_by_spent_outpoint
+    wave1.push(vec![
+        format!("TRUNCATE TABLE {db}.spends_by_spent_outpoint"),
+        format!(
+            "INSERT INTO {db}.spends_by_spent_outpoint (spent_txid, spent_vout, height, spending_tx_index, spending_input_index, spending_txid) \
+             SELECT i.prev_txid, i.prev_vout, i.height, i.tx_index, i.input_index, t.txid \
+             FROM {db}.inputs AS i \
+             INNER JOIN {db}.transactions AS t ON i.height = t.height AND i.tx_index = t.tx_index \
+             WHERE i.is_coinbase = 0 \
+             SETTINGS join_algorithm = 'direct,prefer_partial_merge,hash'"
+        ),
+    ]);
+
+    if profile == IndexProfile::Full {
+        // 5. spends_by_address
+        wave1.push(vec![
             format!("TRUNCATE TABLE {db}.spends_by_address"),
             format!(
                 "INSERT INTO {db}.spends_by_address (spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height) \
-                 SELECT spent_address_hash, height, spending_tx_index, spending_input_index, spent_txid, spent_vout, spent_value_sat, spent_height FROM {db}.spends"
+                 SELECT spent_address_hash, height, tx_index, input_index, prev_txid, prev_vout, spent_value_sat, spent_height \
+                 FROM {db}.inputs WHERE is_coinbase = 0"
             ),
-        ],
-        // 6. address_history (fund + spend) — single `UNION ALL` insert.
-        vec![
-            format!("TRUNCATE TABLE {db}.address_history"),
-            format!(
-                "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
-                 SELECT address_hash, height, tx_index, txid, toInt64(value_sat) AS value_sat, toUInt8(0) AS kind \
-                 FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
-                 UNION ALL \
-                 SELECT spent_address_hash AS address_hash, height, spending_tx_index AS tx_index, \
-                        spending_txid AS txid, toInt64(-spent_value_sat) AS value_sat, toUInt8(1) AS kind \
-                 FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
-            ),
-        ],
-        // 7. utxos_by_address (fund + spend) — single `UNION ALL` insert.
-        vec![
+        ]);
+    }
+
+    // 6. address_history (fund + spend) — single `UNION ALL` insert.
+    wave1.push(vec![
+        format!("TRUNCATE TABLE {db}.address_history"),
+        format!(
+            "INSERT INTO {db}.address_history (address_hash, height, tx_index, txid, value_sat, kind) \
+             SELECT o.address_hash, o.height, o.tx_index, t.txid, toInt64(o.value_sat) AS value_sat, toUInt8(0) AS kind \
+             FROM {db}.outputs AS o \
+             INNER JOIN {db}.transactions AS t ON o.height = t.height AND o.tx_index = t.tx_index \
+             WHERE o.script_type != {SCRIPT_TYPE_OP_RETURN} \
+             UNION ALL \
+             SELECT i.spent_address_hash AS address_hash, i.height, i.tx_index, \
+                    t.txid, toInt64(-i.spent_value_sat) AS value_sat, toUInt8(1) AS kind \
+             FROM {db}.inputs AS i \
+             INNER JOIN {db}.transactions AS t ON i.height = t.height AND i.tx_index = t.tx_index \
+             WHERE i.is_coinbase = 0 AND i.spent_script_type != {SCRIPT_TYPE_OP_RETURN} \
+             SETTINGS join_algorithm = 'direct,prefer_partial_merge,hash'"
+        ),
+    ]);
+
+    // 7. utxos_by_address (fund + spend) — skipped when exported directly from
+    // `UtxoStore::for_each_live_utxo`.
+    if !skip_utxos_by_address {
+        wave1.push(vec![
             format!("TRUNCATE TABLE {db}.utxos_by_address"),
             format!(
                 "INSERT INTO {db}.utxos_by_address (address_hash, script_type, height, tx_index, output_index, txid, value_sat, sign) \
-                 SELECT address_hash, script_type, height, tx_index, output_index, txid, value_sat, toInt8(1) AS sign \
-                 FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
+                 SELECT o.address_hash, o.script_type, o.height, o.tx_index, o.output_index, t.txid, o.value_sat, toInt8(1) AS sign \
+                 FROM {db}.outputs AS o \
+                 INNER JOIN {db}.transactions AS t ON o.height = t.height AND o.tx_index = t.tx_index \
+                 WHERE o.script_type != {SCRIPT_TYPE_OP_RETURN} \
                  UNION ALL \
                  SELECT spent_address_hash AS address_hash, spent_script_type AS script_type, height, \
-                        spending_tx_index AS tx_index, spent_vout AS output_index, spent_txid AS txid, \
+                        tx_index, prev_vout AS output_index, prev_txid AS txid, \
                         spent_value_sat AS value_sat, toInt8(-1) AS sign \
-                 FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
+                 FROM {db}.inputs WHERE is_coinbase = 0 AND spent_script_type != {SCRIPT_TYPE_OP_RETURN} \
+                 SETTINGS join_algorithm = 'direct,prefer_partial_merge,hash'"
             ),
-        ],
-        // 15. address_stats (fund + spend) — single `UNION ALL` insert.
-        vec![
-            format!("TRUNCATE TABLE {db}.address_stats"),
-            format!(
-                "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
-                 SELECT address_hash, toUInt64(1) AS funded_count, value_sat AS funded_sum, \
-                        toUInt64(0) AS spent_count, toUInt64(0) AS spent_sum, toUInt64(1) AS history_count \
-                 FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
-                 UNION ALL \
-                 SELECT spent_address_hash AS address_hash, toUInt64(0) AS funded_count, \
-                        toUInt64(0) AS funded_sum, toUInt64(1) AS spent_count, \
-                        spent_value_sat AS spent_sum, toUInt64(1) AS history_count \
-                 FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN}"
-            ),
-        ],
-        // 17. blocks_by_miner
-        vec![
-            format!("TRUNCATE TABLE {db}.blocks_by_miner"),
-            format!(
-                "INSERT INTO {db}.blocks_by_miner (miner_hash, height, tx_index, coinbase_value) \
-                 SELECT address_hash AS miner_hash, height, tx_index, value_sat AS coinbase_value \
-                 FROM {db}.outputs WHERE tx_index = 0 AND script_type != {SCRIPT_TYPE_OP_RETURN}"
-            ),
-        ],
-        // 19. scripthash_map — DISTINCT, unlike the per-row MV, so it writes one
-        // row per distinct script instead of one per output.
-        vec![
+        ]);
+    }
+
+    // 17. blocks_by_miner
+    wave1.push(vec![
+        format!("TRUNCATE TABLE {db}.blocks_by_miner"),
+        format!(
+            "INSERT INTO {db}.blocks_by_miner (miner_hash, height, tx_index, coinbase_value) \
+             SELECT address_hash AS miner_hash, height, tx_index, value_sat AS coinbase_value \
+             FROM {db}.outputs WHERE tx_index = 0 AND script_type != {SCRIPT_TYPE_OP_RETURN}"
+        ),
+    ]);
+
+    // 19. scripthash_map — DISTINCT, skipped when fused with `address_prefix`.
+    if !skip_scripthash_map {
+        wave1.push(vec![
             format!("TRUNCATE TABLE {db}.scripthash_map"),
             format!(
                 "INSERT INTO {db}.scripthash_map (scripthash, script_type, address_hash) \
@@ -978,8 +1084,35 @@ pub fn backfill_derived_index_groups(db: &str) -> Vec<Vec<String>> {
                  FROM {db}.outputs \
                  WHERE script_type IN (2, 3, 4, 5, 6)"
             ),
-        ],
-    ]
+        ]);
+    }
+
+    // 15. Wave 2: address_stats aggregated in-order from `address_history`.
+    let wave2 = vec![vec![
+        format!("TRUNCATE TABLE {db}.address_stats"),
+        format!(
+            "INSERT INTO {db}.address_stats (address_hash, funded_count, funded_sum, spent_count, spent_sum, history_count) \
+             SELECT address_hash, \
+                    toUInt64(countIf(kind = 0)) AS funded_count, \
+                    toUInt64(sumIf(value_sat, kind = 0)) AS funded_sum, \
+                    toUInt64(countIf(kind = 1)) AS spent_count, \
+                    toUInt64(sumIf(-value_sat, kind = 1)) AS spent_sum, \
+                    toUInt64(count()) AS history_count \
+             FROM {db}.address_history \
+             GROUP BY address_hash \
+             SETTINGS optimize_aggregation_in_order = 1"
+        ),
+    ]];
+
+    [wave1, wave2]
+}
+
+/// Independent `[TRUNCATE TABLE ..., INSERT INTO ...]` statement pairs for all
+/// MV-backed derived index tables under [`IndexProfile::Full`].
+pub fn backfill_derived_index_groups(db: &str) -> Vec<Vec<String>> {
+    let [mut wave1, wave2] = backfill_derived_index_waves(db, IndexProfile::Full, false, false);
+    wave1.extend(wave2);
+    wave1
 }
 
 pub fn backfill_derived_indexes(db: &str) -> Vec<String> {
@@ -1009,7 +1142,7 @@ pub fn backfill_coinstats(db: &str) -> Vec<String> {
                  FROM {db}.outputs WHERE script_type != {SCRIPT_TYPE_OP_RETURN} \
                  UNION ALL \
                  SELECT intDiv(height, 10000) * 10000 AS height, toInt8(-1) AS sign, toInt64(0) AS value_sat \
-                 FROM {db}.spends WHERE spent_script_type != {SCRIPT_TYPE_OP_RETURN} \
+                 FROM {db}.inputs WHERE is_coinbase = 0 AND spent_script_type != {SCRIPT_TYPE_OP_RETURN} \
              ) \
              GROUP BY height ORDER BY height"
         ),
@@ -1027,6 +1160,19 @@ pub fn address_prefix_source(db: &str) -> String {
         "SELECT DISTINCT script_type, hex(address_hash) AS address_hash \
          FROM {db}.outputs \
          WHERE script_type IN (1, 2, 3, 4, 5, 6, 8)"
+    )
+}
+
+/// Binary `RowBinary` variant of [`address_prefix_source`]: emits fixed-width
+/// 33-byte `(script_type UInt8, address_hash FixedString(32))` records (`3.2x`
+/// smaller than TSV hex and zero hex encode/decode overhead), suitable for the
+/// fused `address_prefix + scripthash_map` rebuild pass.
+pub fn address_prefix_binary_source(db: &str) -> String {
+    format!(
+        "SELECT DISTINCT script_type, address_hash \
+         FROM {db}.outputs \
+         WHERE script_type IN (1, 2, 3, 4, 5, 6, 8) \
+         FORMAT RowBinary"
     )
 }
 
@@ -1318,8 +1464,9 @@ mod tests {
         assert!(stmts[2].contains("FROM db.outputs"));
         assert!(stmts[2].contains("WHERE script_type != 7"));
         assert!(stmts[2].contains("GROUP BY address_hash"));
-        // ...and spends from `spends`, matching the spend MV.
-        assert!(stmts[3].contains("FROM db.spends"));
+        // ...and spends from `inputs`, matching the spend MV.
+        assert!(stmts[3].contains("FROM db.inputs"));
+        assert!(stmts[3].contains("is_coinbase = 0"));
         assert!(stmts[3].contains("spent_script_type != 7"));
         assert!(stmts[3].contains("GROUP BY spent_address_hash"));
         // 4. swap: drop the old table (IF EXISTS, so a retry is tolerated), then
@@ -1608,10 +1755,10 @@ mod tests {
                 "{table} must have a backfill insert"
             );
         }
-        // The three two-source tables each get a *single* `INSERT` whose
-        // `UNION ALL` carries both halves — one statement, so one set of parts
-        // for ClickHouse to merge rather than two.
-        for table in ["address_history", "utxos_by_address", "address_stats"] {
+        // The two base-backed two-source tables each get a *single* `INSERT`
+        // whose `UNION ALL` carries both halves; `address_stats` is aggregated
+        // in primary-key order from `address_history` in Wave 2.
+        for table in ["address_history", "utxos_by_address"] {
             assert_eq!(
                 body.matches(&format!("INSERT INTO db.{table} ")).count(),
                 1,
@@ -1624,12 +1771,73 @@ mod tests {
                 "{table} must union its fund and spend halves"
             );
         }
+        assert!(body.contains("FROM db.address_history GROUP BY address_hash"));
+        assert!(body.contains("SETTINGS optimize_aggregation_in_order = 1"));
         // scripthash_map uses DISTINCT (unlike the per-row MV) and the same
         // reconstruction expression.
         assert!(body.contains("INSERT INTO db.scripthash_map "));
         assert!(body.contains("SELECT DISTINCT"));
         assert!(body.contains("unhex('76a914')"));
         assert!(body.contains("WHERE script_type IN (2, 3, 4, 5, 6)"));
+    }
+
+    #[test]
+    fn serving_profile_bulk_projections_and_binary_prefix_source_work() {
+        assert_eq!(IndexProfile::default(), IndexProfile::Serving);
+
+        // Aggregate projections avoid duplicating full rows of outputs/inputs.
+        let out_proj = proj_outputs_by_script_type("db");
+        assert!(out_proj.contains("GROUP BY script_type, height"));
+        assert!(!out_proj.contains("SELECT *"));
+        let spend_proj = proj_spends_by_spent_height("db");
+        assert!(spend_proj.contains("ALTER TABLE db.inputs"));
+        assert!(spend_proj.contains("GROUP BY spent_height, height"));
+        assert!(!spend_proj.contains("SELECT *"));
+
+        // Deferred projection helpers drop and re-materialize all 4 projections.
+        let drops = drop_bulk_projections("db");
+        assert_eq!(drops.len(), 4);
+        assert!(drops
+            .iter()
+            .all(|s| s.contains("DROP PROJECTION IF EXISTS")));
+        let restores = restore_bulk_projection_groups("db");
+        assert_eq!(restores.len(), 3);
+        let restore_body = restores
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        for p in [
+            "blocks_by_hash",
+            "blocks_by_time",
+            "outputs_by_script_type",
+            "spends_by_spent_height",
+        ] {
+            assert!(restore_body.contains(&format!("MATERIALIZE PROJECTION {p}")));
+        }
+
+        // Serving profile omits the 3 unqueried duplicate tables from MVs and Wave 1.
+        let serving_mvs = materialized_views_for_profile("db", IndexProfile::Serving).join("\n");
+        assert!(!serving_mvs.contains("inputs_by_prev_output_mv"));
+        assert!(!serving_mvs.contains("outputs_by_address_mv"));
+        assert!(!serving_mvs.contains("spends_by_address_mv"));
+        assert!(serving_mvs.contains("transactions_by_txid_mv"));
+        assert!(serving_mvs.contains("address_history_fund_mv"));
+
+        let [w1, w2] = backfill_derived_index_waves("db", IndexProfile::Serving, true, true);
+        let w1_body = w1.into_iter().flatten().collect::<Vec<_>>().join("\n");
+        assert!(!w1_body.contains("inputs_by_prev_output"));
+        assert!(!w1_body.contains("outputs_by_address"));
+        assert!(!w1_body.contains("spends_by_address"));
+        assert!(!w1_body.contains("utxos_by_address"));
+        assert!(!w1_body.contains("scripthash_map"));
+        assert!(w1_body.contains("address_history"));
+        assert_eq!(w2.len(), 1);
+        assert!(w2[0][1].contains("optimize_aggregation_in_order = 1"));
+
+        let bin_src = address_prefix_binary_source("db");
+        assert!(bin_src.contains("SELECT DISTINCT script_type, address_hash"));
+        assert!(bin_src.ends_with("FORMAT RowBinary"));
     }
 
     #[test]

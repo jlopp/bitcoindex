@@ -42,9 +42,9 @@ fn scan_file(
     path: &Path,
     file_id: u32,
     xor_key: Option<[u8; 8]>,
-) -> Result<(Vec<(Hash32, HeaderEntry)>, usize), BlkError> {
+) -> Result<(u32, Vec<(Hash32, HeaderEntry)>, usize, u64), BlkError> {
     let mut out: Vec<(Hash32, HeaderEntry)> = Vec::new();
-    scan_blk_headers(path, file_id, xor_key, |rec| {
+    let data_end = scan_blk_headers(path, file_id, xor_key, |rec| {
         let work = work_from_bits(rec.header.bits);
         out.push((
             rec.hash,
@@ -56,7 +56,7 @@ fn scan_file(
         ));
     })?;
     let count = out.len();
-    Ok((out, count))
+    Ok((file_id, out, count, data_end))
 }
 
 /// Derive approximate proof-of-work from compact `bits`.
@@ -141,16 +141,22 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
     // `collect` into a `Vec` preserves input order, and `discover_blk_files`
     // returns files sorted by id, so the merge sees records in deterministic
     // file-id order and preserves first-seen-wins on duplicate block hashes.
-    let scanned: Vec<(Vec<(Hash32, HeaderEntry)>, usize)> = files
+    let scanned: Vec<(u32, Vec<(Hash32, HeaderEntry)>, usize, u64)> = files
         .par_iter()
         .map(|(file_id, path)| scan_file(path, *file_id, xor_key))
         .collect::<Result<Vec<_>, BlkError>>()?;
 
+    let max_file_id = scanned
+        .last()
+        .map(|(fid, _, _, _)| *fid as usize)
+        .unwrap_or(0);
+    let mut file_data_end = vec![0u64; max_file_id + 1];
     let mut headers: FxHashMap<Hash32, HeaderEntry> = FxHashMap::default();
     let mut stats = ChainBuildStats::default();
-    for (records, count) in scanned {
+    for (file_id, records, count, data_end) in scanned {
         stats.files_scanned += 1;
         stats.total_records += count;
+        file_data_end[file_id as usize] = data_end;
         for (hash, entry) in records {
             // First-seen wins on hash duplicates (BIP30 duplicate coinbases
             // share txids, not block hashes, so block-hash dupes indicate
@@ -267,10 +273,13 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
     chain.reverse();
 
     let mut by_height = Vec::with_capacity(chain.len());
-    let mut hash_to_height = FxHashMap::default();
+    let mut hash_to_height = FxHashMap::with_capacity_and_hasher(chain.len(), Default::default());
+    let mut file_max_height = vec![u32::MAX; max_file_id + 1];
     for (i, h) in chain.iter().enumerate() {
-        by_height.push(headers[h].location);
+        let loc = headers[h].location;
+        by_height.push(loc);
         hash_to_height.insert(*h, i as u32);
+        file_max_height[loc.file_id as usize] = i as u32;
     }
 
     stats.orphans = headers.len().saturating_sub(chain.len());
@@ -285,7 +294,10 @@ pub fn build_chain_index(blocks_dir: &Path) -> Result<(ChainIndex, ChainBuildSta
     Ok((
         ChainIndex {
             by_height,
+            block_hashes: chain,
             hash_to_height,
+            file_data_end,
+            file_max_height,
         },
         stats,
     ))
@@ -462,6 +474,10 @@ mod tests {
         assert_eq!(stats.orphans, 0);
         // The retained location is from file 0 (first seen).
         assert_eq!(idx.by_height[0].file_id, 0);
+        assert_eq!(idx.block_hashes, vec![g, dsha256(&a)]);
+        assert_eq!(idx.file_data_end, vec![176, 176]);
+        // File 0 holds heights 0..=1; file 1 held only duplicates so no main-chain height.
+        assert_eq!(idx.file_max_height, vec![1, u32::MAX]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

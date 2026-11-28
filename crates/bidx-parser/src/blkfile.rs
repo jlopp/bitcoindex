@@ -77,29 +77,25 @@ impl BlkFile {
         file_id: u32,
         xor_key: Option<[u8; 8]>,
     ) -> Result<Self, BlkError> {
+        Self::open_with_key_hint(path, file_id, xor_key, None)
+    }
+
+    /// Open the blk file using a pre-resolved optional `xor.dat` key and an
+    /// optional trimmed `known_data_end` byte boundary recorded by the header
+    /// pass.
+    ///
+    /// When `known_data_end` is supplied, both the XOR-decoded reader and the
+    /// `Mmap` reader skip walking record headers a second time, and the XOR
+    /// reader stops reading at `known_data_end` (skipping trailing preallocated
+    /// zero padding on partially filled tip files).
+    pub fn open_with_key_hint(
+        path: &Path,
+        file_id: u32,
+        xor_key: Option<[u8; 8]>,
+        known_data_end: Option<u64>,
+    ) -> Result<Self, BlkError> {
         let backing = match xor_key {
-            Some(key) => {
-                // Sequential kernel `read` into a single owned buffer, followed
-                // by record-boundary trim and in-place 8-byte-chunk XOR decode.
-                // Compared to `Mmap::map` + allocating a second 128 MiB Vec +
-                // `drop(mmap)`, this halves peak per-open allocation, avoids
-                // 32,768 minor page faults per file, and eliminates cross-core
-                // `munmap` TLB shootdown IPIs across worker threads.
-                let mut buf = std::fs::read(path).map_err(|source| BlkError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-                let data_end = record_walk_end(&buf, Some(&key));
-                buf.truncate(data_end);
-                // Release preallocated trailing megabytes on partially filled
-                // tip files while avoiding realloc copies on ordinary files
-                // whose trailing padding is only a few kilobytes.
-                if buf.capacity().saturating_sub(buf.len()) >= (1 << 20) {
-                    buf.shrink_to_fit();
-                }
-                xor_decode_in_place(&mut buf, &key);
-                BlkData::Decoded(buf)
-            }
+            Some(key) => BlkData::Decoded(read_xor_decoded_streaming(path, &key, known_data_end)?),
             None => {
                 let file = File::open(path).map_err(|source| BlkError::Io {
                     path: path.to_path_buf(),
@@ -118,7 +114,10 @@ impl BlkFile {
                 })?;
                 #[cfg(unix)]
                 let _ = mmap.advise(memmap2::Advice::Sequential);
-                let data_end = record_walk_end(&mmap, None);
+                let data_end = match known_data_end {
+                    Some(end) if end > 0 && (end as usize) <= mmap.len() => end as usize,
+                    _ => record_walk_end_decoded(&mmap, mmap.first().is_some_and(|&b| b != 0)),
+                };
                 BlkData::Mmap { mmap, data_end }
             }
         };
@@ -223,7 +222,7 @@ pub fn scan_blk_headers(
     file_id: u32,
     xor_key: Option<[u8; 8]>,
     mut on_record: impl FnMut(BlkRecord),
-) -> Result<(), BlkError> {
+) -> Result<u64, BlkError> {
     let (file, file_len) = open_with_len(path).map_err(|source| BlkError::Io {
         path: path.to_path_buf(),
         source,
@@ -294,67 +293,110 @@ pub fn scan_blk_headers(
         });
         pos += 8 + len;
     }
-    Ok(())
+    Ok(pos)
 }
 
-/// Find where the meaningful data ends by walking the record framing.
+/// Chunk size (64 KiB) for streaming L1/L2-cache-resident read + XOR decode.
+const READ_XOR_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Stream-read `path` and XOR-decode each 64 KiB chunk while it is hot in
+/// L1/L2 cache before appending to the destination `Vec<u8>`.
 ///
-/// A blk file is a flat sequence of `magic(4) || len(4) || payload(len)`
-/// records, optionally followed by trailing preallocated zero padding. We
-/// cannot simply trim trailing zero bytes: the last record may legitimately
-/// end in zeros (a tx with `locktime == 0`), and under XOR obfuscation the
-/// padding decodes to a non-zero key pattern so the raw view is the only
-/// place the zeros are visible at all.
-///
-/// Walking is exact in both cases. It stops at the first offset that is not a
-/// well-formed record — either a non-magic word (the zero padding) or a
-/// declared length that would run past the end of the file. The returned
-/// offset is the end of the last complete record, so it is always a record
-/// boundary; a partially written trailing record is therefore excluded
-/// rather than parsed as garbage.
-///
-/// `key` is the XOR key when the file is obfuscated; lengths are read through
-/// the same XOR so the walk sees the real framing.
-fn record_walk_end(raw: &[u8], key: Option<&[u8; 8]>) -> usize {
-    /// Read a 4-byte word at `off`, XOR-decoding it when obfuscated.
-    #[inline]
-    fn word(raw: &[u8], off: usize, key: Option<&[u8; 8]>) -> u32 {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(&raw[off..off + 4]);
-        if let Some(k) = key {
-            // The keystream index is the byte offset into the file.
-            for (i, byte) in b.iter_mut().enumerate() {
-                *byte ^= k[(off + i) & 7];
-            }
+/// Compared to `std::fs::read` (128 MiB write to DRAM) followed by a separate
+/// `xor_decode_in_place` pass (128 MiB cold-DRAM read + 128 MiB DRAM write),
+/// chunked L2-hot decoding halves DRAM memory-bus traffic (~1.36 TiB saved
+/// across 5,400 mainnet `blk*.dat` files).
+fn read_xor_decoded_streaming(
+    path: &Path,
+    key: &[u8; 8],
+    known_data_end: Option<u64>,
+) -> Result<Vec<u8>, BlkError> {
+    use std::io::Read;
+
+    let (mut file, file_len) = open_with_len(path).map_err(|source| BlkError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    let hinted = known_data_end.filter(|&end| end > 0 && end <= file_len);
+    let target_len = hinted.unwrap_or(file_len) as usize;
+    let mut buf = Vec::with_capacity(target_len);
+    let mut scratch = [0u8; READ_XOR_CHUNK_BYTES];
+    let mut pos = 0usize;
+    let mut first_raw_nonzero = false;
+
+    while pos < target_len {
+        let want = (target_len - pos).min(READ_XOR_CHUNK_BYTES);
+        // coverage-exempt: `file` was just opened above; `read` only fails on
+        // a mid-stream kernel I/O fault.
+        let n = file
+            .read(&mut scratch[..want])
+            .map_err(|source| BlkError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if n == 0 {
+            break; // coverage-exempt: concurrent external truncation between metadata() and read()
         }
-        u32::from_le_bytes(b)
+        if pos == 0 {
+            first_raw_nonzero = scratch[0] != 0;
+        }
+        xor_decode_at_offset(&mut scratch[..n], key, pos);
+        buf.extend_from_slice(&scratch[..n]);
+        pos += n;
     }
 
+    if hinted.is_none() {
+        let data_end = record_walk_end_decoded(&buf, first_raw_nonzero);
+        buf.truncate(data_end);
+        // Release preallocated trailing megabytes on partially filled tip files
+        // while avoiding realloc copies on ordinary files whose trailing padding
+        // is only a few kilobytes.
+        if buf.capacity().saturating_sub(buf.len()) >= (1 << 20) {
+            buf.shrink_to_fit();
+        }
+    }
+    Ok(buf)
+}
+
+/// Find where the meaningful data ends by walking the decoded record framing.
+///
+/// A blk file is a flat sequence of `magic(4) || len(4) || payload(len)`
+/// records, optionally followed by trailing preallocated zero padding.
+/// `first_raw_nonzero` captures whether byte 0 on disk (prior to any XOR
+/// decode) was non-zero, so pure preallocated padding (`0x00` on disk) trims
+/// cleanly to `0` while a genuinely malformed non-zero file is preserved intact
+/// so `BlkRecordIter` surfaces `"bad magic"` / `"bad record len"`.
+fn record_walk_end_decoded(decoded: &[u8], first_raw_nonzero: bool) -> usize {
     let mut pos = 0usize;
     let mut end = 0usize;
     // A record needs at least magic(4) + len(4) + header(80).
-    while pos + 8 + BLOCK_HEADER_LEN <= raw.len() {
-        if !is_known_network_magic(word(raw, pos, key)) {
+    while pos + 8 + BLOCK_HEADER_LEN <= decoded.len() {
+        let magic = u32::from_le_bytes([
+            decoded[pos],
+            decoded[pos + 1],
+            decoded[pos + 2],
+            decoded[pos + 3],
+        ]);
+        if !is_known_network_magic(magic) {
             break;
         }
-        let len = word(raw, pos + 4, key) as usize;
+        let len = u32::from_le_bytes([
+            decoded[pos + 4],
+            decoded[pos + 5],
+            decoded[pos + 6],
+            decoded[pos + 7],
+        ]) as usize;
         // `len` is attacker-controlled in principle; bound it before adding.
-        if len < BLOCK_HEADER_LEN || len > raw.len() - pos - 8 {
+        if len < BLOCK_HEADER_LEN || len > decoded.len() - pos - 8 {
             break;
         }
         pos += 8 + len;
         end = pos;
     }
 
-    // If not a single record parsed, distinguish "this is pure padding (or an
-    // empty file)" from "this file is malformed". Trimming a malformed file to
-    // nothing would turn a wrong `--blocks-dir` into a silent "0 blocks"
-    // instead of the actionable "bad magic"/"bad record len" the iterator
-    // produces. Padding is zero on disk, so a non-zero first byte means the
-    // file is meant to contain records and we hand it over intact to report
-    // the real error.
-    if end == 0 && !raw.is_empty() && raw[0] != 0 {
-        return raw.len();
+    if end == 0 && !decoded.is_empty() && first_raw_nonzero {
+        return decoded.len();
     }
     end
 }
@@ -378,21 +420,22 @@ fn read_xor_key(blk_path: &Path) -> Option<[u8; 8]> {
     blk_path.parent().and_then(read_xor_key_from_dir)
 }
 
-/// XOR-decode `buf` in place against an 8-byte repeating key.
+/// XOR-decode `buf` in place starting at `file_offset` against an 8-byte
+/// repeating key.
 ///
-/// Processes fixed `[u8; 8]` chunks without per-chunk bounds checks or buffer
-/// growth so LLVM auto-vectorizes the hot loop into wide SIMD XORs in L1/L2
-/// cache with zero extra heap allocation.
-fn xor_decode_in_place(buf: &mut [u8], key: &[u8; 8]) {
-    let k64 = u64::from_le_bytes(*key);
+/// Rotates the 64-bit key word by `(file_offset & 7) * 8` bits so arbitrary
+/// `read()` chunk alignments still vectorize into wide SIMD `u64` XORs in L1/L2
+/// cache without per-byte modulo indexing.
+#[inline]
+fn xor_decode_at_offset(buf: &mut [u8], key: &[u8; 8], file_offset: usize) {
+    let shift = file_offset & 7;
+    let k64 = u64::from_le_bytes(*key).rotate_right((shift * 8) as u32);
     let (chunks, rem) = buf.as_chunks_mut::<8>();
     for c in chunks {
         *c = (u64::from_le_bytes(*c) ^ k64).to_le_bytes();
     }
-    // `chunks` consumed an exact multiple of 8 bytes, so `rem` starts at
-    // keystream index 0.
     for (i, b) in rem.iter_mut().enumerate() {
-        *b ^= key[i];
+        *b ^= key[(shift + i) & 7];
     }
 }
 
@@ -504,6 +547,22 @@ fn parse_blk_name(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xor_decode_in_place(buf: &mut [u8], key: &[u8; 8]) {
+        xor_decode_at_offset(buf, key, 0);
+    }
+
+    fn record_walk_end(raw: &[u8], key: Option<&[u8; 8]>) -> usize {
+        let first_raw_nonzero = raw.first().is_some_and(|&b| b != 0);
+        match key {
+            Some(k) => {
+                let mut decoded = raw.to_vec();
+                xor_decode_at_offset(&mut decoded, k, 0);
+                record_walk_end_decoded(&decoded, first_raw_nonzero)
+            }
+            None => record_walk_end_decoded(raw, first_raw_nonzero),
+        }
+    }
 
     #[test]
     fn parses_blk_names() {
@@ -1223,6 +1282,51 @@ mod tests {
         match scan_blk_headers(&missing, 99998, None, |_| {}) {
             Err(BlkError::Io { path: p, .. }) => assert_eq!(p, missing),
             other => panic!("expected Io error, got {other:?}"),
+        }
+
+        // open_with_key_hint exercises both plain Mmap and multi-chunk (>64 KiB)
+        // XOR-decoded streaming with and without `known_data_end`, plus unaligned
+        // `xor_decode_at_offset` offsets.
+        let big_plain = synth_records(3, 30_000, false); // > 90 KiB across 2x 64 KiB chunks
+        let valid_end = big_plain.len() as u64;
+        let mut big_padded = big_plain.clone();
+        big_padded.resize(big_plain.len() + 4096, 0);
+        let plain_hint_path = tmp.join("blk00006.dat");
+        fs::write(&plain_hint_path, &big_padded).unwrap();
+        let bf_plain_hint =
+            BlkFile::open_with_key_hint(&plain_hint_path, 6, None, Some(valid_end)).unwrap();
+        assert_eq!(bf_plain_hint.data(), big_plain.as_slice());
+        // Out-of-bounds hint falls back to record_walk_end_decoded cleanly.
+        let bf_plain_over =
+            BlkFile::open_with_key_hint(&plain_hint_path, 6, None, Some(u64::MAX)).unwrap();
+        assert_eq!(bf_plain_over.data(), big_plain.as_slice());
+
+        let big_obf: Vec<u8> = big_padded
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ key[i & 7])
+            .collect();
+        let xor_hint_path = tmp.join("blk00007.dat");
+        fs::write(&xor_hint_path, &big_obf).unwrap();
+        let end_from_scan = scan_blk_headers(&xor_hint_path, 7, Some(key), |_| {}).unwrap();
+        assert_eq!(end_from_scan, valid_end);
+        let bf_xor_hint =
+            BlkFile::open_with_key_hint(&xor_hint_path, 7, Some(key), Some(valid_end)).unwrap();
+        assert_eq!(bf_xor_hint.data(), big_plain.as_slice());
+        let bf_xor_unhinted =
+            BlkFile::open_with_key_hint(&xor_hint_path, 7, Some(key), None).unwrap();
+        assert_eq!(bf_xor_unhinted.data(), big_plain.as_slice());
+
+        // Verify xor_decode_at_offset for every misalignment 0..8 and non-8 tail.
+        for shift in 0..8usize {
+            let orig: Vec<u8> = (0..23u8).map(|x| x.wrapping_mul(7)).collect();
+            let mut encoded: Vec<u8> = orig
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[(shift + i) & 7])
+                .collect();
+            xor_decode_at_offset(&mut encoded, &key, shift);
+            assert_eq!(encoded, orig, "shift={shift}");
         }
 
         let _ = fs::remove_dir_all(&tmp);

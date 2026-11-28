@@ -1198,53 +1198,40 @@ fn bench_consume(
             }
 
             let mut block = block;
-            let res = if do_utxo {
-                let t0 = std::time::Instant::now();
-                let r = utxo
-                    .map(|u| u.apply_block(next, &block.txs, &block.inputs, &block.outputs))
-                    .transpose()?;
-                let dt = t0.elapsed().as_nanos() as u64;
-                utxo_wall.fetch_add(dt, Ordering::Relaxed);
-                utxo_samples.push(dt);
-                r
-            } else {
-                None
-            };
-
-            if let Some(ref res) = res {
-                missing_utxos.fetch_add(res.missing, Ordering::Relaxed);
-                db_lookups.fetch_add(res.db_lookups, Ordering::Relaxed);
-                db_nanos.fetch_add(res.db_nanos, Ordering::Relaxed);
-                pending_hits.fetch_add(res.pending_hits, Ordering::Relaxed);
-                cache_hits.fetch_add(res.cache_hits, Ordering::Relaxed);
-                if do_fees {
-                    // By consensus only `tx_index == 0` can be a coinbase tx,
-                    // so checking `inputs.first()` is O(1) with zero per-block
-                    // `Vec<bool>` allocation or input scan.
-                    let first_is_coinbase = block
-                        .inputs
-                        .first()
-                        .is_some_and(|inp| inp.is_coinbase && inp.tx_index == 0);
-                    let mut total_fee = 0u64;
-                    for (i, tx) in block.txs.iter_mut().enumerate() {
-                        tx.fee = res.fees[i];
-                        if !(i == 0 && first_is_coinbase) {
-                            total_fee = total_fee.saturating_add(res.fees[i]);
+            if do_utxo {
+                if let Some(u) = utxo {
+                    let t0 = std::time::Instant::now();
+                    let stats = u.apply_block_in_place(
+                        next,
+                        &mut block.block_row,
+                        &mut block.txs,
+                        &mut block.inputs,
+                        &block.outputs,
+                    )?;
+                    let dt = t0.elapsed().as_nanos() as u64;
+                    utxo_wall.fetch_add(dt, Ordering::Relaxed);
+                    utxo_samples.push(dt);
+                    missing_utxos.fetch_add(stats.missing, Ordering::Relaxed);
+                    db_lookups.fetch_add(stats.db_lookups, Ordering::Relaxed);
+                    db_nanos.fetch_add(stats.db_nanos, Ordering::Relaxed);
+                    pending_hits.fetch_add(stats.pending_hits, Ordering::Relaxed);
+                    cache_hits.fetch_add(stats.cache_hits, Ordering::Relaxed);
+                    if !do_fees {
+                        for tx in &mut block.txs {
+                            tx.fee = 0;
                         }
+                        block.block_row.total_fee = 0;
                     }
-                    block.block_row.total_fee = total_fee;
                 }
             }
 
             if let Some(sink) = sink.as_mut() {
                 let t0 = std::time::Instant::now();
-                let spends = res.as_ref().map_or(&[][..], |r| r.spends.as_slice());
                 sink.push_block_rows(
                     &block.block_row,
                     &block.txs,
                     &block.inputs,
                     &block.outputs,
-                    spends,
                     &block.witnesses,
                 )?;
                 sink_wall.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1912,7 +1899,6 @@ mod tests {
                 height,
                 tx_index: 0,
                 input_index: 0,
-                txid,
                 prev_txid: [0u8; 32],
                 prev_vout: 0xffff_ffff,
                 script_sig_len: 0,
@@ -1920,12 +1906,15 @@ mod tests {
                 witness_items: 0,
                 witness_bytes: 0,
                 is_coinbase: true,
+                spent_value_sat: 0,
+                spent_script_type: 0,
+                spent_address_hash: [0u8; 32],
+                spent_height: 0,
             }],
             outputs: vec![OutputRow {
                 height,
                 tx_index: 0,
                 output_index: 0,
-                txid,
                 value_sat: 5_000_000_000,
                 script_pubkey_len: 0,
                 script_type: 0,
@@ -2032,6 +2021,25 @@ mod tests {
         assert_eq!(got.sink_wall, 0);
         assert_eq!(got.utxo_wall, 0);
         assert!(got.utxo_samples.is_empty());
+
+        // Exercise `do_utxo = true` with `do_fees = false` so fees are zeroed out.
+        let utxo_dir = consume_out_dir("consume-utxo-nofees");
+        let utxo_store = UtxoStore::open(&utxo_dir).unwrap();
+        let blocks2: Vec<(u32, _)> = [0u32, 1].into_iter().map(|h| (h, synth_block(h))).collect();
+        let got2 = drive_consume(
+            blocks2,
+            2,
+            10,
+            false,
+            true,
+            false,
+            Some(&utxo_store),
+            &out_dir,
+        );
+        assert_eq!(got2.blocks_done, 2);
+        assert_eq!(got2.utxo_samples.len(), 2);
+        drop(utxo_store);
+        let _ = std::fs::remove_dir_all(utxo_dir);
         let _ = std::fs::remove_dir_all(out_dir);
     }
 
@@ -2266,8 +2274,8 @@ mod tests {
         assert_eq!(got.blocks_done, 1);
         assert!(got.sink_wall > 0);
         assert_eq!(got.missing, 0);
-        // All five entity files exist for part 0.
-        for entity in ["blocks", "transactions", "inputs", "outputs", "spends"] {
+        // All four entity files exist for part 0.
+        for entity in ["blocks", "transactions", "inputs", "outputs"] {
             let p = out_dir.join(entity).join("part-00000.parquet");
             assert!(p.exists(), "missing {}", p.display());
         }
@@ -2969,7 +2977,7 @@ mod tests {
         // (cache_hits == 1, no DB lookup); without one it falls through to the
         // database (cache_hits == 0, one lookup). This is the observable
         // difference the (stats, cache) match arms select between.
-        fn run(cache_mb: Option<usize>) -> bidx_store::SpendResult {
+        fn run(cache_mb: Option<usize>) -> bidx_store::WindowStats {
             let dir = std::env::temp_dir().join(format!(
                 "bidx-bench-cache-{}-{}",
                 std::process::id(),
@@ -2980,7 +2988,7 @@ mod tests {
             let store = open_utxo_for_bench(&dir, false, cache_mb, &plan).unwrap();
 
             let txid0 = [0x11u8; 32];
-            let tx0 = TxRow {
+            let mut tx0 = [TxRow {
                 height: 0,
                 tx_index: 0,
                 txid: txid0,
@@ -2992,21 +3000,37 @@ mod tests {
                 input_count: 1,
                 output_count: 1,
                 has_witness: false,
-            };
+            }];
             let out0 = OutputRow {
                 height: 0,
                 tx_index: 0,
                 output_index: 0,
-                txid: txid0,
                 value_sat: 1000,
                 script_pubkey_len: 25,
                 script_type: bidx_core::ScriptType::P2PKH as u8,
                 address_hash: [0u8; 32],
             };
-            store.apply_block(0, &[tx0], &[], &[out0]).unwrap();
+            let mut blk0 = bidx_core::types::BlockRow {
+                height: 0,
+                hash: [0; 32],
+                prev_hash: [0; 32],
+                merkle_root: [0; 32],
+                time: 0,
+                bits: 0,
+                nonce: 0,
+                version: 1,
+                tx_count: 1,
+                size: 0,
+                weight: 0,
+                total_fee: 0,
+                coinbase_value: 1000,
+            };
+            store
+                .apply_block_in_place(0, &mut blk0, &mut tx0, &mut [], &[out0])
+                .unwrap();
 
             let txid1 = [0x22u8; 32];
-            let tx1 = TxRow {
+            let mut tx1 = [TxRow {
                 height: 1,
                 tx_index: 0,
                 txid: txid1,
@@ -3018,12 +3042,11 @@ mod tests {
                 input_count: 1,
                 output_count: 0,
                 has_witness: false,
-            };
-            let inp1 = InputRow {
+            }];
+            let mut inp1 = [InputRow {
                 height: 1,
                 tx_index: 0,
                 input_index: 0,
-                txid: txid1,
                 prev_txid: txid0,
                 prev_vout: 0,
                 script_sig_len: 0,
@@ -3031,8 +3054,30 @@ mod tests {
                 witness_items: 0,
                 witness_bytes: 0,
                 is_coinbase: false,
+                spent_value_sat: 0,
+                spent_script_type: 0,
+                spent_address_hash: [0u8; 32],
+                spent_height: 0,
+            }];
+            let mut blk1 = bidx_core::types::BlockRow {
+                height: 1,
+                hash: [1; 32],
+                prev_hash: [0; 32],
+                merkle_root: [0; 32],
+                time: 0,
+                bits: 0,
+                nonce: 0,
+                version: 1,
+                tx_count: 1,
+                size: 0,
+                weight: 0,
+                total_fee: 0,
+                coinbase_value: 0,
             };
-            let res = store.apply_block(1, &[tx1], &[inp1], &[]).unwrap();
+            let res = store
+                .apply_block_in_place(1, &mut blk1, &mut tx1, &mut inp1, &[])
+                .unwrap();
+            assert_eq!(inp1[0].spent_value_sat, 1000);
             drop(store);
             let _ = std::fs::remove_dir_all(&dir);
             res
@@ -3120,10 +3165,9 @@ mod tests {
     }
 
     #[test]
-    fn bench_consume_sink_mode_writes_spend_rows_when_utxo_present() {
+    fn bench_consume_sink_mode_enriches_spent_inputs_when_utxo_present() {
         // do_sink && do_utxo: block 0's coinbase output becomes a UTXO, and
-        // block 1 spends it, so `res.spends` is non-empty and the sink's
-        // `push_spend` loop runs.
+        // block 1 spends it in-place on `inputs`.
         let dir = std::env::temp_dir().join(format!("bidx-bench-spends-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3152,7 +3196,7 @@ mod tests {
             "block 1 spends block 0's output, so none missing"
         );
         assert!(got.sink_wall > 0);
-        assert!(out_dir.join("spends").join("part-00000.parquet").exists());
+        assert!(out_dir.join("inputs").join("part-00000.parquet").exists());
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(out_dir);

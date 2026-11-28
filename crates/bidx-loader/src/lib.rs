@@ -88,6 +88,19 @@ pub enum LoadMode {
     Upload,
 }
 
+/// Options controlling deferred derived-index materialization at the end of a
+/// bulk or streaming load.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BulkLoadOptions {
+    pub profile: schema::IndexProfile,
+    /// When `true`, skip SQL `outputs UNION ALL spends` for `utxos_by_address`
+    /// because live UTXOs were already exported from `UtxoStore`.
+    pub skip_utxos_by_address: bool,
+    /// When `true`, skip SQL `SELECT DISTINCT ... scripthash_map` because
+    /// `scripthash_map` is populated by [`ChLoader::rebuild_address_and_scripthash_par`].
+    pub skip_scripthash_map: bool,
+}
+
 pub struct ChLoader {
     pub cfg: ChConfig,
     client: PathBuf,
@@ -326,11 +339,14 @@ impl ChLoader {
     }
 
     /// Prepare ClickHouse for a bulk or pipelined-streaming load by dropping
-    /// all materialized views in one batch so base-table inserts do not fan out
-    /// into derived-table writes on every row.
+    /// all materialized views and base-table projections in one batch so
+    /// base-table inserts neither fan out into derived-table writes nor build
+    /// inline secondary projections on every inserted block.
     pub fn begin_streaming_load(&self) -> Result<(), LoadError> {
-        tracing::info!("dropping materialized views for a deferred derived-index build");
-        self.run_multiquery(&schema::drop_materialized_views(&self.cfg.database))
+        tracing::info!("dropping materialized views and base-table projections for deferred build");
+        let mut stmts = schema::drop_materialized_views(&self.cfg.database);
+        stmts.extend(schema::drop_bulk_projections(&self.cfg.database));
+        self.run_multiquery(&stmts)
     }
 
     /// Load a single completed part (`part-{part_id:05}.parquet`) across all
@@ -373,23 +389,79 @@ impl ChLoader {
         })
     }
 
-    /// Finalize a bulk or pipelined-streaming load by building all independent
-    /// derived index tables in parallel from the base tables, then recreating
-    /// the materialized views for subsequent live tracking.
+    /// Finalize a bulk or pipelined-streaming load under default
+    /// [`BulkLoadOptions`] (`IndexProfile::Full`, all SQL backfills enabled).
     pub fn finish_streaming_load(&self) -> Result<(), LoadError> {
-        tracing::info!("building derived index tables in parallel from the base tables");
-        let groups = schema::backfill_derived_index_groups(&self.cfg.database);
-        run_parallel(groups, Self::BACKFILL_CONCURRENCY, |grp| {
+        self.finish_streaming_load_with(BulkLoadOptions::default())
+    }
+
+    /// Finalize a bulk or pipelined-streaming load:
+    /// 1. Restore base-table projections + build Wave 1 derived index tables in
+    ///    parallel;
+    /// 2. Compute Wave 2 (`address_stats` in-order from `address_history`);
+    /// 3. Recreate the materialized views configured for `opts.profile`.
+    pub fn finish_streaming_load_with(&self, opts: BulkLoadOptions) -> Result<(), LoadError> {
+        tracing::info!(
+            ?opts,
+            "restoring projections and building derived index tables in parallel"
+        );
+        let [mut wave1, wave2] = schema::backfill_derived_index_waves(
+            &self.cfg.database,
+            opts.profile,
+            opts.skip_utxos_by_address,
+            opts.skip_scripthash_map,
+        );
+        let mut stage1 = schema::restore_bulk_projection_groups(&self.cfg.database);
+        stage1.append(&mut wave1);
+        run_parallel(stage1, Self::BACKFILL_CONCURRENCY, |grp| {
+            self.run_multiquery(&grp)
+        })?;
+        run_parallel(wave2, Self::BACKFILL_CONCURRENCY, |grp| {
             self.run_multiquery(&grp)
         })?;
         tracing::info!("recreating materialized views for live tracking");
-        self.run_multiquery(&schema::materialized_views(&self.cfg.database))
+        self.run_multiquery(&schema::materialized_views_for_profile(
+            &self.cfg.database,
+            opts.profile,
+        ))
     }
 
-    /// Load every base entity (plus the optional witness table) using `mode`,
-    /// parallelizing base-table loads/uploads and derived-index backfills across
-    /// concurrent ClickHouse connections while materialized views are dropped.
+    /// Load every base entity (plus the optional witness table) using `mode`
+    /// under [`schema::IndexProfile::Serving`].
     pub fn load_all_with(&self, parquet_dir: &Path, mode: LoadMode) -> Result<(), LoadError> {
+        self.load_all_with_profile(parquet_dir, mode, schema::IndexProfile::default())
+    }
+
+    /// Load every base entity (plus the optional witness table) using `mode`
+    /// and `profile`, parallelizing base-table loads/uploads and derived-index
+    /// backfills across concurrent ClickHouse connections while materialized
+    /// views and base-table projections are deferred.
+    pub fn load_all_with_profile(
+        &self,
+        parquet_dir: &Path,
+        mode: LoadMode,
+        profile: schema::IndexProfile,
+    ) -> Result<(), LoadError> {
+        self.load_all_with_profile_and_opts(
+            parquet_dir,
+            mode,
+            BulkLoadOptions {
+                profile,
+                skip_utxos_by_address: false,
+                skip_scripthash_map: false,
+            },
+        )
+    }
+
+    /// Load every base entity (plus the optional witness table) using `mode`
+    /// and explicit [`BulkLoadOptions`] (e.g. skipping SQL `scripthash_map`
+    /// when `rebuild_address_and_scripthash_par` runs immediately afterwards).
+    pub fn load_all_with_profile_and_opts(
+        &self,
+        parquet_dir: &Path,
+        mode: LoadMode,
+        opts: BulkLoadOptions,
+    ) -> Result<(), LoadError> {
         self.begin_streaming_load()?;
 
         let mut entities: Vec<&'static str> = schema::ENTITIES.to_vec();
@@ -410,7 +482,7 @@ impl ChLoader {
             LoadMode::Upload => {
                 // Flatten `(entity, part_path)` across all entities so a pool
                 // of `UPLOAD_CONCURRENCY` streams stays saturated on the large
-                // `inputs`/`outputs`/`spends` tables instead of serializing
+                // `inputs`/`outputs` tables instead of serializing
                 // one entity or one part file at a time.
                 let mut tasks: Vec<(&'static str, PathBuf)> = Vec::new();
                 for entity in entities {
@@ -424,7 +496,140 @@ impl ChLoader {
             }
         }
 
-        self.finish_streaming_load()
+        self.finish_streaming_load_with(opts)
+    }
+
+    /// Default byte buffer threshold (`8 MiB`) before flushing `utxos_by_address`
+    /// `RowBinary` batches during direct `UtxoStore` snapshot export.
+    pub const UTXO_EXPORT_FLUSH_BYTES: usize = 8 << 20;
+
+    /// Export live UTXOs directly from `UtxoStore::for_each_live_utxo` into
+    /// `{db}.utxos_by_address` as `sign = 1` rows (`RowBinary`), bypassing the
+    /// 6.17B-row `outputs UNION ALL spends` CollapsingMergeTree churn.
+    pub fn stream_utxos_by_address<F>(&self, produce: F) -> Result<usize, LoadError>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(&[u8; 32], u32, u64, u8, u32, &[u8; 32]) -> Result<(), LoadError>,
+        ) -> Result<(), LoadError>,
+    {
+        self.stream_utxos_by_address_with_threshold(Self::UTXO_EXPORT_FLUSH_BYTES, produce)
+    }
+
+    fn spawn_rowbinary_sink(
+        &self,
+        db: &str,
+        table: &'static str,
+        cols: &str,
+    ) -> Result<(std::process::Child, std::process::ChildStdin), LoadError> {
+        use std::process::{Command, Stdio};
+        let mut args = self.base_args();
+        args.push(format!(
+            "--query=INSERT INTO {db}.{table} ({cols}) FORMAT RowBinary"
+        ));
+        let mut child = Command::new(&self.client)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // coverage-exempt — `child` is spawned with `Stdio::piped()` for stdin, so `take()` always returns `Some`.
+        let Some(stdin) = child.stdin.take() else {
+            return Err(LoadError::Client(format!(
+                "could not open stdin for {table} insert"
+            )));
+        };
+        Ok((child, stdin))
+    }
+
+    fn flush_utxo_buf(
+        &self,
+        db: &str,
+        buf: &mut Vec<u8>,
+        sink: &mut Option<(std::process::Child, std::process::ChildStdin)>,
+    ) -> Result<(), LoadError> {
+        use std::io::Write;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if sink.is_none() {
+            *sink = Some(self.spawn_rowbinary_sink(
+                db,
+                "utxos_by_address",
+                rowbinary::UTXOS_BY_ADDRESS_COLS,
+            )?);
+        }
+        if let Some((_, ref mut stdin)) = sink {
+            stdin
+                .write_all(buf)
+                .map_err(|e| LoadError::Client(format!("write to utxos_by_address failed: {e}")))?;
+        }
+        buf.clear();
+        Ok(())
+    }
+
+    fn stream_utxos_by_address_with_threshold<F>(
+        &self,
+        flush_threshold: usize,
+        produce: F,
+    ) -> Result<usize, LoadError>
+    where
+        F: FnOnce(
+            &mut dyn FnMut(&[u8; 32], u32, u64, u8, u32, &[u8; 32]) -> Result<(), LoadError>,
+        ) -> Result<(), LoadError>,
+    {
+        let db = self.cfg.database.clone();
+        self.run_query(&format!("TRUNCATE TABLE {db}.utxos_by_address"))?;
+
+        let mut sink: Option<(std::process::Child, std::process::ChildStdin)> = None;
+        let mut buf: Vec<u8> = Vec::with_capacity(flush_threshold.clamp(256, 8 << 20));
+        let mut count = 0usize;
+
+        let res = (|| -> Result<(), LoadError> {
+            produce(
+                &mut |txid, vout, value_sat, script_type, height, address_hash| {
+                    if script_type == 7 {
+                        return Ok(());
+                    }
+                    rowbinary::utxo_by_address(
+                        address_hash,
+                        script_type,
+                        height,
+                        0,
+                        vout,
+                        txid,
+                        value_sat,
+                        1,
+                        &mut buf,
+                    );
+                    count += 1;
+                    if buf.len() >= flush_threshold {
+                        self.flush_utxo_buf(&db, &mut buf, &mut sink)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            self.flush_utxo_buf(&db, &mut buf, &mut sink)
+        })();
+
+        if let Err(err) = res {
+            if let Some((mut child, stdin)) = sink.take() {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(err);
+        }
+
+        if let Some((child, stdin)) = sink.take() {
+            drop(stdin);
+            let out = child.wait_with_output()?;
+            if !out.status.success() {
+                return Err(LoadError::Client(
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                ));
+            }
+        }
+        Ok(count)
     }
 
     /// Refresh one backfilled index. Only the *SQL-only* backfill indexes are
@@ -448,7 +653,12 @@ impl ChLoader {
 
     /// Rows buffered per streaming `RowBinary` flush when rebuilding
     /// `address_prefix`.
-    pub const ADDRESS_PREFIX_BATCH: usize = 500;
+    pub const ADDRESS_PREFIX_BATCH: usize = 4_096;
+
+    /// Rows buffered per streaming `RowBinary` flush in the fused binary
+    /// `address_prefix + scripthash_map` rebuild pass (`65_536 * 33 B = 2.06 MiB`
+    /// input chunk, amortizing Rayon synchronization across 64k addresses).
+    pub const ADDRESS_BINARY_BATCH: usize = 65_536;
 
     /// Rebuild the `address_prefix` index by streaming distinct
     /// `(script_type, address_hash)` rows line-by-line out of `outputs` in
@@ -494,29 +704,148 @@ impl ChLoader {
         })
     }
 
-    fn spawn_address_prefix_sink(
+    fn write_rowbinary_sink(
         &self,
         db: &str,
-    ) -> Result<(std::process::Child, std::process::ChildStdin), LoadError> {
-        use std::process::{Command, Stdio};
-        let mut args = self.base_args();
-        args.push(format!(
-            "--query=INSERT INTO {db}.address_prefix ({}) FORMAT RowBinary",
-            rowbinary::ADDRESS_PREFIX_COLS
+        table: &'static str,
+        cols: &'static str,
+        buf: &[u8],
+        sink: &mut Option<(std::process::Child, std::process::ChildStdin)>,
+    ) -> Result<(), LoadError> {
+        use std::io::Write;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if sink.is_none() {
+            *sink = Some(self.spawn_rowbinary_sink(db, table, cols)?);
+        }
+        if let Some((_, ref mut stdin)) = sink {
+            stdin
+                .write_all(buf)
+                .map_err(|e| LoadError::Client(format!("write to {table} failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Fused binary rebuild of both `address_prefix` and `scripthash_map` in a
+    /// single `SELECT DISTINCT script_type, address_hash FROM outputs FORMAT
+    /// RowBinary` scan (`33 B/row`, zero hex encoding/decoding, one Rayon pass
+    /// computing base58/bech32 + `SHA256(scriptPubKey)` together).
+    pub fn rebuild_address_and_scripthash_par<R, S>(
+        &self,
+        render_addr: R,
+        compute_scripthash: S,
+    ) -> Result<(usize, usize), LoadError>
+    where
+        R: Fn(u8, &[u8; 32]) -> Option<String> + Sync,
+        S: Fn(u8, &[u8; 32]) -> Option<[u8; 32]> + Sync,
+    {
+        self.rebuild_address_and_scripthash_par_with_batch(
+            Self::ADDRESS_BINARY_BATCH,
+            render_addr,
+            compute_scripthash,
+        )
+    }
+
+    fn rebuild_address_and_scripthash_par_with_batch<R, S>(
+        &self,
+        batch_rows: usize,
+        render_addr: R,
+        compute_scripthash: S,
+    ) -> Result<(usize, usize), LoadError>
+    where
+        R: Fn(u8, &[u8; 32]) -> Option<String> + Sync,
+        S: Fn(u8, &[u8; 32]) -> Option<[u8; 32]> + Sync,
+    {
+        use std::io::BufReader;
+        use std::process::{Child, ChildStdin, Command, Stdio};
+
+        let db = self.cfg.database.clone();
+        self.run_multiquery(&[
+            format!("TRUNCATE TABLE {db}.address_prefix"),
+            format!("TRUNCATE TABLE {db}.scripthash_map"),
+        ])?;
+
+        let mut src_args = self.base_args();
+        src_args.push(format!(
+            "--query={}",
+            schema::address_prefix_binary_source(&db)
         ));
-        let mut child = Command::new(&self.client)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+        let mut src_child = Command::new(&self.client)
+            .args(src_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        // coverage-exempt — `child` is spawned with `Stdio::piped()` for stdin, so `take()` always returns `Some`.
-        let Some(stdin) = child.stdin.take() else {
+        // coverage-exempt — `src_child` is spawned with `Stdio::piped()` for stdout, so `take()` always returns `Some`.
+        let Some(stdout) = src_child.stdout.take() else {
             return Err(LoadError::Client(
-                "could not open stdin for address_prefix insert".into(),
+                "could not open stdout for binary address_prefix source".into(),
             ));
         };
-        Ok((child, stdin))
+
+        let batch_rows = batch_rows.max(1);
+        let mut reader = BufReader::with_capacity(256 << 10, stdout);
+        let mut state = FusedRebuildState {
+            db,
+            chunk: Vec::with_capacity(batch_rows),
+            computed: Vec::with_capacity(batch_rows),
+            addr_buf: Vec::with_capacity(batch_rows * 76),
+            sh_buf: Vec::with_capacity(batch_rows * 65),
+            addr_sink: None,
+            sh_sink: None,
+            addr_inserted: 0,
+            sh_inserted: 0,
+        };
+
+        let stream_res = read_fused_binary_stream(
+            self,
+            &mut reader,
+            batch_rows,
+            &mut state,
+            &render_addr,
+            &compute_scripthash,
+        );
+
+        drop(reader);
+        let kill_sink = |sink: &mut Option<(Child, ChildStdin)>| {
+            if let Some((mut child, stdin)) = sink.take() {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        };
+
+        if let Err(err) = stream_res {
+            let _ = src_child.kill();
+            let _ = src_child.wait();
+            kill_sink(&mut state.addr_sink);
+            kill_sink(&mut state.sh_sink);
+            return Err(err);
+        }
+
+        let src_out = src_child.wait_with_output()?;
+        if !src_out.status.success() {
+            kill_sink(&mut state.addr_sink);
+            kill_sink(&mut state.sh_sink);
+            return Err(LoadError::Client(
+                String::from_utf8_lossy(&src_out.stderr).into_owned(),
+            ));
+        }
+
+        for mut sink in [state.addr_sink, state.sh_sink] {
+            if let Some((child, stdin)) = sink.take() {
+                drop(stdin);
+                let out = child.wait_with_output()?;
+                if !out.status.success() {
+                    kill_sink(&mut None);
+                    return Err(LoadError::Client(
+                        String::from_utf8_lossy(&out.stderr).into_owned(),
+                    ));
+                }
+            }
+        }
+        Ok((state.addr_inserted, state.sh_inserted))
     }
 
     fn flush_address_prefix_chunk<C>(
@@ -530,7 +859,6 @@ impl ChLoader {
     where
         C: FnMut(&[(u8, [u8; 32])], &mut Vec<u8>) -> usize,
     {
-        use std::io::Write;
         if chunk.is_empty() {
             return Ok(0);
         }
@@ -540,14 +868,13 @@ impl ChLoader {
         if count == 0 {
             return Ok(0);
         }
-        if sink.is_none() {
-            *sink = Some(self.spawn_address_prefix_sink(db)?);
-        }
-        if let Some((_, ref mut stdin)) = sink {
-            stdin
-                .write_all(rb_buf)
-                .map_err(|e| LoadError::Client(format!("write to address_prefix failed: {e}")))?;
-        }
+        self.write_rowbinary_sink(
+            db,
+            "address_prefix",
+            rowbinary::ADDRESS_PREFIX_COLS,
+            rb_buf,
+            sink,
+        )?;
         Ok(count)
     }
 
@@ -698,6 +1025,106 @@ where
     match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+struct FusedRebuildState {
+    db: String,
+    chunk: Vec<(u8, [u8; 32])>,
+    computed: Vec<(Option<String>, Option<[u8; 32]>)>,
+    addr_buf: Vec<u8>,
+    sh_buf: Vec<u8>,
+    addr_sink: Option<(std::process::Child, std::process::ChildStdin)>,
+    sh_sink: Option<(std::process::Child, std::process::ChildStdin)>,
+    addr_inserted: usize,
+    sh_inserted: usize,
+}
+
+impl FusedRebuildState {
+    fn flush<R, S>(
+        &mut self,
+        loader: &ChLoader,
+        render_addr: &R,
+        compute_scripthash: &S,
+    ) -> Result<(), LoadError>
+    where
+        R: Fn(u8, &[u8; 32]) -> Option<String> + Sync,
+        S: Fn(u8, &[u8; 32]) -> Option<[u8; 32]> + Sync,
+    {
+        use rayon::prelude::*;
+        if self.chunk.is_empty() {
+            return Ok(());
+        }
+        self.chunk
+            .par_iter()
+            .map(|(ty, hash)| (render_addr(*ty, hash), compute_scripthash(*ty, hash)))
+            .collect_into_vec(&mut self.computed);
+        self.addr_buf.clear();
+        self.sh_buf.clear();
+        for ((ty, hash), (maybe_addr, maybe_sh)) in self.chunk.iter().zip(self.computed.drain(..)) {
+            if let Some(addr) = maybe_addr {
+                rowbinary::address_prefix(&addr, *ty, hash, &mut self.addr_buf);
+                self.addr_inserted += 1;
+            }
+            if let Some(sh) = maybe_sh {
+                rowbinary::scripthash_map(&sh, *ty, hash, &mut self.sh_buf);
+                self.sh_inserted += 1;
+            }
+        }
+        self.chunk.clear();
+        loader.write_rowbinary_sink(
+            &self.db,
+            "address_prefix",
+            rowbinary::ADDRESS_PREFIX_COLS,
+            &self.addr_buf,
+            &mut self.addr_sink,
+        )?;
+        loader.write_rowbinary_sink(
+            &self.db,
+            "scripthash_map",
+            rowbinary::SCRIPTHASH_MAP_COLS,
+            &self.sh_buf,
+            &mut self.sh_sink,
+        )?;
+        Ok(())
+    }
+}
+
+fn read_fused_binary_stream<Rd, R, S>(
+    loader: &ChLoader,
+    reader: &mut Rd,
+    batch_rows: usize,
+    state: &mut FusedRebuildState,
+    render_addr: &R,
+    compute_scripthash: &S,
+) -> Result<(), LoadError>
+where
+    Rd: std::io::Read,
+    R: Fn(u8, &[u8; 32]) -> Option<String> + Sync,
+    S: Fn(u8, &[u8; 32]) -> Option<[u8; 32]> + Sync,
+{
+    let mut row = [0u8; 33];
+    let mut filled = 0usize;
+    loop {
+        let n = reader.read(&mut row[filled..])?;
+        if n == 0 {
+            if filled == 0 {
+                return state.flush(loader, render_addr, compute_scripthash);
+            }
+            return Err(LoadError::Client(format!(
+                "truncated binary address_prefix row ({filled}/33 bytes)"
+            )));
+        }
+        filled += n;
+        if filled == 33 {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&row[1..33]);
+            state.chunk.push((row[0], hash));
+            filled = 0;
+            if state.chunk.len() >= batch_rows {
+                state.flush(loader, render_addr, compute_scripthash)?;
+            }
+        }
     }
 }
 
@@ -1138,13 +1565,17 @@ mod tests {
             "{log}"
         );
         // The deferred derived-index build brackets the load: views dropped
-        // first, recreated last.
+        // first, serving views recreated last (default profile is `Serving`).
         assert!(
             log.contains("DROP VIEW IF EXISTS db.outputs_by_address_mv"),
             "{log}"
         );
         assert!(
-            log.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS db.outputs_by_address_mv"),
+            !log.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS db.outputs_by_address_mv"),
+            "{log}"
+        );
+        assert!(
+            log.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS db.spends_by_spent_outpoint_mv"),
             "{log}"
         );
         // ServerFile never streams stdin: every base entity is loaded via a
@@ -1177,7 +1608,9 @@ mod tests {
         let client = logging_client("defer-order", false);
         let loader = loader_with(client.clone());
         let root = parquet_tree("defer-order", false);
-        loader.load_all_with(&root, LoadMode::ServerFile).unwrap();
+        loader
+            .load_all_with_profile(&root, LoadMode::ServerFile, schema::IndexProfile::Full)
+            .unwrap();
         let log = read_log(&client);
 
         let at = |needle: &str| {
@@ -1828,5 +2261,274 @@ mod tests {
             Err(LoadError::Client(_))
         ));
         let _ = std::fs::remove_file(&pipe_fail);
+    }
+
+    #[test]
+    fn stream_utxos_by_address_and_serving_profile_work_with_error_paths() {
+        let _g = fork_guard();
+        use std::os::unix::fs::PermissionsExt;
+
+        let write_script = |tag: &str, script: String| -> PathBuf {
+            let p =
+                std::env::temp_dir().join(format!("bidx-utxo-exp-{tag}-{}", std::process::id()));
+            let tmp = std::env::temp_dir()
+                .join(format!("bidx-utxo-exp-{tag}-{}-tmp", std::process::id()));
+            std::fs::write(&tmp, script).unwrap();
+            let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&tmp, perms).unwrap();
+            std::fs::rename(&tmp, &p).unwrap();
+            p
+        };
+
+        let ok_client = write_script(
+            "ok",
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$a\" in --query=*INSERT*utxos_by_address*) cat >> \"$0.utxo.bin\"; exit 0;; esac; done\n\
+             for a in \"$@\"; do case \"$a\" in --query=*) echo \"$a\" >> \"$0.log\";; esac; done\n\
+             exit 0\n"
+                .to_string(),
+        );
+        let loader = loader_with(ok_client.clone());
+
+        // Empty producer spawns no RowBinary sink.
+        assert_eq!(loader.stream_utxos_by_address(|_emit| Ok(())).unwrap(), 0);
+        // Also cover default `finish_streaming_load()` convenience wrapper.
+        loader.finish_streaming_load().unwrap();
+
+        // Multi-flush with OP_RETURN filtered out (`86` bytes per row, threshold `100` forces in-loop + tail flush).
+        let n = loader
+            .stream_utxos_by_address_with_threshold(100, |emit| {
+                emit(&[0x11; 32], 0, 1_000, 4, 10, &[0xAA; 32])?;
+                emit(&[0x22; 32], 1, 0, 7, 10, &[0x00; 32])?; // OP_RETURN skipped
+                emit(&[0x33; 32], 2, 2_000, 6, 11, &[0xBB; 32])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(n, 2);
+        let raw = std::fs::read(format!("{}.utxo.bin", ok_client.display())).unwrap();
+        assert_eq!(raw.len(), 2 * 86);
+
+        // Producer callback failure after spawning sink cleans up and surfaces error.
+        let prod_err = loader.stream_utxos_by_address_with_threshold(50, |emit| {
+            emit(&[0x11; 32], 0, 1_000, 4, 10, &[0xAA; 32])?;
+            Err(LoadError::Client("producer boom".into()))
+        });
+        assert!(matches!(prod_err, Err(LoadError::Client(m)) if m == "producer boom"));
+
+        // Serving profile load exercises `load_all_with_profile(..., IndexProfile::Serving)`.
+        let root = parquet_tree("serving", false);
+        loader
+            .load_all_with_profile(&root, LoadMode::ServerFile, schema::IndexProfile::Serving)
+            .unwrap();
+        let log = read_log(&ok_client);
+        assert!(log.contains("DROP PROJECTION IF EXISTS blocks_by_hash"));
+        assert!(log.contains("MATERIALIZE PROJECTION blocks_by_hash"));
+        assert!(!log.contains("INSERT INTO db.outputs_by_address "));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(format!("{}.utxo.bin", ok_client.display()));
+        let _ = std::fs::remove_file(format!("{}.log", ok_client.display()));
+        let _ = std::fs::remove_file(&ok_client);
+
+        // Sink failure at EOF.
+        let sink_fail = write_script(
+            "sink-fail",
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$a\" in --query=*INSERT*utxos_by_address*) cat >/dev/null; echo 'utxo sink died' >&2; exit 1;; esac; done\n\
+             exit 0\n"
+                .to_string(),
+        );
+        assert!(matches!(
+            loader_with(sink_fail.clone()).stream_utxos_by_address(|emit| {
+                emit(&[0x11; 32], 0, 1_000, 4, 10, &[0xAA; 32])
+            }),
+            Err(LoadError::Client(m)) if m.contains("utxo sink died")
+        ));
+        let _ = std::fs::remove_file(&sink_fail);
+
+        // Broken pipe on large write.
+        let pipe_fail = write_script(
+            "pipe-fail",
+            "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$a\" in --query=*INSERT*utxos_by_address*) exit 1;; esac; done\n\
+             exit 0\n"
+                .to_string(),
+        );
+        assert!(matches!(
+            loader_with(pipe_fail.clone()).stream_utxos_by_address_with_threshold(1024, |emit| {
+                for i in 0..4000u32 {
+                    emit(&[0x11; 32], i, 1_000, 4, 10, &[0xAA; 32])?;
+                }
+                Ok(())
+            }),
+            Err(LoadError::Client(_))
+        ));
+        let _ = std::fs::remove_file(&pipe_fail);
+    }
+
+    #[test]
+    fn rebuild_address_and_scripthash_par_handles_batches_and_error_paths() {
+        let _g = fork_guard();
+        use std::os::unix::fs::PermissionsExt;
+
+        let write_bin_src = |tag: &str, bin_payload: &[u8], mode: &str| -> PathBuf {
+            let p = std::env::temp_dir().join(format!("bidx-fused-{tag}-{}", std::process::id()));
+            let data =
+                std::env::temp_dir().join(format!("bidx-fused-{tag}-{}.bin", std::process::id()));
+            std::fs::write(&data, bin_payload).unwrap();
+            let script = match mode {
+                "ok" => format!(
+                    "#!/bin/sh\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*SELECT*DISTINCT*FORMAT*RowBinary*) cat '{}'; exit 0;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*address_prefix*) cat >> \"$0.ap.bin\"; exit 0;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*scripthash_map*) cat >> \"$0.sh.bin\"; exit 0;; esac; done\n\
+                     exit 0\n",
+                    data.display()
+                ),
+                "src_fail" => format!(
+                    "#!/bin/sh\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*SELECT*DISTINCT*FORMAT*RowBinary*) cat '{}'; echo 'bin src died' >&2; exit 1;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
+                     exit 0\n",
+                    data.display()
+                ),
+                "sink_fail" => format!(
+                    "#!/bin/sh\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*SELECT*DISTINCT*FORMAT*RowBinary*) cat '{}'; exit 0;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*scripthash_map*) cat >/dev/null; echo 'sh sink died' >&2; exit 1;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
+                     exit 0\n",
+                    data.display()
+                ),
+                "ap_pipe_fail" => format!(
+                    "#!/bin/sh\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*SELECT*DISTINCT*FORMAT*RowBinary*) cat '{}'; exit 0;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*address_prefix*) exit 1;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
+                     exit 0\n",
+                    data.display()
+                ),
+                _ => format!(
+                    "#!/bin/sh\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*SELECT*DISTINCT*FORMAT*RowBinary*) cat '{}'; exit 0;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*scripthash_map*) exit 1;; esac; done\n\
+                     for a in \"$@\"; do case \"$a\" in --query=*INSERT*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
+                     exit 0\n",
+                    data.display()
+                ),
+            };
+            let tmp =
+                std::env::temp_dir().join(format!("bidx-fused-{tag}-{}-tmp", std::process::id()));
+            std::fs::write(&tmp, script).unwrap();
+            let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&tmp, perms).unwrap();
+            std::fs::rename(&tmp, &p).unwrap();
+            p
+        };
+
+        let mut three_rows = Vec::new();
+        // Row 1: P2PKH (both address + scripthash)
+        three_rows.push(2u8);
+        three_rows.extend_from_slice(&[0x11; 32]);
+        // Row 2: P2PK (address only, no scripthash)
+        three_rows.push(1u8);
+        three_rows.extend_from_slice(&[0x22; 32]);
+        // Row 3: unrenderable (neither)
+        three_rows.push(7u8);
+        three_rows.extend_from_slice(&[0x00; 32]);
+
+        let ok = write_bin_src("ok", &three_rows, "ok");
+        let loader = loader_with(ok.clone());
+        // Public wrapper with default batch size.
+        let (ap, sh) = loader
+            .rebuild_address_and_scripthash_par(
+                |ty, h| (ty == 1 || ty == 2).then(|| format!("1addr{}", h[0])),
+                |ty, h| (ty == 2).then_some(*h),
+            )
+            .unwrap();
+        assert_eq!((ap, sh), (2, 1));
+        // Multi-batch with `batch_rows = 2` + all-None run (0 sinks spawned).
+        let (ap2, sh2) = loader
+            .rebuild_address_and_scripthash_par_with_batch(
+                2,
+                |ty, h| (ty == 2).then(|| format!("1addr{}", h[0])),
+                |ty, h| (ty == 2).then_some(*h),
+            )
+            .unwrap();
+        assert_eq!((ap2, sh2), (1, 1));
+        assert_eq!(
+            loader
+                .rebuild_address_and_scripthash_par(|_, _| None, |_, _| None)
+                .unwrap(),
+            (0, 0)
+        );
+        let _ = std::fs::remove_file(format!("{}.ap.bin", ok.display()));
+        let _ = std::fs::remove_file(format!("{}.sh.bin", ok.display()));
+        let _ = std::fs::remove_file(format!("{}.bin", ok.display()));
+        let _ = std::fs::remove_file(&ok);
+
+        // Truncated trailing record after first batch flushed -> stream error.
+        let mut trunc = three_rows.clone();
+        trunc.extend_from_slice(&[2u8, 0xAA, 0xBB]);
+        let trunc_client = write_bin_src("trunc", &trunc, "ok");
+        assert!(matches!(
+            loader_with(trunc_client.clone()).rebuild_address_and_scripthash_par_with_batch(
+                2,
+                |_, _| Some("1x".into()),
+                |_, h| Some(*h),
+            ),
+            Err(LoadError::Client(m)) if m.contains("truncated binary")
+        ));
+        let _ = std::fs::remove_file(format!("{}.ap.bin", trunc_client.display()));
+        let _ = std::fs::remove_file(format!("{}.sh.bin", trunc_client.display()));
+        let _ = std::fs::remove_file(format!("{}.bin", trunc_client.display()));
+        let _ = std::fs::remove_file(&trunc_client);
+
+        // Source non-zero exit after spawning sinks.
+        let src_fail = write_bin_src("src-fail", &three_rows, "src_fail");
+        assert!(matches!(
+            loader_with(src_fail.clone()).rebuild_address_and_scripthash_par_with_batch(
+                1,
+                |_, _| Some("1x".into()),
+                |_, h| Some(*h),
+            ),
+            Err(LoadError::Client(m)) if m.contains("bin src died")
+        ));
+        let _ = std::fs::remove_file(format!("{}.bin", src_fail.display()));
+        let _ = std::fs::remove_file(&src_fail);
+
+        // Sink non-zero exit at EOF.
+        let sink_fail = write_bin_src("sink-fail", &three_rows, "sink_fail");
+        assert!(matches!(
+            loader_with(sink_fail.clone()).rebuild_address_and_scripthash_par(
+                |_, _| Some("1x".into()),
+                |_, h| Some(*h),
+            ),
+            Err(LoadError::Client(m)) if m.contains("sh sink died")
+        ));
+        let _ = std::fs::remove_file(format!("{}.bin", sink_fail.display()));
+        let _ = std::fs::remove_file(&sink_fail);
+
+        // Broken pipe on address_prefix and scripthash_map sinks (>64 KiB).
+        let mut big = Vec::with_capacity(33 * 1500);
+        for _ in 0..1500 {
+            big.push(2u8);
+            big.extend_from_slice(&[0x33; 32]);
+        }
+        let long_addr = "1".repeat(200);
+        for (tag, mode) in [("ap-pipe", "ap_pipe_fail"), ("sh-pipe", "sh_pipe_fail")] {
+            let pf = write_bin_src(tag, &big, mode);
+            assert!(matches!(
+                loader_with(pf.clone()).rebuild_address_and_scripthash_par_with_batch(
+                    256,
+                    |_, _| Some(long_addr.clone()),
+                    |_, h| Some(*h),
+                ),
+                Err(LoadError::Client(_))
+            ));
+            let _ = std::fs::remove_file(format!("{}.bin", pf.display()));
+            let _ = std::fs::remove_file(&pf);
+        }
     }
 }

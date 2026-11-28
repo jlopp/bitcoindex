@@ -95,13 +95,45 @@ impl BlockLocation {
 pub struct ChainIndex {
     /// height -> location, dense over the main chain.
     pub by_height: Vec<BlockLocation>,
-    /// hash -> height, main chain only.
+    /// height -> block hash, dense over the main chain (avoids re-hashing
+    /// 80-byte headers during the full-parse stage).
+    pub block_hashes: Vec<Hash32>,
+    /// hash -> height, main chain only. Bulk parse drops this map via
+    /// [`ChainIndex::drop_hash_index`] before spawning workers to reclaim ~64 MiB.
     pub hash_to_height: rustc_hash::FxHashMap<Hash32, u32>,
+    /// `file_id` -> trimmed end offset of complete records in `blk{file_id:05}.dat`.
+    pub file_data_end: Vec<u64>,
+    /// `file_id` -> highest main-chain height stored in `blk{file_id:05}.dat`
+    /// (`u32::MAX` when a file holds zero main-chain blocks). Once the ordered
+    /// consumer advances past this height, no future block will ever read that
+    /// file again and its 128 MiB buffer can be evicted immediately.
+    pub file_max_height: Vec<u32>,
 }
 
 impl ChainIndex {
     pub fn tip_height(&self) -> Option<u32> {
         self.by_height.len().checked_sub(1).map(|n| n as u32)
+    }
+
+    /// Release the `hash -> height` lookup table (reclaiming ~64 MiB on mainnet)
+    /// when a caller only needs dense `height -> (location, hash)` indexing.
+    pub fn drop_hash_index(&mut self) {
+        self.hash_to_height = rustc_hash::FxHashMap::default();
+    }
+
+    /// Trimmed record-boundary end offset for `file_id`, if recorded and non-zero.
+    #[inline]
+    pub fn data_end_for_file(&self, file_id: u32) -> Option<u64> {
+        self.file_data_end
+            .get(file_id as usize)
+            .copied()
+            .filter(|&end| end > 0)
+    }
+
+    /// True when `height` is the highest main-chain height residing in `file_id`.
+    #[inline]
+    pub fn is_last_height_in_file(&self, height: u32, file_id: u32) -> bool {
+        self.file_max_height.get(file_id as usize).copied() == Some(height)
     }
 }
 
@@ -113,7 +145,7 @@ pub type TxPk = (u32, u32);
 // Hashes are kept as raw 32-byte arrays (wire/little-endian order) so the
 // Arrow/Parquet layer can store them as FixedSizeBinary(32) directly.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BlockRow {
     pub height: u32,
     pub hash: [u8; 32],
@@ -130,10 +162,10 @@ pub struct BlockRow {
     pub coinbase_value: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxRow {
     pub height: u32,
-    pub tx_index: u32,
+    pub tx_index: u16,
     pub txid: [u8; 32],
     pub version: i32,
     pub locktime: u32,
@@ -146,52 +178,44 @@ pub struct TxRow {
     pub has_witness: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRow {
     pub height: u32,
-    pub tx_index: u32,
-    pub input_index: u32,
-    pub txid: [u8; 32],
+    pub tx_index: u16,
+    pub input_index: u16,
     pub prev_txid: [u8; 32],
     pub prev_vout: u32,
     pub script_sig_len: u32,
     pub sequence: u32,
-    pub witness_items: u32,
+    pub witness_items: u16,
     pub witness_bytes: u32,
     /// True for coinbase inputs (prev_txid == 0, prev_vout == 0xFFFFFFFF).
     pub is_coinbase: bool,
+    /// Value of the spent previous output in satoshis (populated during UTXO
+    /// apply; `0` for coinbase or unresolved prevouts).
+    pub spent_value_sat: u64,
+    /// Script classification of the spent previous output (`0` for coinbase or
+    /// unresolved prevouts).
+    pub spent_script_type: u8,
+    /// 20- or 32-byte address hash of the spent previous output, right-padded
+    /// with zeros (`[0u8; 32]` for coinbase or unresolved prevouts).
+    pub spent_address_hash: [u8; 32],
+    /// Block height at which the spent previous output was created (`0` for
+    /// coinbase, genesis prevouts, or unresolved prevouts).
+    pub spent_height: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRow {
     pub height: u32,
-    pub tx_index: u32,
-    pub output_index: u32,
-    pub txid: [u8; 32],
+    pub tx_index: u16,
+    pub output_index: u16,
     pub value_sat: u64,
     pub script_pubkey_len: u32,
     pub script_type: u8,
     /// 20- or 32-byte address-relevant hash, right-padded with zeros.
     /// Meaning depends on script_type (see `script::ScriptType`).
     pub address_hash: [u8; 32],
-}
-
-/// Derived: an input spending a previous output, enriched with the spent
-/// output's value and address. Produced via the UTXO store during parse.
-#[derive(Debug, Clone)]
-pub struct SpendRow {
-    pub height: u32,
-    pub spending_tx_index: u32,
-    pub spending_input_index: u32,
-    pub spending_txid: [u8; 32],
-    pub spent_txid: [u8; 32],
-    pub spent_vout: u32,
-    pub spent_value_sat: u64,
-    pub spent_script_type: u8,
-    pub spent_address_hash: [u8; 32],
-    /// Height at which the spent output was created; 0 if unknown (pre-genesis
-    /// never occurs in practice; used as sentinel for missing UTXO).
-    pub spent_height: u32,
 }
 
 /// Optional witness payload for one input of one transaction. Produced only
@@ -202,11 +226,11 @@ pub struct SpendRow {
 /// One row per witness *item*, so a multi-item script-path spend produces
 /// several rows. `item_bytes` holds the raw stack element, not a hash, so it is
 /// variable-length (`Binary` in Parquet, `String` in ClickHouse).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WitnessRow {
     pub height: u32,
-    pub tx_index: u32,
-    pub input_index: u32,
+    pub tx_index: u16,
+    pub input_index: u16,
     /// Position of this item within the input's witness stack.
     pub item_index: u32,
     /// Length of `item_bytes` (stored alongside so a query can filter on item
@@ -277,5 +301,38 @@ mod tests {
             record_len: 100,
         };
         assert_eq!(l.data_offset(), 50);
+    }
+
+    #[test]
+    fn chain_index_helpers_handle_drop_data_end_and_last_height() {
+        let h0 = Hash32([1u8; 32]);
+        let mut map = rustc_hash::FxHashMap::default();
+        map.insert(h0, 0);
+        let mut idx = ChainIndex {
+            by_height: vec![BlockLocation {
+                file_id: 1,
+                offset: 0,
+                record_len: 88,
+            }],
+            block_hashes: vec![h0],
+            hash_to_height: map,
+            file_data_end: vec![0, 4096],
+            file_max_height: vec![u32::MAX, 0],
+        };
+        assert_eq!(idx.tip_height(), Some(0));
+        assert_eq!(idx.data_end_for_file(0), None);
+        assert_eq!(idx.data_end_for_file(1), Some(4096));
+        assert_eq!(idx.data_end_for_file(99), None);
+        assert!(!idx.is_last_height_in_file(0, 0));
+        assert!(idx.is_last_height_in_file(0, 1));
+        assert!(!idx.is_last_height_in_file(1, 1));
+        assert!(!idx.is_last_height_in_file(0, 99));
+
+        idx.drop_hash_index();
+        assert!(idx.hash_to_height.is_empty());
+
+        idx.by_height.clear();
+        assert_eq!(idx.tip_height(), None);
+        assert_eq!(BlockRow::default().height, 0);
     }
 }

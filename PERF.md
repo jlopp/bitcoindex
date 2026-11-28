@@ -1380,6 +1380,133 @@ Six coordinated changes eliminate this post-400k slowdown (`crates/bidx-store/sr
    Cache misses probe an in-RAM Bloom filter on each 512 MiB active/immutable
    memtable instead of performing skiplist binary searches before checking SSTs.
 
+---
+
+## 21. Schema v3 spend consolidation, `txid` column pruning, 16-block lookahead windowing, & zero-Parquet direct ingestion
+
+End-to-end resource analysis of a full ~880,000-block mainnet bulk load (~1.15B
+transactions, ~2.89B inputs, ~3.28B outputs, ~2.89B non-coinbase spends) exposed
+massive cross-table duplication, unnecessary disk round-trips, and post-load
+ClickHouse compaction bottlenecks. Fourteen coordinated architectural changes
+eliminate them (`SCHEMA_VERSION = 3`):
+
+1. **Consolidate `spends` into `inputs` (`SpendRow` & `spends` base table
+   eliminated; `crates/bidx-core/src/types.rs`, `bidx-store`, `bidx-loader`,
+   `bidx-live`, `bidx-cli`).**
+   Every non-coinbase `InputRow` (`is_coinbase = 0`) had an exact 1:1 row in the
+   standalone `spends` table duplicating `(height, tx_index, input_index,
+   prev_txid, prev_vout)` across 2.89B rows (~202 GB raw). `InputRow` now carries
+   `spent_value_sat: u64`, `spent_script_type: u8`, `spent_address_hash: [u8; 32]`,
+   and `spent_height: u32` directly (zeroed on coinbase inputs), populated
+   in-place by `UtxoStore::apply_block_in_place` / `apply_window_in_place`. The
+   5th base table (`spends`), `SpendRow`, `SpendsTable`, `spend_recycle`
+   channels, and 5th `LiveChWriter` pipe are completely deleted (`ENTITIES` is
+   now 4 base tables: `blocks`, `transactions`, `inputs`, `outputs`).
+2. **Prune redundant `txid` from `inputs` and `outputs` (`crates/bidx-core`,
+   `bidx-parser`, `bidx-store`, `bidx-loader`, `bidx-serve`).**
+   `inputs.txid` (2.89B × 32 B = 92.5 GB incompressible random digest bytes) and
+   `outputs.txid` (3.28B × 32 B = 105.0 GB) were redundant with
+   `transactions(height, tx_index) -> txid` (~37 GB once) and prevented `parse_tx`
+   from streaming inputs/outputs without post-parse slice walks. Dropping `txid`
+   from `inputs` and `outputs` removes **197.5 GB** of incompressible Zstd/MergeTree
+   payload; `bidx-serve` point-queries `inputs`/`outputs` purely on the primary
+   key `(height, tx_index)` after resolving `transactions_by_txid`, and joins
+   `transactions USING (height, tx_index)` when rendering uncached block details.
+3. **Narrow in-memory intra-block coordinates to `u16` (`crates/bidx-core`,
+   `bidx-parser`, `bidx-store`, `bidx-loader`).**
+   By Bitcoin consensus (`MAX_BLOCK_WEIGHT = 4,000,000` WU, minimum tx ≥ 60 B =
+   240 WU), a block can contain at most ~16,666 transactions, inputs, outputs, or
+   witness stack items (`< 65,535`). Narrowing `tx_index`, `input_index`,
+   `output_index`, and `witness_items` to `u16` in `TxRow`/`InputRow`/`OutputRow`/
+   `WitnessItemRow` shrinks `InputRow` to 96 B and `OutputRow` to 56 B across
+   every `FullBlock` in flight while widening cleanly to `UInt32` at the
+   Parquet/RowBinary boundary.
+4. **16-block cross-block UTXO lookahead windowing (`apply_window_in_place`,
+   `DEFAULT_UTXO_WINDOW_BLOCKS = 16`; `crates/bidx-store/src/utxo.rs`,
+   `pipeline.rs`).**
+   ~25–35% of Bitcoin spends consume outputs created 1–15 blocks earlier (child-
+   pays-for-parent, exchange sweeps, Lightning/batch chains). Draining up to 16
+   contiguous heights at once cancels intra-window creation+spend pairs purely in
+   `ApplyScratch::pending` (zero `RecentUtxoCache` mutex churn, zero RocksDB KV
+   writes), merges cache misses across all 16 blocks into one globally-sorted
+   `batched_multi_get_cf`, and commits one `WriteBatch` per window.
+5. **Packed 45-byte `UtxoValue` + `FixedPrefix(8)` SSTs (`utxo.rs`).**
+   Standard P2PKH/P2SH/P2WPKH scripts (`script_type` 1, 2, 3, 6 — ~70% of live
+   UTXOs) only populate 20 bytes of `address_hash` with 12 trailing zeros.
+   Encoding those types in 33 bytes instead of 45 bytes shrinks RocksDB UTXO
+   values by ~27%, and an 8-byte `SliceTransform::create_fixed_prefix(8)` on the
+   uniformly-distributed SHA256d outpoint key accelerates SST prefix blooms.
+6. **Zero-allocation `FullBlock` object pool (`RECYCLE_POOL_DEPTH`,
+   `parse_block_full_into`; `bidx-parser`, `pipeline.rs`).**
+   Rayon parse workers acquire recycled `FullBlock` structs from a bounded
+   channel fed by the sink thread (`clear_keep_capacity` with high-water
+   shrinking for pathological mega-blocks), eliminating ~3.5M multi-megabyte
+   `Vec` heap allocations/frees across a full chain parse.
+7. **Singleflight `BlkFile` open + `ChainIndex` data-end hints + proactive file
+   eviction + zero-copy mmap (`blkfile.rs`, `chain.rs`, `pipeline.rs`).**
+   - Unobfuscated (`xor_key.is_none()`) `blkNNNNN.dat` files keep their OS
+     `Mmap` directly (`Backing::Mapped`) instead of copying 128 MiB into heap
+     RAM (`madvise(MADV_SEQUENTIAL)` during header scan).
+   - `build_chain_index` records exact `file_data_end` offsets per file and drops
+     its ~64 MiB `by_hash` `FxHashMap` once heights are linked (`drop_hash_index`),
+     so `BlkFile::open_with_hint` skips re-walking every block record.
+   - `ThreadFileCache` deduplicates concurrent worker misses on a new file via
+     per-`file_id` `Condvar` singleflight and immediately evicts each completed
+     `blkNNNNN.dat` once the consumer drains its highest height
+     (`is_last_height_in_file`).
+8. **Direct ClickHouse `RowBinary` bulk ingestion (`--direct-clickhouse`;
+   `live_insert.rs`, `pipeline.rs`, `main.rs`).**
+   `LiveChWriter::open_bulk` opens 8 MiB-buffered `INSERT INTO ... FORMAT
+   RowBinary` pipes with tuned bulk MergeTree settings (`min_insert_block_size_*`,
+   `max_insert_threads = 4`, `async_insert = 0`), streaming rows straight from
+   the ordered consumer into ClickHouse with **zero Parquet encoding, zero Zstd
+   compression, and zero intermediate disk writes/reads** (~400+ GB disk round-trip
+   eliminated).
+9. **Default `IndexProfile::Serving` (`--index-profile serving|full`;
+   `schema.rs`, `main.rs`).**
+   Auditing `bidx-serve` showed three massive historical index tables
+   (`inputs_by_prev_output`, `outputs_by_address`, `spends_by_address`, totaling
+   ~9.06B MergeTree rows / ~565 GB on mainnet) are never queried by any Esplora
+   or Electrum endpoint. `IndexProfile::Serving` is now the default, skipping
+   their backfills and MVs unless `--index-profile full` is explicitly requested.
+10. **Direct RocksDB -> `utxos_by_address` live UTXO snapshot export
+    (`for_each_live_utxo` + `stream_utxos_by_address`; `utxo.rs`, `lib.rs`,
+    `pipeline.rs`).**
+    When indexing from genesis, `run_parse` streams the ~170M live UTXOs straight
+    out of RocksDB (`4 MiB` readahead, `fill_cache = false`) into
+    `utxos_by_address` as `sign = 1` `RowBinary` rows, bypassing ClickHouse's
+    6.17B-row `outputs UNION ALL inputs` CollapsingMergeTree external sort (~96%
+    fewer rows).
+11. **Fused binary `rebuild_address_and_scripthash_par` (`schema.rs`, `lib.rs`,
+    `rowbinary.rs`, `pipeline.rs`, `main.rs`).**
+    Replaces the 1B-row TSV `hex(address_hash)` text scan + separate SQL
+    `scripthash_map` scan with a single `SELECT DISTINCT script_type,
+    address_hash FROM outputs WHERE script_type != 7 FORMAT RowBinary` stream
+    (`33 B/row`, 64k-row Rayon batches) that computes both base58/bech32
+    `address_prefix` and `SHA256(scriptPubKey)` `scripthash_map` in one pass.
+12. **Deferred base-table projections & two-wave in-order `address_stats`
+    backfill (`schema.rs`, `lib.rs`).**
+    - `begin_streaming_load` drops `proj_tx_by_fee` and
+      `proj_spends_by_spent_height` during base-table ingestion and materializes
+      them once in `finish_streaming_load_with`.
+    - `spends_by_spent_outpoint` backfills from `inputs` joined with
+      `transactions` on `(height, tx_index)` using
+      `SETTINGS join_algorithm = 'direct,prefer_partial_merge,hash'`.
+    - Wave 2 computes `address_stats` from `address_history` (already sorted by
+      `(address_hash, script_type)`) with `optimize_aggregation_in_order = 1`,
+      reducing aggregation RAM from tens of GiB to \(O(1)\).
+13. **ClickHouse column codecs & tuned row-group batching (`schema.rs`,
+    `parquet_writers.rs`).**
+    Explicit `CODEC(DoubleDelta, ZSTD(1))` / `CODEC(Delta, ZSTD(1))` on monotonic
+    heights, timestamps, and intra-block indices, `CODEC(ZSTD(1))` on random
+    32-byte hashes (avoiding LZ4 CPU waste on incompressible digests), and
+    `DEFAULT_BATCH_ROWS = 1_048_576` for fewer, denser Parquet row groups.
+14. **Native ISA codegen (`.cargo/config.toml`).**
+    `rustflags = ["-C", "target-cpu=native"]` unlocks hardware SHA-NI
+    instructions in `sha2` (accelerating `dsha256`, `hash160`, and Electrum
+    scripthash computation ~4–6×) alongside AVX2/BMI2 vectorization in Arrow,
+    Parquet, Zstd, and RocksDB.
+
 
 
 

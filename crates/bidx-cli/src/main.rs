@@ -3,6 +3,27 @@ use bench::{run_bench, BenchConfig};
 use bidx_core::Network;
 use clap::{Parser, Subcommand};
 
+/// CLI-facing derived-index profile (mirrors `bidx_loader::schema::IndexProfile`).
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum IndexProfileArg {
+    /// Materialize only the indexes consulted by `bidx serve` (default).
+    /// Skips `inputs_by_prev_output`, `outputs_by_address`, and `spends_by_address`,
+    /// saving ~565 GB of ClickHouse MergeTree storage on mainnet.
+    #[default]
+    Serving,
+    /// Materialize all 19 historical derived index tables.
+    Full,
+}
+
+impl From<IndexProfileArg> for bidx_loader::schema::IndexProfile {
+    fn from(a: IndexProfileArg) -> Self {
+        match a {
+            IndexProfileArg::Serving => bidx_loader::schema::IndexProfile::Serving,
+            IndexProfileArg::Full => bidx_loader::schema::IndexProfile::Full,
+        }
+    }
+}
+
 /// CLI-facing network enum (mirrors bidx_core::Network but is clap-typed).
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum NetworkArg {
@@ -109,13 +130,13 @@ enum Cmd {
         blocks_dir: PathBuf,
     },
 
-    /// Full ingest: parse blocks, link spends via UTXO store, write Parquet.
+    /// Full ingest: parse blocks, link spends via UTXO store, write Parquet (or stream directly to ClickHouse).
     Parse {
         #[arg(long)]
         blocks_dir: PathBuf,
-        /// Output directory for Parquet part files.
+        /// Output directory for Parquet part files (optional when `--direct-clickhouse` is set).
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
         /// RocksDB UTXO store path (created if missing).
         #[arg(long)]
         utxo: PathBuf,
@@ -186,6 +207,17 @@ enum Cmd {
         #[arg(long)]
         stream_clickhouse: bool,
 
+        /// Bypass Parquet files completely: stream enriched rows directly into
+        /// ClickHouse over persistent 8 MiB-buffered `RowBinary` pipes, then
+        /// export the live UTXO snapshot and build derived indexes at completion.
+        #[arg(long)]
+        direct_clickhouse: bool,
+
+        /// Derived-index profile to materialize in ClickHouse (`serving` by
+        /// default; `full` includes unreferenced analytical index tables).
+        #[arg(long, value_enum, default_value_t = IndexProfileArg::Serving)]
+        index_profile: IndexProfileArg,
+
         /// When `--stream-clickhouse` is set, stream Parquet part files over
         /// `clickhouse-client` stdin instead of server-side `file(...)`.
         #[arg(long, env = "BIDX_LOAD__UPLOAD")]
@@ -218,6 +250,14 @@ enum Cmd {
         /// output directory.
         #[arg(long, env = "BIDX_LOAD__UPLOAD")]
         upload: bool,
+        /// Derived-index profile to materialize (`serving` by default; `full`
+        /// includes unreferenced analytical index tables).
+        #[arg(long, value_enum, default_value_t = IndexProfileArg::Serving)]
+        index_profile: IndexProfileArg,
+        /// Chain network used to populate `address_prefix` and `scripthash_map`
+        /// in a single fused binary pass after loading.
+        #[arg(long, value_enum, default_value = "mainnet")]
+        network: NetworkArg,
         #[command(flatten)]
         ch: ChArgs,
     },
@@ -431,24 +471,44 @@ fn run(cli: Cli) -> Result<()> {
             block_cache_mb,
             utxo_cache_mb,
             stream_clickhouse,
+            direct_clickhouse,
+            index_profile,
             upload,
             unlink_loaded_parts,
             ch,
         } => {
+            if stream_clickhouse && direct_clickhouse {
+                anyhow::bail!("--stream-clickhouse and --direct-clickhouse are mutually exclusive");
+            }
             if unlink_loaded_parts && !stream_clickhouse {
                 anyhow::bail!("--unlink-loaded-parts requires --stream-clickhouse");
             }
-            let stream_ch = if stream_clickhouse {
+            if !direct_clickhouse && out.is_none() {
+                anyhow::bail!("--out is required unless --direct-clickhouse is set");
+            }
+            let out = out.unwrap_or_default();
+            let stream_ch = if direct_clickhouse {
+                let loader = bidx_loader::ChLoader::new(ch.into())?;
+                Some(pipeline::StreamClickHouseConfig {
+                    loader,
+                    mode: pipeline::StreamChMode::DirectRowBinary,
+                    profile: index_profile.into(),
+                })
+            } else if stream_clickhouse {
                 let loader = bidx_loader::ChLoader::new(ch.into())?;
                 let mode = if upload {
-                    bidx_loader::LoadMode::Upload
+                    pipeline::StreamChMode::ParquetUpload {
+                        unlink_loaded_parts,
+                    }
                 } else {
-                    bidx_loader::LoadMode::ServerFile
+                    pipeline::StreamChMode::ParquetServerFile {
+                        unlink_loaded_parts,
+                    }
                 };
                 Some(pipeline::StreamClickHouseConfig {
                     loader,
                     mode,
-                    unlink_loaded_parts,
+                    profile: index_profile.into(),
                 })
             } else {
                 None
@@ -481,15 +541,34 @@ fn run(cli: Cli) -> Result<()> {
             println!("schema initialized");
         }
 
-        Cmd::Load { input, upload, ch } => {
+        Cmd::Load {
+            input,
+            upload,
+            index_profile,
+            network,
+            ch,
+        } => {
             let loader = bidx_loader::ChLoader::new(ch.into())?;
             let mode = if upload {
                 bidx_loader::LoadMode::Upload
             } else {
                 bidx_loader::LoadMode::ServerFile
             };
-            loader.load_all_with(&input, mode)?;
-            println!("load complete");
+            loader.load_all_with_profile_and_opts(
+                &input,
+                mode,
+                bidx_loader::BulkLoadOptions {
+                    profile: index_profile.into(),
+                    skip_utxos_by_address: false,
+                    skip_scripthash_map: true,
+                },
+            )?;
+            let net: Network = network.into();
+            let (addr_n, sh_n) = loader.rebuild_address_and_scripthash_par(
+                |ty, hash| bidx_serve::address::render_address(net, ty, hash),
+                bidx_serve::address::scripthash_of,
+            )?;
+            println!("load complete ({addr_n} addresses, {sh_n} scripthashes indexed)");
         }
 
         Cmd::Inspect { blocks_dir, height } => {
@@ -511,6 +590,13 @@ fn run(cli: Cli) -> Result<()> {
                         bidx_serve::address::render_address(net, ty, hash)
                     })?;
                     println!("rebuilt index {name} ({n} addresses)");
+                } else if name == "address_and_scripthash" {
+                    let net: Network = network.into();
+                    let (addr_n, sh_n) = loader.rebuild_address_and_scripthash_par(
+                        |ty, hash| bidx_serve::address::render_address(net, ty, hash),
+                        bidx_serve::address::scripthash_of,
+                    )?;
+                    println!("rebuilt address_prefix ({addr_n}) and scripthash_map ({sh_n})");
                 } else {
                     loader.rebuild_index(&name)?;
                     println!("rebuilt index {name}");
@@ -683,7 +769,7 @@ mod tests {
 
     #[test]
     fn cli_parse_rejects_conflicting_or_missing_args() {
-        // Parse requires --out and --utxo.
+        // Parse requires --utxo.
         let c = Cli::try_parse_from(["bidx", "parse", "--blocks-dir", "/tmp/x"]);
         assert!(c.is_err());
         // Inspect requires a height.
@@ -878,10 +964,20 @@ mod tests {
         // arm reaches its success println.
         with_fake_client("ok", || {
             assert!(run(cli(&["bidx", "init-db"])).is_ok());
-            assert!(run(cli(&["bidx", "load", "--input", "/tmp/nope"])).is_ok());
+            assert!(run(cli(&[
+                "bidx",
+                "load",
+                "--input",
+                "/tmp/nope",
+                "--index-profile",
+                "full"
+            ]))
+            .is_ok());
             assert!(run(cli(&["bidx", "index", "rebuild", "coinstats_by_height"])).is_ok());
             // address_prefix routes through the Rust renderer (0 rows here).
             assert!(run(cli(&["bidx", "index", "rebuild", "address_prefix"])).is_ok());
+            // fused binary address_prefix + scripthash_map rebuild (0 rows here).
+            assert!(run(cli(&["bidx", "index", "rebuild", "address_and_scripthash"])).is_ok());
             // migrate: schema_version parses "0" → reports up to date.
             assert!(run(cli(&["bidx", "migrate"])).is_ok());
         });
@@ -894,14 +990,25 @@ mod tests {
         let _g = testlock::fork_guard();
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("bidx-cli-ap-{tag}-{}", std::process::id()));
+        let bin_row =
+            std::env::temp_dir().join(format!("bidx-cli-ap-{tag}-{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(&bin_row);
+        let mut raw_33 = vec![2u8];
+        raw_33.extend_from_slice(&[
+            0x62, 0xe9, 0x07, 0xb1, 0x5c, 0xbf, 0x27, 0xd5, 0x42, 0x53, 0x99, 0xeb, 0xf6, 0xf0,
+            0xfb, 0x50, 0xeb, 0xb8, 0x8f, 0x18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        std::fs::write(&bin_row, &raw_33).unwrap();
         // hash160 62e907b1... is the genesis P2PKH address on mainnet.
         let body = format!(
             "#!/bin/sh\n\
+             for a in \"$@\"; do case \"$a\" in --query=*SELECT*DISTINCT*FORMAT*RowBinary*) cat '{}'; exit 0;; esac; done\n\
              for a in \"$@\"; do case \"$a\" in --query=*DISTINCT*script_type*) printf '2\\t{}' ; exit 0;; esac; done\n\
              for a in \"$@\"; do case \"$a\" in --query=*FORMAT*RowBinary*) cat >/dev/null; exit 0;; esac; done\n\
              for a in \"$@\"; do case \"$a\" in --query=*) echo \"$a\";; esac; done\n\
              exit 0\n",
+            bin_row.display(),
             format!("{}{}", "62e907b15cbf27d5425399ebf6f0fb50ebb88f18", "0".repeat(24))
         );
         std::fs::write(&dir, body).unwrap();
@@ -916,6 +1023,7 @@ mod tests {
             Some(v) => std::env::set_var("BIDX_CLICKHOUSE_CLIENT", v),
             None => std::env::remove_var("BIDX_CLICKHOUSE_CLIENT"),
         }
+        let _ = std::fs::remove_file(&bin_row);
         let _ = std::fs::remove_file(&dir);
     }
 
@@ -923,6 +1031,11 @@ mod tests {
     fn run_index_rebuild_address_prefix_renders_a_mainnet_address() {
         with_address_prefix_client("mainnet", || {
             assert!(run(cli(&["bidx", "index", "rebuild", "address_prefix"])).is_ok());
+            assert!(run(cli(
+                &["bidx", "index", "rebuild", "address_and_scripthash",]
+            ))
+            .is_ok());
+            assert!(run(cli(&["bidx", "load", "--input", "/tmp/nope",])).is_ok());
             // An explicit network arg is accepted too.
             assert!(run(cli(&[
                 "bidx",
@@ -1038,22 +1151,63 @@ mod tests {
                 err.to_string().contains("--stream-clickhouse"),
                 "got: {err}"
             );
+
+            // `--stream-clickhouse` and `--direct-clickhouse` together is rejected.
+            let bad_both = cli(&[
+                "bidx",
+                "parse",
+                "--blocks-dir",
+                "/definitely/not/here",
+                "--out",
+                "/tmp/bidx-out",
+                "--utxo",
+                "/tmp/bidx-utxo",
+                "--stream-clickhouse",
+                "--direct-clickhouse",
+            ]);
+            let err_both = run(bad_both).unwrap_err();
+            assert!(
+                err_both.to_string().contains("mutually exclusive"),
+                "got: {err_both}"
+            );
+
+            // Omitting `--out` without `--direct-clickhouse` is rejected.
+            let bad_no_out = cli(&[
+                "bidx",
+                "parse",
+                "--blocks-dir",
+                "/definitely/not/here",
+                "--utxo",
+                "/tmp/bidx-utxo",
+            ]);
+            let err_no_out = run(bad_no_out).unwrap_err();
+            assert!(
+                err_no_out.to_string().contains("--out is required"),
+                "got: {err_no_out}"
+            );
         }
 
-        // `--stream-clickhouse` resolves the ClickHouse client and maps both
-        // ServerFile and Upload modes into `StreamClickHouseConfig`.
+        // `--stream-clickhouse` and `--direct-clickhouse` resolve the ClickHouse
+        // client and map ServerFile, Upload, and DirectRowBinary modes + profiles.
         with_fake_client("parse-stream", || {
             for extra in [
-                &["--stream-clickhouse"][..],
-                &["--stream-clickhouse", "--upload", "--unlink-loaded-parts"][..],
+                &["--out", "/tmp/bidx-out", "--stream-clickhouse"][..],
+                &[
+                    "--out",
+                    "/tmp/bidx-out",
+                    "--stream-clickhouse",
+                    "--upload",
+                    "--unlink-loaded-parts",
+                    "--index-profile",
+                    "full",
+                ][..],
+                &["--direct-clickhouse", "--index-profile", "serving"][..],
             ] {
                 let mut args = vec![
                     "bidx",
                     "parse",
                     "--blocks-dir",
                     "/definitely/not/here",
-                    "--out",
-                    "/tmp/bidx-out",
                     "--utxo",
                     "/tmp/bidx-utxo",
                 ];

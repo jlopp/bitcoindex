@@ -26,6 +26,7 @@ pub enum TxParseError {
 
 const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
 
+#[derive(Default)]
 pub struct FullBlock {
     pub block_row: BlockRow,
     pub txs: Vec<TxRow>,
@@ -34,6 +35,34 @@ pub struct FullBlock {
     /// Witness payload rows, one per witness stack item. Empty unless the
     /// caller enabled capture (see [`ParseOptions`]).
     pub witnesses: Vec<bidx_core::WitnessRow>,
+}
+
+/// Cap retained row-vector capacity when recycling [`FullBlock`] buffers back
+/// to parse workers so a single outlier 15k-tx block cannot permanently pin
+/// multi-megabyte allocations across every slot in the pool.
+const MAX_RETAINED_ROWS: usize = 32_768;
+
+impl FullBlock {
+    /// Reset all row vectors for reuse while preserving steady-state heap
+    /// capacities across blocks.
+    pub fn clear_keep_capacity(&mut self) {
+        self.txs.clear();
+        if self.txs.capacity() > MAX_RETAINED_ROWS {
+            self.txs.shrink_to(MAX_RETAINED_ROWS);
+        }
+        self.inputs.clear();
+        if self.inputs.capacity() > MAX_RETAINED_ROWS {
+            self.inputs.shrink_to(MAX_RETAINED_ROWS);
+        }
+        self.outputs.clear();
+        if self.outputs.capacity() > MAX_RETAINED_ROWS {
+            self.outputs.shrink_to(MAX_RETAINED_ROWS);
+        }
+        self.witnesses.clear();
+        if self.witnesses.capacity() > MAX_RETAINED_ROWS {
+            self.witnesses.shrink_to(MAX_RETAINED_ROWS);
+        }
+    }
 }
 
 /// Toggles for the full-parse stage.
@@ -71,6 +100,23 @@ pub fn parse_block_full_opts(
     header: &bidx_core::BlockHeader,
     opts: ParseOptions,
 ) -> Result<FullBlock, TxParseError> {
+    let mut block = FullBlock::default();
+    parse_block_full_into(payload, height, block_hash, header, opts, &mut block)?;
+    Ok(block)
+}
+
+/// Parse a block payload directly into `out`, reusing its existing `txs`,
+/// `inputs`, `outputs`, and `witnesses` heap allocations across blocks so the
+/// worker->consumer->sink pipeline operates with zero steady-state allocations.
+pub fn parse_block_full_into(
+    payload: &[u8],
+    height: u32,
+    block_hash: Hash32,
+    header: &bidx_core::BlockHeader,
+    opts: ParseOptions,
+    out: &mut FullBlock,
+) -> Result<(), TxParseError> {
+    out.clear_keep_capacity();
     let mut c = Cursor::new(payload);
     c.skip(80)?;
 
@@ -79,34 +125,32 @@ pub fn parse_block_full_opts(
     // Pre-size block-level row vectors once and append directly inside
     // `parse_tx`, avoiding ~2.2B per-transaction Vec allocations, copies, and
     // frees across a full mainnet parse.
-    let mut txs = Vec::with_capacity(est_txs);
-    let mut inputs = Vec::with_capacity(est_txs.saturating_mul(2));
-    let mut outputs = Vec::with_capacity(est_txs.saturating_mul(2));
-    let mut witnesses = if opts.capture_witness {
-        Vec::with_capacity(est_txs.saturating_mul(2))
-    } else {
-        Vec::new()
-    };
+    out.txs.reserve(est_txs);
+    out.inputs.reserve(est_txs.saturating_mul(2));
+    out.outputs.reserve(est_txs.saturating_mul(2));
+    if opts.capture_witness {
+        out.witnesses.reserve(est_txs.saturating_mul(2));
+    }
     let mut coinbase_value = 0u64;
     let mut tx_weight_sum = 0u64;
 
     for tx_index in 0..tx_count as u32 {
-        let out_start = outputs.len();
+        let out_start = out.outputs.len();
         let tx = parse_tx(
             &mut c,
             payload,
             height,
             tx_index,
             opts,
-            &mut inputs,
-            &mut outputs,
-            &mut witnesses,
+            &mut out.inputs,
+            &mut out.outputs,
+            &mut out.witnesses,
         )?;
         if tx_index == 0 {
-            coinbase_value = outputs[out_start..].iter().map(|o| o.value_sat).sum();
+            coinbase_value = out.outputs[out_start..].iter().map(|o| o.value_sat).sum();
         }
         tx_weight_sum += tx.weight as u64;
-        txs.push(tx);
+        out.txs.push(tx);
     }
 
     // coverage-exempt — unreachable by construction: the loop above
@@ -117,16 +161,16 @@ pub fn parse_block_full_opts(
     // produce a block whose `tx_count` disagrees with its `txs` vector. See
     // `explicit_tx_count_mismatch_error_is_reported`, which asserts the error's
     // construction and `Display`.
-    if txs.len() as u64 != tx_count {
+    if out.txs.len() as u64 != tx_count {
         return Err(TxParseError::TxCountMismatch {
             declared: tx_count,
-            parsed: txs.len() as u64,
+            parsed: out.txs.len() as u64,
         });
     }
 
     let block_weight = (tx_weight_sum + 80 * 4).min(u32::MAX as u64) as u32;
 
-    let block_row = BlockRow {
+    out.block_row = BlockRow {
         height,
         hash: *block_hash.as_bytes(),
         prev_hash: *header.prev_hash.as_bytes(),
@@ -142,13 +186,7 @@ pub fn parse_block_full_opts(
         coinbase_value,
     };
 
-    Ok(FullBlock {
-        block_row,
-        txs,
-        inputs,
-        outputs,
-        witnesses,
-    })
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,6 +231,7 @@ fn parse_tx<'a>(
     let inp_start = inputs.len();
     inputs.reserve((input_count as usize).min(100_000));
     let is_single_input = input_count == 1;
+    let tx_idx16 = tx_index.min(u16::MAX as u32) as u16;
     for input_index in 0..input_count as u32 {
         let prev_txid: [u8; 32] = c.read_array()?;
         let prev_vout = c.read_u32()?;
@@ -206,9 +245,8 @@ fn parse_tx<'a>(
             && prev_vout == 0xFFFF_FFFF;
         inputs.push(InputRow {
             height,
-            tx_index,
-            input_index,
-            txid: [0u8; 32],
+            tx_index: tx_idx16,
+            input_index: input_index.min(u16::MAX as u32) as u16,
             prev_txid,
             prev_vout,
             script_sig_len: script_len as u32,
@@ -216,10 +254,13 @@ fn parse_tx<'a>(
             witness_items: 0,
             witness_bytes: 0,
             is_coinbase,
+            spent_value_sat: 0,
+            spent_script_type: 0,
+            spent_address_hash: [0u8; 32],
+            spent_height: 0,
         });
     }
 
-    let out_start = outputs.len();
     let output_count = c.read_count()?;
     outputs.reserve((output_count as usize).min(100_000));
     for output_index in 0..output_count as u32 {
@@ -232,9 +273,8 @@ fn parse_tx<'a>(
         let (script_type, address_hash) = bidx_core::classify_script(spk);
         outputs.push(OutputRow {
             height,
-            tx_index,
-            output_index,
-            txid: [0u8; 32],
+            tx_index: tx_idx16,
+            output_index: output_index.min(u16::MAX as u32) as u16,
             value_sat,
             script_pubkey_len: spk_len as u32,
             script_type: script_type as u8,
@@ -248,14 +288,14 @@ fn parse_tx<'a>(
     if has_witness {
         for inp in &mut inputs[inp_start..] {
             let item_count = c.read_count()?;
-            inp.witness_items = item_count as u32;
+            inp.witness_items = item_count.min(u16::MAX as u64) as u16;
             for item_index in 0..item_count as u32 {
                 let item_len = c.read_count()?;
                 if opts.capture_witness {
                     let bytes = c.read_bytes(item_len as usize)?;
                     witnesses.push(bidx_core::WitnessRow {
                         height,
-                        tx_index,
+                        tx_index: tx_idx16,
                         input_index: inp.input_index,
                         item_index,
                         item_len: item_len as u32,
@@ -297,12 +337,6 @@ fn parse_tx<'a>(
     };
 
     let txid_bytes = *txid.as_bytes();
-    for inp in &mut inputs[inp_start..] {
-        inp.txid = txid_bytes;
-    }
-    for out in &mut outputs[out_start..] {
-        out.txid = txid_bytes;
-    }
 
     let total_len = (abs_end - abs_start) as u64;
     let stripped_len = if has_witness {
@@ -316,7 +350,7 @@ fn parse_tx<'a>(
 
     Ok(TxRow {
         height,
-        tx_index,
+        tx_index: tx_idx16,
         txid: txid_bytes,
         version,
         locktime,
@@ -403,13 +437,19 @@ mod tests {
         assert_eq!(inp.prev_txid, [0xABu8; 32]);
         assert_eq!(inp.prev_vout, 0);
         assert_eq!(inp.sequence, 0xffff_ffff);
-        assert_eq!(inp.txid, tx.txid);
+        assert_eq!(inp.tx_index, 0);
+        assert_eq!(inp.input_index, 0);
+        assert_eq!(inp.spent_value_sat, 0);
+        assert_eq!(inp.spent_script_type, 0);
+        assert_eq!(inp.spent_address_hash, [0u8; 32]);
+        assert_eq!(inp.spent_height, 0);
         // Prev txid non-zero and vout not 0xffff_ffff so this is NOT coinbase.
         assert!(!inp.is_coinbase);
         // Output row.
         let out = &block.outputs[0];
         assert_eq!(out.value_sat, 42_000);
-        assert_eq!(out.txid, tx.txid);
+        assert_eq!(out.tx_index, 0);
+        assert_eq!(out.output_index, 0);
     }
 
     #[test]
@@ -787,5 +827,52 @@ mod tests {
             assert_eq!(block.outputs.len(), 1, "{label}");
             assert_eq!(block.outputs[0].value_sat, 123, "{label}");
         }
+    }
+
+    #[test]
+    fn parse_block_full_into_reuses_buffers_and_caps_oversized_capacities() {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1i32.to_le_bytes());
+        tx.push(1u8);
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx.push(1u8);
+        tx.extend_from_slice(&500u64.to_le_bytes());
+        tx.push(0u8);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+
+        let payload = block_with(&[tx]);
+        let hash = dsha256(&payload[..80]);
+
+        let mut reused = FullBlock {
+            block_row: BlockRow::default(),
+            txs: Vec::with_capacity(MAX_RETAINED_ROWS + 1_000),
+            inputs: Vec::with_capacity(MAX_RETAINED_ROWS + 1_000),
+            outputs: Vec::with_capacity(MAX_RETAINED_ROWS + 1_000),
+            witnesses: Vec::with_capacity(MAX_RETAINED_ROWS + 1_000),
+        };
+        reused.clear_keep_capacity();
+        assert!(reused.txs.capacity() >= MAX_RETAINED_ROWS);
+        assert!(reused.txs.capacity() < MAX_RETAINED_ROWS + 1_000);
+        assert!(reused.inputs.capacity() < MAX_RETAINED_ROWS + 1_000);
+        assert!(reused.outputs.capacity() < MAX_RETAINED_ROWS + 1_000);
+        assert!(reused.witnesses.capacity() < MAX_RETAINED_ROWS + 1_000);
+
+        parse_block_full_into(
+            &payload,
+            7,
+            hash,
+            &header_for(1),
+            ParseOptions {
+                capture_witness: true,
+            },
+            &mut reused,
+        )
+        .unwrap();
+        assert_eq!(reused.block_row.height, 7);
+        assert_eq!(reused.txs.len(), 1);
+        assert_eq!(reused.outputs[0].value_sat, 500);
     }
 }

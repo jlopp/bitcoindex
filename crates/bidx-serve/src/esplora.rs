@@ -186,44 +186,44 @@ impl<'a> Esplora<'a> {
             Ok(None) => return Response::bad_request("invalid address or scripthash"),
             Err(e) => return Response::from_store_error(e),
         };
-        match self.store.address_stats(&hash) {
-            Ok(Some(s)) => {
-                let balance = s.funded_sum.saturating_sub(s.spent_sum);
-                Response::ok(json!({
-                    "address": segment,
-                    "chain_stats": {
-                        "funded_txo_count": s.funded_count,
-                        "funded_txo_sum": s.funded_sum,
-                        "spent_txo_count": s.spent_count,
-                        "spent_txo_sum": s.spent_sum,
-                        "tx_count": s.history_count,
-                    },
-                    "mempool_stats": {
-                        "funded_txo_count": 0,
-                        "funded_txo_sum": 0,
-                        "spent_txo_count": 0,
-                        "spent_txo_sum": 0,
-                        "tx_count": 0,
-                    },
-                    "balance": balance,
-                }))
-            }
-            Ok(None) => {
-                self.note_address_not_found();
-                Response::ok(json!({
-                    "address": segment,
-                    "chain_stats": {
-                        "funded_txo_count": 0, "funded_txo_sum": 0,
-                        "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": 0,
-                    },
-                    "mempool_stats": {
-                        "funded_txo_count": 0, "funded_txo_sum": 0,
-                        "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": 0,
-                    },
-                    "balance": 0,
-                }))
-            }
-            Err(e) => Response::from_store_error(e),
+        let stats = match self.store.address_stats(&hash) {
+            Ok(v) => v,
+            Err(e) => return Response::from_store_error(e),
+        };
+        if let Some(s) = stats {
+            let balance = s.funded_sum.saturating_sub(s.spent_sum);
+            Response::ok(json!({
+                "address": segment,
+                "chain_stats": {
+                    "funded_txo_count": s.funded_count,
+                    "funded_txo_sum": s.funded_sum,
+                    "spent_txo_count": s.spent_count,
+                    "spent_txo_sum": s.spent_sum,
+                    "tx_count": s.history_count,
+                },
+                "mempool_stats": {
+                    "funded_txo_count": 0,
+                    "funded_txo_sum": 0,
+                    "spent_txo_count": 0,
+                    "spent_txo_sum": 0,
+                    "tx_count": 0,
+                },
+                "balance": balance,
+            }))
+        } else {
+            self.note_address_not_found();
+            Response::ok(json!({
+                "address": segment,
+                "chain_stats": {
+                    "funded_txo_count": 0, "funded_txo_sum": 0,
+                    "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": 0,
+                },
+                "mempool_stats": {
+                    "funded_txo_count": 0, "funded_txo_sum": 0,
+                    "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": 0,
+                },
+                "balance": 0,
+            }))
         }
     }
 
@@ -234,23 +234,22 @@ impl<'a> Esplora<'a> {
             Ok(None) => return Response::bad_request("invalid address or scripthash"),
             Err(e) => return Response::from_store_error(e),
         };
-        match self.store.address_utxos(&hash, limit) {
-            Ok(rows) => {
-                let out: Vec<Value> = rows
-                    .iter()
-                    .map(|u| {
-                        json!({
-                            "txid": store::reverse_hex(&u.txid).unwrap_or(u.txid.clone()),
-                            "vout": u.output_index,
-                            "value": u.value_sat,
-                            "status": { "confirmed": true, "block_height": u.height },
-                        })
-                    })
-                    .collect();
-                Response::ok(json!(out))
-            }
-            Err(e) => Response::from_store_error(e),
-        }
+        let rows = match self.store.address_utxos(&hash, limit) {
+            Ok(r) => r,
+            Err(e) => return Response::from_store_error(e),
+        };
+        let out: Vec<Value> = rows
+            .iter()
+            .map(|u| {
+                json!({
+                    "txid": store::reverse_hex(&u.txid).unwrap_or(u.txid.clone()),
+                    "vout": u.output_index,
+                    "value": u.value_sat,
+                    "status": { "confirmed": true, "block_height": u.height },
+                })
+            })
+            .collect();
+        Response::ok(json!(out))
     }
 
     /// `GET /address/:addr/txs` → transaction summaries for the address.
@@ -260,35 +259,33 @@ impl<'a> Esplora<'a> {
             Ok(None) => return Response::bad_request("invalid address or scripthash"),
             Err(e) => return Response::from_store_error(e),
         };
-        match self.store.address_history(&hash, limit) {
-            Ok(rows) => {
-                // Group history rows by txid into per-tx net value summaries.
-                let mut order: Vec<String> = Vec::new();
-                let mut by_tx: std::collections::BTreeMap<String, (u32, i64)> =
-                    std::collections::BTreeMap::new();
-                for r in rows {
-                    let disp = store::reverse_hex(&r.txid).unwrap_or(r.txid.clone());
-                    let entry = by_tx.entry(disp.clone()).or_insert_with(|| {
-                        order.push(disp.clone());
-                        (r.height, 0)
-                    });
-                    entry.1 += r.value_sat;
-                }
-                let out: Vec<Value> = order
-                    .iter()
-                    .map(|txid| {
-                        let (height, value) = by_tx[txid];
-                        json!({
-                            "txid": txid,
-                            "status": { "confirmed": true, "block_height": height },
-                            "value": value,
-                        })
-                    })
-                    .collect();
-                Response::ok(json!(out))
-            }
-            Err(e) => Response::from_store_error(e),
+        let rows = match self.store.address_history(&hash, limit) {
+            Ok(r) => r,
+            Err(e) => return Response::from_store_error(e),
+        };
+        // Group history rows by txid into per-tx net value summaries.
+        let mut order: Vec<String> = Vec::new();
+        let mut by_tx = std::collections::BTreeMap::<String, (u32, i64)>::new();
+        for r in rows {
+            let disp = store::reverse_hex(&r.txid).unwrap_or(r.txid.clone());
+            let entry = by_tx.entry(disp.clone()).or_insert_with(|| {
+                order.push(disp.clone());
+                (r.height, 0)
+            });
+            entry.1 += r.value_sat;
         }
+        let out: Vec<Value> = order
+            .iter()
+            .map(|txid| {
+                let (height, value) = by_tx[txid];
+                json!({
+                    "txid": txid,
+                    "status": { "confirmed": true, "block_height": height },
+                    "value": value,
+                })
+            })
+            .collect();
+        Response::ok(json!(out))
     }
 
     /// `GET /tx/:txid` → transaction detail with vin/vout and status.
@@ -306,8 +303,14 @@ impl<'a> Esplora<'a> {
             Ok(Some(b)) => store::reverse_hex(&b.hash).unwrap_or_default(),
             _ => String::new(),
         };
-        let inputs = self.store.tx_inputs(&wire).unwrap_or_default();
-        let outputs = self.store.tx_outputs(&wire).unwrap_or_default();
+        let inputs = self
+            .store
+            .tx_inputs_at(tx.height, tx.tx_index)
+            .unwrap_or_default();
+        let outputs = self
+            .store
+            .tx_outputs_at(tx.height, tx.tx_index)
+            .unwrap_or_default();
         let vin: Vec<Value> = inputs
             .iter()
             .map(|i| {
@@ -360,8 +363,7 @@ impl<'a> Esplora<'a> {
             Ok(s) => s,
             Err(e) => return Response::from_store_error(e),
         };
-        let mut by_vout: std::collections::BTreeMap<u32, &store::OutspendRow> =
-            std::collections::BTreeMap::new();
+        let mut by_vout = std::collections::BTreeMap::<u32, &store::OutspendRow>::new();
         for s in &spends {
             by_vout.insert(s.spent_vout, s);
         }
@@ -384,13 +386,12 @@ impl<'a> Esplora<'a> {
         if prefix.is_empty() || prefix.len() > 64 {
             return Response::bad_request("invalid prefix");
         }
-        match self.store.address_prefix(prefix, 100) {
-            Ok(rows) => {
-                let out: Vec<String> = rows.into_iter().map(|r| r.address).collect();
-                Response::ok(json!(out))
-            }
-            Err(e) => Response::from_store_error(e),
-        }
+        let rows = match self.store.address_prefix(prefix, 100) {
+            Ok(r) => r,
+            Err(e) => return Response::from_store_error(e),
+        };
+        let out: Vec<String> = rows.into_iter().map(|r| r.address).collect();
+        Response::ok(json!(out))
     }
 }
 

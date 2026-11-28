@@ -1,6 +1,9 @@
 [build]
 # Keep build artifacts inside the repository rather than /tmp caches.
 target-dir = "target"
+# Enable host CPU ISA extensions (SHA-NI, AVX2, BMI2, POPCNT) for `sha2`,
+# `parquet`/`arrow` columnar builders, and `zstd`/`rocksdb` routines.
+rustflags = ["-C", "target-cpu=native"]
 
 [env]
 # Force temporary files (rustc, linkers, build scripts, and std::env::temp_dir()

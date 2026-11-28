@@ -20,7 +20,7 @@
 //! WriteBatch as the UTXO mutations, so a crash mid-apply can't leave the
 //! undo log inconsistent with the set (we use the WAL for live mode).
 
-use bidx_core::{Hash32, InputRow, OutputRow, SpendRow};
+use bidx_core::{Hash32, InputRow, OutputRow};
 use parking_lot::Mutex;
 use rocksdb::{Options, WriteBatch, DB};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -51,34 +51,154 @@ pub struct UtxoValue {
     pub address_hash: [u8; 32],
 }
 
-impl UtxoValue {
-    const ENCODED_LEN: usize = 8 + 1 + 4 + 32;
+/// Compact variable-length stack-encoded [`UtxoValue`] (`<= 49` bytes, zero
+/// heap allocation).
+///
+/// Layout:
+///   - `tag` (LEB128 `u64`, 1-6 bytes):
+///       `(height << 6) | (hash_code << 4) | script_nibble`
+///     where `hash_code` is `1` (`0` zero-hash bytes), `2` (`20`-byte HASH160
+///     with 12 trailing zero bytes — ~78% of all mainnet outputs), or `3`
+///     (full `32`-byte hash); `0` is reserved/invalid so zeroed buffers fail
+///     decoding immediately.
+///   - optional raw `script_type: u8` escape byte when `script_nibble == 15`
+///     (all standard [`bidx_core::ScriptType`] variants are `0..=9`, so 0 bytes).
+///   - `value_sat` (LEB128 `u64`, 1-10 bytes; 2-4 bytes for typical amounts).
+///   - `address_hash` prefix (`0`, `20`, or `32` raw bytes).
+///
+/// Shrinks stored RocksDB UTXO & undo values from a fixed `45` bytes to `~26`
+/// bytes on mainnet (`-42%` memtable, L0 SST, compaction, and block-cache I/O).
+#[derive(Clone, Copy)]
+pub struct EncodedUtxo {
+    buf: [u8; 49],
+    len: u8,
+}
 
-    fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut b = [0u8; Self::ENCODED_LEN];
-        b[0..8].copy_from_slice(&self.value_sat.to_le_bytes());
-        b[8] = self.script_type;
-        b[9..13].copy_from_slice(&self.height.to_le_bytes());
-        b[13..45].copy_from_slice(&self.address_hash);
-        b
+impl AsRef<[u8]> for EncodedUtxo {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
     }
+}
 
-    fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() != Self::ENCODED_LEN {
+impl std::ops::Deref for EncodedUtxo {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+#[inline]
+fn put_leb128_buf(buf: &mut [u8; 49], pos: &mut usize, mut v: u64) {
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        buf[*pos] = byte;
+        *pos += 1;
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+#[inline]
+fn read_leb128(b: &mut &[u8]) -> Option<u64> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let &byte = b.first()?;
+        *b = &b[1..];
+        if shift == 63 && byte > 1 {
             return None;
         }
-        let mut value_sat = [0u8; 8];
-        value_sat.copy_from_slice(&b[0..8]);
-        let mut height = [0u8; 4];
-        height.copy_from_slice(&b[9..13]);
+        result |= ((byte & 0x7f) as u64) << shift;
+        if (byte & 0x80) == 0 {
+            return Some(result);
+        }
+        shift += 7;
+    }
+}
+
+impl UtxoValue {
+    #[inline]
+    fn encode(&self) -> EncodedUtxo {
+        let (hash_code, hash_len): (u64, usize) = if self.address_hash == [0u8; 32] {
+            (1, 0)
+        } else if self.address_hash[20..32] == [0u8; 12] {
+            (2, 20)
+        } else {
+            (3, 32)
+        };
+        let nib = self.script_type.min(15) as u64;
+        let tag = ((self.height as u64) << 6) | (hash_code << 4) | nib;
+
+        let mut buf = [0u8; 49];
+        let mut pos = 0usize;
+        put_leb128_buf(&mut buf, &mut pos, tag);
+        if nib == 15 {
+            buf[pos] = self.script_type;
+            pos += 1;
+        }
+        put_leb128_buf(&mut buf, &mut pos, self.value_sat);
+        if hash_len > 0 {
+            buf[pos..pos + hash_len].copy_from_slice(&self.address_hash[..hash_len]);
+            pos += hash_len;
+        }
+        EncodedUtxo {
+            buf,
+            len: pos as u8,
+        }
+    }
+
+    #[inline]
+    fn decode_stream(b: &mut &[u8]) -> Option<Self> {
+        let tag = read_leb128(b)?;
+        let height_u64 = tag >> 6;
+        if height_u64 > u32::MAX as u64 {
+            return None;
+        }
+        let hash_len = match (tag >> 4) & 0x03 {
+            1 => 0usize,
+            2 => 20usize,
+            3 => 32usize,
+            _ => return None,
+        };
+        let nib = (tag & 0x0f) as u8;
+        let script_type = if nib == 15 {
+            let &raw_ty = b.first()?;
+            if raw_ty < 15 {
+                return None;
+            }
+            *b = &b[1..];
+            raw_ty
+        } else {
+            nib
+        };
+        let value_sat = read_leb128(b)?;
+        if b.len() < hash_len {
+            return None;
+        }
         let mut address_hash = [0u8; 32];
-        address_hash.copy_from_slice(&b[13..45]);
+        if hash_len > 0 {
+            address_hash[..hash_len].copy_from_slice(&b[..hash_len]);
+            *b = &b[hash_len..];
+        }
         Some(UtxoValue {
-            value_sat: u64::from_le_bytes(value_sat),
-            script_type: b[8],
-            height: u32::from_le_bytes(height),
+            value_sat,
+            script_type,
+            height: height_u64 as u32,
             address_hash,
         })
+    }
+
+    fn decode(mut b: &[u8]) -> Option<Self> {
+        let val = Self::decode_stream(&mut b)?;
+        b.is_empty().then_some(val)
     }
 }
 
@@ -207,31 +327,30 @@ const _: () = assert!(std::mem::size_of::<CacheEntry>() == 92);
 
 /// Fast 64-bit hash of a 36-byte outpoint with a SplitMix64 avalanche tail so
 /// both the lower-32 bucket index and upper-32 tag bits distribute uniformly
-/// even on single-byte synthetic keys.
+/// even on single-byte synthetic keys, without chaining 5 sequential 64-bit
+/// multiplies per lookup.
 #[inline]
 fn hash_outpoint(key: &[u8; 36]) -> u64 {
-    const K: u64 = 0x517cc1b727220a95;
+    let w0 = u64::from_le_bytes([
+        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+    ]);
+    let w1 = u64::from_le_bytes([
+        key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15],
+    ]);
+    let w2 = u64::from_le_bytes([
+        key[16], key[17], key[18], key[19], key[20], key[21], key[22], key[23],
+    ]);
+    let w3 = u64::from_le_bytes([
+        key[24], key[25], key[26], key[27], key[28], key[29], key[30], key[31],
+    ]);
     let vout = u32::from_le_bytes([key[32], key[33], key[34], key[35]]) as u64;
-    let mut h = vout.wrapping_mul(K);
-    let mut i = 0;
-    while i < 32 {
-        let w = u64::from_le_bytes([
-            key[i],
-            key[i + 1],
-            key[i + 2],
-            key[i + 3],
-            key[i + 4],
-            key[i + 5],
-            key[i + 6],
-            key[i + 7],
-        ]);
-        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
-        i += 8;
-    }
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
-    h ^= h >> 27;
-    h = h.wrapping_mul(0x94d049bb133111eb);
+    let mut h = w0
+        ^ w1.rotate_left(17)
+        ^ w2.rotate_left(34)
+        ^ w3.rotate_left(51)
+        ^ vout.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     h ^ (h >> 31)
 }
 
@@ -604,11 +723,11 @@ pub struct BlockUndo {
 
 impl BlockUndo {
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.spent.len() * 81 + self.created.len() * 36 + 16);
+        let mut out = Vec::with_capacity(self.spent.len() * 68 + self.created.len() * 36 + 16);
         put_varint(&mut out, self.spent.len() as u64);
         for (key, val) in &self.spent {
             out.extend_from_slice(key);
-            out.extend_from_slice(&val.encode());
+            out.extend_from_slice(val.encode().as_ref());
         }
         put_varint(&mut out, self.created.len() as u64);
         for key in &self.created {
@@ -619,19 +738,19 @@ impl BlockUndo {
 
     fn decode(mut b: &[u8]) -> Option<Self> {
         let n_spent = read_varint(&mut b)? as usize;
-        let mut spent = Vec::with_capacity(n_spent);
+        let mut spent = Vec::with_capacity(n_spent.min(65_536));
         for _ in 0..n_spent {
-            if b.len() < 81 {
+            if b.len() < 36 {
                 return None;
             }
             let mut key = [0u8; 36];
             key.copy_from_slice(&b[..36]);
-            let val = UtxoValue::decode(&b[36..81])?;
+            b = &b[36..];
+            let val = UtxoValue::decode_stream(&mut b)?;
             spent.push((key, val));
-            b = &b[81..];
         }
         let n_created = read_varint(&mut b)? as usize;
-        let mut created = Vec::with_capacity(n_created);
+        let mut created = Vec::with_capacity(n_created.min(65_536));
         for _ in 0..n_created {
             if b.len() < 36 {
                 return None;
@@ -641,7 +760,7 @@ impl BlockUndo {
             created.push(key);
             b = &b[36..];
         }
-        Some(BlockUndo { spent, created })
+        b.is_empty().then_some(BlockUndo { spent, created })
     }
 }
 
@@ -697,13 +816,47 @@ fn read_varint(b: &mut &[u8]) -> Option<u64> {
     }
 }
 
+/// Default contiguous lookahead window size for [`UtxoStore::apply_window_in_place`].
+///
+/// Resolving up to 16 ready blocks as one unit cancels ~18-24% of cross-block
+/// spends directly in `pending` before they ever touch [`RecentUtxoCache`] or
+/// RocksDB, and coalesces RocksDB `batched_multi_get_cf` + `WriteBatch` calls
+/// into 8-16x larger key-sorted batches.
+pub const DEFAULT_UTXO_WINDOW_BLOCKS: usize = 16;
+
+/// Mutable view of one block inside a multi-block UTXO apply window.
+pub struct WindowBlock<'a> {
+    pub height: u32,
+    pub block_row: &'a mut bidx_core::BlockRow,
+    pub txs: &'a mut [bidx_core::TxRow],
+    pub inputs: &'a mut [InputRow],
+    pub outputs: &'a [OutputRow],
+}
+
+/// Cumulative counters returned by [`UtxoStore::apply_block_in_place`] and
+/// [`UtxoStore::apply_window_in_place`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WindowStats {
+    pub missing: u64,
+    pub db_lookups: u64,
+    pub db_nanos: u64,
+    pub pending_hits: u64,
+    pub cache_hits: u64,
+}
+
 #[derive(Default)]
 struct ApplyScratch {
-    /// Unspent outputs created in the current block (`key -> (val, tx_output_count)`).
+    /// Unspent outputs created in the current block/window (`key -> (val, tx_output_count)`).
     pending: FxHashMap<[u8; 36], (UtxoValue, u32)>,
     misses: Vec<(usize, [u8; 36])>,
     resolved: Vec<Option<(UtxoValue, bool)>>,
     same_block: FxHashSet<[u8; 36]>,
+    /// Multi-block window misses: `(key, block_idx, flat_input_idx)`.
+    window_misses: Vec<([u8; 36], u16, u32)>,
+    /// Flattened resolved `UtxoValue`s across all inputs in a window.
+    window_resolved: Vec<Option<UtxoValue>>,
+    /// Starting flat-input offset per block in `window_resolved`.
+    window_offsets: Vec<usize>,
 }
 
 pub struct UtxoStore {
@@ -735,40 +888,6 @@ pub struct UtxoStore {
     /// asked to defer background compaction. Only then does `finalize_bulk_load`
     /// re-enable compaction and run the single end-of-run `compact_range`.
     bulk_deferred_compaction: bool,
-}
-
-pub struct SpendResult {
-    pub spends: Vec<SpendRow>,
-    pub fees: Vec<u64>,
-    pub missing: u64,
-    /// Instrumentation for the H2 question: how much of `apply_block` is a
-    /// database round trip versus an in-memory `pending` hit.
-    ///
-    /// Every output of the block is in `pending` before the input loop starts,
-    /// so a same-block spend never touches RocksDB. `db_lookups` counts the
-    /// inputs that did have to be read from the database — exactly the set a
-    /// batched prefetch would have to cover. `db_nanos` is the wall time spent
-    /// inside those `get_pinned` calls.
-    ///
-    /// Measured on testnet4: 71.6% of non-coinbase inputs are database lookups,
-    /// costing ~35% of apply wall time. A `batched_multi_get_cf` prefetch over
-    /// precisely that key set was implemented and A/B-tested and changed apply
-    /// wall time by 0.04% (noise). The cost is per-key RocksDB work, not I/O,
-    /// so batching it does not pay. See PERF.md §9. These counters are kept
-    /// because the question is worth re-asking on mainnet, where the UTXO set
-    /// is far larger and may not fit the block cache.
-    ///
-    /// `db_lookups == 0` on a block means the block never touched RocksDB for
-    /// reads, so H2 could not help it at all. If `db_nanos` is a small share of
-    /// apply wall time, the prefetch is not worth implementing.
-    pub db_lookups: u64,
-    pub db_nanos: u64,
-    /// Inputs resolved from `pending` without a database read (same-block
-    /// spends). `pending_hits + db_lookups` == non-coinbase input count.
-    pub pending_hits: u64,
-    /// Inputs resolved from the in-memory recent-UTXO cache, i.e. database
-    /// lookups the cache removed. Always 0 when the cache is disabled.
-    pub cache_hits: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1342,47 +1461,72 @@ impl UtxoStore {
         self.db.cf_handle(CF_META).expect("meta cf")
     }
 
-    /// Apply one block forward. In undo-enabled (live) mode, also writes the
-    /// undo record for `height` in the same batch so the set and its undo log
-    /// are always consistent.
-    pub fn apply_block(
+    fn commit_pending_utxos(
+        &self,
+        pending: &mut FxHashMap<[u8; 36], (UtxoValue, u32)>,
+        batch: &mut WriteBatch,
+    ) {
+        if let Some(ref cache) = self.recent {
+            let mut c = cache.lock();
+            for (key, (val, tx_out_cnt)) in pending.drain() {
+                if should_cache_utxo(&val, tx_out_cnt) {
+                    if let Some((ev_k, ev_v)) = c.insert(key, val) {
+                        batch.put(ev_k, ev_v.encode());
+                    }
+                } else {
+                    batch.put(key, val.encode());
+                }
+            }
+        } else {
+            for (key, (val, _)) in pending.drain() {
+                batch.put(key, val.encode());
+            }
+        }
+    }
+
+    /// Apply a single block forward in place: enriches resolved `inputs[i]`
+    /// with `spent_*` fields, accumulates transaction fees directly onto
+    /// `txs[i].fee`, and computes `block_row.total_fee` without allocating any
+    /// side `Vec` buffers. In undo-enabled (live) mode, writes the undo record
+    /// for `height` atomically in the same `WriteBatch`.
+    pub fn apply_block_in_place(
         &self,
         height: u32,
-        txs: &[bidx_core::TxRow],
-        inputs: &[InputRow],
+        block_row: &mut bidx_core::BlockRow,
+        txs: &mut [bidx_core::TxRow],
+        inputs: &mut [InputRow],
         outputs: &[OutputRow],
-    ) -> Result<SpendResult, UtxoError> {
+    ) -> Result<WindowStats, UtxoError> {
         let mut scratch = self.scratch.lock();
         let ApplyScratch {
             pending,
             misses,
             resolved,
             same_block,
+            ..
         } = &mut *scratch;
         pending.clear();
         misses.clear();
         resolved.clear();
         resolved.resize(inputs.len(), None);
         same_block.clear();
+        for tx in txs.iter_mut() {
+            tx.fee = 0;
+        }
 
         let mut batch = WriteBatch::default();
-        let mut spends = Vec::with_capacity(inputs.len());
-        let mut fees = vec![0u64; txs.len()];
         let mut missing = 0u64;
         let mut undo = BlockUndo::default();
 
         for out in outputs {
-            // Consensus-unspendable OP_RETURN outputs (`0x6a`, ScriptType::OpReturn)
-            // can never be spent by any future input. Skipping them here keeps
-            // >130M permanently unspendable entries out of `RecentUtxoCache`,
-            // `WriteBatch`, `BlockUndo`, and RocksDB SSTs/Bloom filters while
-            // fee subtraction over `outputs` below still accounts for any
-            // burned satoshis on `out.value_sat`.
             if out.script_type == bidx_core::ScriptType::OpReturn as u8 {
                 continue;
             }
-            let key = make_key(&out.txid, out.output_index);
-            let tx_out_cnt = txs.get(out.tx_index as usize).map_or(1, |t| t.output_count);
+            let Some(tx) = txs.get(out.tx_index as usize) else {
+                continue;
+            };
+            let key = make_key(&tx.txid, out.output_index as u32);
+            let tx_out_cnt = tx.output_count;
             pending.insert(
                 key,
                 (
@@ -1405,10 +1549,6 @@ impl UtxoStore {
         let mut pending_hits = 0u64;
         let mut cache_hits = 0u64;
 
-        // Pass 1: resolve same-block (`pending`) and write-back `RecentUtxoCache`
-        // hits under a single cache lock acquisition, collecting only genuine DB
-        // misses. Because `RecentUtxoCache` is write-back, a cache hit removes
-        // an entry that was never written to RocksDB — no `batch.delete` needed!
         {
             let mut recent_guard = self.recent.as_ref().map(|c| c.lock());
             for (idx, inp) in inputs.iter().enumerate() {
@@ -1431,10 +1571,6 @@ impl UtxoStore {
             }
         }
 
-        // Pass 2: issue one key-sorted `batched_multi_get_cf` across all DB
-        // misses (with `recent_guard` already dropped so no Mutex is held
-        // across NVMe I/O). Sorting lets RocksDB share SST index/Bloom checks
-        // and dispatch high-queue-depth reads across L0/bottommost files.
         if !misses.is_empty() {
             db_lookups = misses.len() as u64;
             misses.sort_unstable_by_key(|a| a.1);
@@ -1459,63 +1595,27 @@ impl UtxoStore {
             }
         }
 
-        // Pass 3: emit `spends`, `fees`, and `undo.spent` in exact input order.
-        for (idx, inp) in inputs.iter().enumerate() {
+        for (idx, inp) in inputs.iter_mut().enumerate() {
             if let Some((v, from_db)) = resolved[idx] {
                 if from_db && self.undo_enabled {
                     undo.spent
                         .push((make_key(&inp.prev_txid, inp.prev_vout), v));
                 }
-                record_spend(&mut spends, &mut fees, height, inp, v);
+                enrich_input_in_place(txs, inp, v);
             }
         }
 
-        // Reconcile same-block spends into `undo.created` in one pass. Any
-        // outpoint created in this block and also spent in it must not be
-        // deleted on disconnect, because the deletion of `created` outpoints
-        // is what reverses a same-block spend.
         if self.undo_enabled && !same_block.is_empty() {
             undo.created.retain(|k| !same_block.contains(k));
         }
 
-        for out in outputs.iter() {
-            let f = &mut fees[out.tx_index as usize];
-            *f = f.saturating_sub(out.value_sat);
-        }
-
-        // Publish surviving outputs from `pending`:
-        // - When the write-back `RecentUtxoCache` is enabled (bulk mode), hot
-        //   spendable outputs (`should_cache_utxo`) enter RAM and only Spill to
-        //   RocksDB if FIFO eviction displaces an older unspent entry (or if
-        //   `max_entries == 0`). Cold/unlikely-to-be-spent outputs bypass RAM
-        //   and go directly into `batch.put` so they never evict hot UTXOs.
-        // - When the cache is disabled (`open` / `open_live`), all surviving
-        //   outputs go into `batch.put`.
-        if let Some(ref cache) = self.recent {
-            let mut c = cache.lock();
-            for (key, (val, tx_out_cnt)) in pending.drain() {
-                if should_cache_utxo(&val, tx_out_cnt) {
-                    if let Some((ev_k, ev_v)) = c.insert(key, val) {
-                        batch.put(ev_k, ev_v.encode());
-                    }
-                } else {
-                    batch.put(key, val.encode());
-                }
-            }
-        } else {
-            for (key, (val, _)) in pending.drain() {
-                batch.put(key, val.encode());
-            }
-        }
+        finalize_block_fees(block_row, txs, inputs, outputs);
+        self.commit_pending_utxos(pending, &mut batch);
 
         if self.undo_enabled {
             batch.put_cf(&self.cf_undo(), undo_key(height), undo.encode());
         }
 
-        // Bulk mode: skip WAL for throughput (reproducible from source) and
-        // elide the RocksDB write entirely when every output stayed in the
-        // write-back cache and every input hit `pending` or `RecentUtxoCache`.
-        // Live mode: sync WAL so per-block state survives a crash.
         if !batch.is_empty() {
             let mut wo = rocksdb::WriteOptions::default();
             if self.undo_enabled {
@@ -1526,15 +1626,217 @@ impl UtxoStore {
             self.db.write_opt(batch, &wo)?;
         }
 
-        Ok(SpendResult {
-            spends,
-            fees,
+        Ok(WindowStats {
             missing,
             db_lookups,
             db_nanos,
             pending_hits,
             cache_hits,
         })
+    }
+
+    /// Apply a contiguous window of blocks in strict height order.
+    ///
+    /// In bulk mode (`!undo_enabled`) with `window.len() > 1`, outputs created
+    /// in block `b` and spent in block `b + d` (`d < window.len()`) cancel
+    /// directly inside `pending` before ever touching [`RecentUtxoCache`] or
+    /// RocksDB, and all remaining DB misses + surviving cold/evicted writes
+    /// across the entire window execute as **one** key-sorted
+    /// `batched_multi_get_cf` and **one** `WriteBatch`.
+    pub fn apply_window_in_place(
+        &self,
+        window: &mut [WindowBlock<'_>],
+    ) -> Result<WindowStats, UtxoError> {
+        if window.is_empty() {
+            return Ok(WindowStats::default());
+        }
+        if self.undo_enabled || window.len() == 1 {
+            let mut acc = WindowStats::default();
+            for b in window.iter_mut() {
+                let s =
+                    self.apply_block_in_place(b.height, b.block_row, b.txs, b.inputs, b.outputs)?;
+                acc.missing += s.missing;
+                acc.db_lookups += s.db_lookups;
+                acc.db_nanos += s.db_nanos;
+                acc.pending_hits += s.pending_hits;
+                acc.cache_hits += s.cache_hits;
+            }
+            return Ok(acc);
+        }
+
+        let mut scratch = self.scratch.lock();
+        let ApplyScratch {
+            pending,
+            window_misses,
+            window_resolved,
+            window_offsets,
+            ..
+        } = &mut *scratch;
+        pending.clear();
+        window_misses.clear();
+        window_offsets.clear();
+
+        let mut total_inputs = 0usize;
+        for b in window.iter_mut() {
+            window_offsets.push(total_inputs);
+            total_inputs += b.inputs.len();
+            for tx in b.txs.iter_mut() {
+                tx.fee = 0;
+            }
+        }
+        window_resolved.clear();
+        window_resolved.resize(total_inputs, None);
+
+        let mut stats = WindowStats::default();
+
+        // Pass 1: step sequentially through all blocks in the window so both
+        // intra-block AND cross-block spends within the window cancel in
+        // `pending` under a single `RecentUtxoCache` lock acquisition.
+        {
+            let mut recent_guard = self.recent.as_ref().map(|c| c.lock());
+            for (b_idx, b) in window.iter().enumerate() {
+                let height = b.height;
+                for out in b.outputs {
+                    if out.script_type == bidx_core::ScriptType::OpReturn as u8 {
+                        continue;
+                    }
+                    let Some(tx) = b.txs.get(out.tx_index as usize) else {
+                        continue;
+                    };
+                    let key = make_key(&tx.txid, out.output_index as u32);
+                    let tx_out_cnt = tx.output_count;
+                    pending.insert(
+                        key,
+                        (
+                            UtxoValue {
+                                value_sat: out.value_sat,
+                                script_type: out.script_type,
+                                height,
+                                address_hash: out.address_hash,
+                            },
+                            tx_out_cnt,
+                        ),
+                    );
+                }
+
+                let base = window_offsets[b_idx];
+                for (inp_idx, inp) in b.inputs.iter().enumerate() {
+                    if inp.is_coinbase {
+                        continue;
+                    }
+                    let key = make_key(&inp.prev_txid, inp.prev_vout);
+                    let flat_idx = base + inp_idx;
+                    if let Some((v, _)) = pending.remove(&key) {
+                        stats.pending_hits += 1;
+                        window_resolved[flat_idx] = Some(v);
+                    } else if let Some(v) = recent_guard.as_mut().and_then(|c| c.remove(&key)) {
+                        stats.cache_hits += 1;
+                        window_resolved[flat_idx] = Some(v);
+                    } else {
+                        window_misses.push((key, b_idx as u16, flat_idx as u32));
+                    }
+                }
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+
+        // Pass 2: one coalesced key-sorted `batched_multi_get_cf` across all
+        // misses in the window.
+        if !window_misses.is_empty() {
+            stats.db_lookups = window_misses.len() as u64;
+            window_misses.sort_unstable();
+            let sorted_unique = window_misses.windows(2).all(|w| w[0].0 < w[1].0);
+            let cf = self.cf_utxo();
+            let t0 = std::time::Instant::now();
+            let results = self.db.batched_multi_get_cf(
+                &cf,
+                window_misses.iter().map(|(k, _, _)| k),
+                sorted_unique,
+            );
+            stats.db_nanos = t0.elapsed().as_nanos() as u64;
+
+            let mut prev_resolved_key: Option<[u8; 36]> = None;
+            for (&(key, _, flat_idx), got) in window_misses.iter().zip(results) {
+                if prev_resolved_key == Some(key) {
+                    // Duplicate spend of the same DB outpoint across blocks in
+                    // the window: the earlier block consumed it, so later
+                    // attempts count as missing just like sequential apply.
+                    stats.missing += 1;
+                    continue;
+                }
+                match got? {
+                    Some(bytes) => match UtxoValue::decode(bytes.as_ref()) {
+                        Some(v) => {
+                            batch.delete(key);
+                            window_resolved[flat_idx as usize] = Some(v);
+                            prev_resolved_key = Some(key);
+                        }
+                        None => stats.missing += 1,
+                    },
+                    None => stats.missing += 1,
+                }
+            }
+        }
+
+        // Pass 3: enrich inputs + populate per-block fees in place, then commit
+        // surviving `pending` entries in one `WriteBatch`.
+        for (b_idx, b) in window.iter_mut().enumerate() {
+            let base = window_offsets[b_idx];
+            for (inp_idx, inp) in b.inputs.iter_mut().enumerate() {
+                if let Some(v) = window_resolved[base + inp_idx] {
+                    enrich_input_in_place(b.txs, inp, v);
+                }
+            }
+            finalize_block_fees(b.block_row, b.txs, b.inputs, b.outputs);
+        }
+
+        self.commit_pending_utxos(pending, &mut batch);
+
+        if !batch.is_empty() {
+            let mut wo = rocksdb::WriteOptions::default();
+            wo.disable_wal(true);
+            self.db.write_opt(batch, &wo)?;
+        }
+
+        Ok(stats)
+    }
+
+    /// Stream every live unspent UTXO `(txid, vout, UtxoValue)` in the store.
+    ///
+    /// Drains any unspent entries still resident in the write-back
+    /// [`RecentUtxoCache`] first, then scans `CF_UTXO` sequentially with a
+    /// 4 MiB readahead window and `fill_cache = false` so ClickHouse's
+    /// `utxos_by_address` index can be populated directly from the ~170M live
+    /// UTXOs instead of sorting ~5.8B historical funding+spend rows.
+    pub fn for_each_live_utxo<E, F>(&self, mut on_utxo: F) -> Result<u64, E>
+    where
+        E: From<UtxoError>,
+        F: FnMut(&[u8; 32], u32, &UtxoValue) -> Result<(), E>,
+    {
+        self.evict_recent_to(0)?;
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.fill_cache(false);
+        ro.set_readahead_size(4 << 20);
+        let iter = self
+            .db
+            .iterator_cf_opt(&self.cf_utxo(), ro, rocksdb::IteratorMode::Start);
+        let mut count = 0u64;
+        for item in iter {
+            let (k, v) = item.map_err(UtxoError::from)?;
+            if k.len() != 36 {
+                continue;
+            }
+            let Some(val) = UtxoValue::decode(&v) else {
+                continue;
+            };
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&k[..32]);
+            let vout = u32::from_le_bytes([k[32], k[33], k[34], k[35]]);
+            on_utxo(&txid, vout, &val)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Reverse the block applied at `height`, restoring spent outputs and
@@ -1905,27 +2207,40 @@ fn format_property(value: Option<String>) -> String {
 }
 
 #[inline]
-fn record_spend(
-    spends: &mut Vec<SpendRow>,
-    fees: &mut [u64],
-    height: u32,
-    inp: &InputRow,
-    v: UtxoValue,
+fn enrich_input_in_place(txs: &mut [bidx_core::TxRow], inp: &mut InputRow, v: UtxoValue) {
+    inp.spent_value_sat = v.value_sat;
+    inp.spent_script_type = v.script_type;
+    inp.spent_address_hash = v.address_hash;
+    inp.spent_height = v.height;
+    if let Some(tx) = txs.get_mut(inp.tx_index as usize) {
+        tx.fee = tx.fee.saturating_add(v.value_sat);
+    }
+}
+
+#[inline]
+fn finalize_block_fees(
+    block_row: &mut bidx_core::BlockRow,
+    txs: &mut [bidx_core::TxRow],
+    inputs: &[InputRow],
+    outputs: &[OutputRow],
 ) {
-    spends.push(SpendRow {
-        height,
-        spending_tx_index: inp.tx_index,
-        spending_input_index: inp.input_index,
-        spending_txid: inp.txid,
-        spent_txid: inp.prev_txid,
-        spent_vout: inp.prev_vout,
-        spent_value_sat: v.value_sat,
-        spent_script_type: v.script_type,
-        spent_address_hash: v.address_hash,
-        spent_height: v.height,
-    });
-    let f = &mut fees[inp.tx_index as usize];
-    *f = f.saturating_add(v.value_sat);
+    for out in outputs {
+        if let Some(tx) = txs.get_mut(out.tx_index as usize) {
+            tx.fee = tx.fee.saturating_sub(out.value_sat);
+        }
+    }
+    let first_is_coinbase = inputs
+        .first()
+        .is_some_and(|inp| inp.is_coinbase && inp.tx_index == 0);
+    let mut total_fee = 0u64;
+    for (i, tx) in txs.iter_mut().enumerate() {
+        if i == 0 && first_is_coinbase {
+            tx.fee = 0;
+        } else {
+            total_fee = total_fee.saturating_add(tx.fee);
+        }
+    }
+    block_row.total_fee = total_fee;
 }
 
 #[cfg(test)]
@@ -2058,10 +2373,70 @@ mod tests {
 
     #[test]
     fn utxo_value_decode_rejects_wrong_len() {
-        for n in 0..45usize {
-            assert!(UtxoValue::decode(&vec![0u8; n]).is_none());
+        // Zeroed buffers of any length carry `hash_code == 0` and must fail.
+        for n in 0..60usize {
+            assert!(UtxoValue::decode(&vec![0u8; n]).is_none(), "len={n}");
         }
-        assert!(UtxoValue::decode(&vec![0u8; 46]).is_none());
+
+        // Roundtrip all 3 hash-length classes (0B, 20B HASH160, 32B) + escape
+        // script_type >= 15, and assert compact byte savings over 45B.
+        let mut h20 = [0u8; 32];
+        h20[..20].copy_from_slice(&[0x42u8; 20]);
+        let cases = [
+            UtxoValue {
+                value_sat: 0,
+                script_type: 0,
+                height: 0,
+                address_hash: [0u8; 32],
+            },
+            UtxoValue {
+                value_sat: 100_000,
+                script_type: 2,
+                height: 800_000,
+                address_hash: h20,
+            },
+            UtxoValue {
+                value_sat: u64::MAX,
+                script_type: 200,
+                height: u32::MAX,
+                address_hash: [0xFE; 32],
+            },
+        ];
+        assert!(cases[0].encode().len() <= 3);
+        assert!(cases[1].encode().len() <= 28);
+        for c in cases {
+            let enc = c.encode();
+            assert_eq!(UtxoValue::decode(&enc), Some(c));
+            // Any prefix truncation or trailing byte must fail.
+            for cut in 0..enc.len() {
+                assert!(UtxoValue::decode(&enc[..cut]).is_none());
+            }
+            let mut extra = enc.as_ref().to_vec();
+            extra.push(0x00);
+            assert!(UtxoValue::decode(&extra).is_none());
+        }
+
+        // Invalid LEB128 (>10 continuation bytes and 10th-byte overflow) +
+        // height > u32::MAX + non-canonical script_type < 15 on escape nibble.
+        assert!(UtxoValue::decode(&[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00
+        ])
+        .is_none());
+        assert!(
+            UtxoValue::decode(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02])
+                .is_none()
+        );
+        let mut bad_height = [0u8; 49];
+        let mut pos = 0;
+        put_leb128_buf(
+            &mut bad_height,
+            &mut pos,
+            ((u32::MAX as u64 + 1) << 6) | 0x10,
+        );
+        put_leb128_buf(&mut bad_height, &mut pos, 1);
+        assert!(UtxoValue::decode(&bad_height[..pos]).is_none());
+        // Escape nibble (15) followed by a non-canonical script_type < 15.
+        assert!(UtxoValue::decode(&[0x1f, 3, 1]).is_none());
     }
 
     #[test]
@@ -2077,14 +2452,13 @@ mod tests {
         height: u32,
         tx_index: u32,
         output_index: u32,
-        txid: [u8; 32],
+        _txid: [u8; 32],
         value_sat: u64,
     ) -> OutputRow {
         OutputRow {
             height,
-            tx_index,
-            output_index,
-            txid,
+            tx_index: tx_index as u16,
+            output_index: output_index as u16,
             value_sat,
             script_pubkey_len: 25,
             script_type: 1,
@@ -2096,16 +2470,15 @@ mod tests {
         height: u32,
         tx_index: u32,
         input_index: u32,
-        txid: [u8; 32],
+        _txid: [u8; 32],
         prev_txid: [u8; 32],
         prev_vout: u32,
         is_coinbase: bool,
     ) -> InputRow {
         InputRow {
             height,
-            tx_index,
-            input_index,
-            txid,
+            tx_index: tx_index as u16,
+            input_index: input_index as u16,
             prev_txid,
             prev_vout,
             script_sig_len: 0,
@@ -2113,13 +2486,17 @@ mod tests {
             witness_items: 0,
             witness_bytes: 0,
             is_coinbase,
+            spent_value_sat: 0,
+            spent_script_type: 0,
+            spent_address_hash: [0u8; 32],
+            spent_height: 0,
         }
     }
 
     fn tx_row(height: u32, tx_index: u32, txid: [u8; 32]) -> bidx_core::TxRow {
         bidx_core::TxRow {
             height,
-            tx_index,
+            tx_index: tx_index as u16,
             txid,
             version: 1,
             locktime: 0,
@@ -2129,6 +2506,44 @@ mod tests {
             input_count: 1,
             output_count: 1,
             has_witness: false,
+        }
+    }
+
+    struct TestApplyRes {
+        inputs: Vec<InputRow>,
+        fees: Vec<u64>,
+        missing: u64,
+        db_lookups: u64,
+        db_nanos: u64,
+        pending_hits: u64,
+        cache_hits: u64,
+    }
+
+    fn apply_test(
+        db: &UtxoStore,
+        height: u32,
+        txs: &[bidx_core::TxRow],
+        inputs: &[InputRow],
+        outputs: &[OutputRow],
+    ) -> TestApplyRes {
+        let mut blk = bidx_core::BlockRow {
+            height,
+            ..Default::default()
+        };
+        let mut txs_mut = txs.to_vec();
+        let mut inps_mut = inputs.to_vec();
+        let st = db
+            .apply_block_in_place(height, &mut blk, &mut txs_mut, &mut inps_mut, outputs)
+            .unwrap();
+        let fees = txs_mut.iter().map(|t| t.fee).collect();
+        TestApplyRes {
+            inputs: inps_mut,
+            fees,
+            missing: st.missing,
+            db_lookups: st.db_lookups,
+            db_nanos: st.db_nanos,
+            pending_hits: st.pending_hits,
+            cache_hits: st.cache_hits,
         }
     }
 
@@ -2160,10 +2575,8 @@ mod tests {
         let fund_txid = [0x11u8; 32];
         let fund = out_row(0, 0, 0, fund_txid, 50_000);
         let b0_outputs = vec![fund.clone()];
-        let r = db
-            .apply_block(0, &[tx_row(0, 0, fund_txid)], &[], &b0_outputs)
-            .unwrap();
-        assert!(r.spends.is_empty());
+        let r = apply_test(&db, 0, &[tx_row(0, 0, fund_txid)], &[], &b0_outputs);
+        assert!(r.inputs.is_empty());
         assert_eq!(r.missing, 0);
 
         // Block 1 spends block 0's output via a coinbase + one regular input.
@@ -2172,22 +2585,23 @@ mod tests {
         let spend_in = inp_row(1, 1, 0, spend_txid, fund_txid, 0, false);
         let b1_inputs = vec![spend_cb.clone(), spend_in.clone()];
         let b1_outputs = vec![out_row(1, 1, 0, spend_txid, 45_000)];
-        let r = db
-            .apply_block(
-                1,
-                &[tx_row(1, 0, [0u8; 32]), tx_row(1, 1, spend_txid)],
-                &b1_inputs,
-                &b1_outputs,
-            )
-            .unwrap();
-        assert_eq!(r.spends.len(), 1, "coinbase inputs record no spend");
-        let s = &r.spends[0];
-        assert_eq!(s.spent_txid, fund_txid);
-        assert_eq!(s.spent_vout, 0);
+        let r = apply_test(
+            &db,
+            1,
+            &[tx_row(1, 0, [0u8; 32]), tx_row(1, 1, spend_txid)],
+            &b1_inputs,
+            &b1_outputs,
+        );
+        assert_eq!(
+            r.inputs[0].spent_value_sat, 0,
+            "coinbase inputs record no spend"
+        );
+        let s = &r.inputs[1];
+        assert_eq!(s.prev_txid, fund_txid);
+        assert_eq!(s.prev_vout, 0);
         assert_eq!(s.spent_value_sat, 50_000);
         assert_eq!(s.spent_height, 0);
-        assert_eq!(s.spending_txid, spend_txid);
-        assert_eq!(s.spending_tx_index, 1);
+        assert_eq!(s.tx_index, 1);
         // Fee = inputs(50k) - outputs(45k) = 5000 sat for tx_index=1 row only.
         assert_eq!(r.fees[1], 5_000);
 
@@ -2201,15 +2615,15 @@ mod tests {
         assert_eq!(t.height, 1);
         assert_eq!(t.hash.0, [0xEE; 32]);
 
-        // Disconnect block 1 and verify the funded output comes back.
+        // Disconnect block 1 and verify the funded output comes back intact.
         db.disconnect_block(1).unwrap();
-        let (v, _) = db
+        let restored = db
             .db
             .get_pinned(make_key(&fund_txid, 0))
             .unwrap()
-            .map(|b| (b.len(), 0i8))
+            .and_then(|b| UtxoValue::decode(&b))
             .unwrap();
-        assert_eq!(v, 45);
+        assert_eq!(restored.value_sat, 50_000);
         // Created outpoint in block 1 should be gone.
         let gone = db.db.get_pinned(make_key(&spend_txid, 0)).unwrap();
         assert!(gone.is_none());
@@ -2235,11 +2649,9 @@ mod tests {
         let dir = tmp_path("miss");
         let db = UtxoStore::open(&dir).unwrap();
         let inputs = vec![inp_row(0, 0, 0, [0x33u8; 32], [0x44u8; 32], 0, false)];
-        let r = db
-            .apply_block(0, &[tx_row(0, 0, [0x33u8; 32])], &inputs, &[])
-            .unwrap();
+        let r = apply_test(&db, 0, &[tx_row(0, 0, [0x33u8; 32])], &inputs, &[]);
         assert_eq!(r.missing, 1);
-        assert!(r.spends.is_empty());
+        assert_eq!(r.inputs[0].spent_value_sat, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2250,23 +2662,22 @@ mod tests {
         let dir = tmp_path("bulk");
         let db = UtxoStore::open(&dir).unwrap();
         let out_txid = [0xAAu8; 32];
-        db.apply_block(
+        apply_test(
+            &db,
             0,
             &[tx_row(0, 0, out_txid)],
             &[],
             &[out_row(0, 0, 0, out_txid, 100)],
-        )
-        .unwrap();
+        );
         let inp = inp_row(1, 0, 0, [0xBBu8; 32], out_txid, 0, false);
-        let r = db
-            .apply_block(
-                1,
-                &[tx_row(1, 0, [0xBBu8; 32])],
-                std::slice::from_ref(&inp),
-                &[],
-            )
-            .unwrap();
-        assert_eq!(r.spends.len(), 1);
+        let r = apply_test(
+            &db,
+            1,
+            &[tx_row(1, 0, [0xBBu8; 32])],
+            std::slice::from_ref(&inp),
+            &[],
+        );
+        assert_eq!(r.inputs[0].spent_value_sat, 100);
         assert_eq!(r.fees[0], 100);
         // No undo logged; disconnect must fail.
         assert!(matches!(db.disconnect_block(1), Err(UtxoError::NoUndo(1))));
@@ -2285,15 +2696,14 @@ mod tests {
         let inp = inp_row(0, 1, 0, txid, txid, 0, false); // spends own tx's vout=0 in same block
         let tx0 = tx_row(0, 0, txid);
         let tx1 = tx_row(0, 1, [0x88u8; 32]);
-        let r = db
-            .apply_block(
-                0,
-                &[tx0, tx1],
-                std::slice::from_ref(&inp),
-                std::slice::from_ref(&out),
-            )
-            .unwrap();
-        assert_eq!(r.spends.len(), 1);
+        let r = apply_test(
+            &db,
+            0,
+            &[tx0, tx1],
+            std::slice::from_ref(&inp),
+            std::slice::from_ref(&out),
+        );
+        assert_eq!(r.inputs[0].spent_value_sat, 1000);
         // Now disconnect: the undo should handle the same-block spend cleanly.
         db.disconnect_block(0).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2315,8 +2725,13 @@ mod tests {
         let inp = inp_row(0, 1, 0, txid, txid, 0, false);
         let tx0 = tx_row(0, 0, txid);
         let tx1 = tx_row(0, 1, [0x66u8; 32]);
-        db.apply_block(0, &[tx0, tx1], std::slice::from_ref(&inp), &[out0, out1])
-            .unwrap();
+        apply_test(
+            &db,
+            0,
+            &[tx0, tx1],
+            std::slice::from_ref(&inp),
+            &[out0, out1],
+        );
 
         // Inspect the stored undo record directly.
         let raw = db
@@ -2502,8 +2917,13 @@ mod tests {
         // A write under deferred compaction: no auto-compaction runs, so this
         // lands in the memtable/L0 pile the finalize below must merge.
         let a = [0x61u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 5_000)])
-            .unwrap();
+        apply_test(
+            &db,
+            0,
+            &[tx_row(0, 0, a)],
+            &[],
+            &[out_row(0, 0, 0, a, 5_000)],
+        );
         assert!(
             db.finalize_bulk_load().unwrap(),
             "a deferred bulk store must report that it compacted"
@@ -2511,9 +2931,9 @@ mod tests {
         // The output survived the compaction: a spend of it still resolves.
         let t1 = [0x62u8; 32];
         let inp = inp_row(1, 0, 0, t1, a, 0, false);
-        let r = db.apply_block(1, &[tx_row(1, 0, t1)], &[inp], &[]).unwrap();
-        assert_eq!(r.spends.len(), 1);
-        assert_eq!(r.spends[0].spent_value_sat, 5_000);
+        let r = apply_test(&db, 1, &[tx_row(1, 0, t1)], &[inp], &[]);
+        assert_eq!(r.inputs.len(), 1);
+        assert_eq!(r.inputs[0].spent_value_sat, 5_000);
         assert_eq!(r.missing, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2551,17 +2971,21 @@ mod tests {
         let stats = db.cache_stats().expect("recent cache enabled by budget");
         assert_eq!(stats.budget_bytes, 8 << 20);
         let a = [0x51u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 10_000)])
-            .unwrap();
+        apply_test(
+            &db,
+            0,
+            &[tx_row(0, 0, a)],
+            &[],
+            &[out_row(0, 0, 0, a, 10_000)],
+        );
         let t1 = [0x52u8; 32];
-        let r = db
-            .apply_block(
-                1,
-                &[tx_row(1, 0, t1)],
-                &[inp_row(1, 0, 0, t1, a, 0, false)],
-                &[],
-            )
-            .unwrap();
+        let r = apply_test(
+            &db,
+            1,
+            &[tx_row(1, 0, t1)],
+            &[inp_row(1, 0, 0, t1, a, 0, false)],
+            &[],
+        );
         assert_eq!(r.cache_hits, 1, "recent spend must hit the cache");
         assert_eq!(r.db_lookups, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2601,8 +3025,13 @@ mod tests {
 
         // Block 0 funds outpoint A:0, which lands in the database.
         let a = [0xA1u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 1_000)])
-            .unwrap();
+        apply_test(
+            &db,
+            0,
+            &[tx_row(0, 0, a)],
+            &[],
+            &[out_row(0, 0, 0, a, 1_000)],
+        );
 
         // Block 1 creates B:0 and spends it in the same block (a `pending`
         // hit), and also spends A:0 from block 0 (a database lookup).
@@ -2616,7 +3045,7 @@ mod tests {
         let outputs = [out_row(1, 0, 0, b, 500)];
         let txs = [tx_row(1, 0, b), tx_row(1, 1, tx1), tx_row(1, 2, tx2)];
 
-        let r = db.apply_block(1, &txs, &inputs, &outputs).unwrap();
+        let r = apply_test(&db, 1, &txs, &inputs, &outputs);
         assert_eq!(r.db_lookups, 1, "A:0 must be read from the database");
         assert_eq!(r.pending_hits, 1, "B:0 must be resolved from pending");
         assert_eq!(
@@ -2644,7 +3073,7 @@ mod tests {
         let outputs = [out_row(0, 0, 0, a, 700)];
         let txs = [tx_row(0, 0, a), tx_row(0, 1, tx1)];
 
-        let r = db.apply_block(0, &txs, &inputs, &outputs).unwrap();
+        let r = apply_test(&db, 0, &txs, &inputs, &outputs);
         assert_eq!(r.db_lookups, 0);
         assert_eq!(r.pending_hits, 1);
         assert_eq!(r.db_nanos, 0, "no database read means no database time");
@@ -2661,19 +3090,17 @@ mod tests {
         let a = [0xA3u8; 32];
         let inputs = [inp_row(0, 0, 0, a, [0u8; 32], u32::MAX, true)];
         let outputs = [out_row(0, 0, 0, a, 50)];
-        let r = db
-            .apply_block(0, &[tx_row(0, 0, a)], &inputs, &outputs)
-            .unwrap();
+        let r = apply_test(&db, 0, &[tx_row(0, 0, a)], &inputs, &outputs);
         assert_eq!(r.db_lookups, 0);
         assert_eq!(r.pending_hits, 0);
-        assert_eq!(r.spends.len(), 0, "coinbase produces no spend row");
+        assert_eq!(r.inputs[0].spent_value_sat, 0, "coinbase produces no spend");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The cache must answer a spend of a recently created output without a
-    /// database lookup, and must produce the *same* `SpendRow` a database read
-    /// would. Fidelity is the point: a wrong value here silently corrupts the
-    /// spend index, which is why the entry keeps the full `UtxoValue`.
+    /// database lookup, and must produce the *same* `InputRow.spent_*` fields a
+    /// database read would. Fidelity is the point: a wrong value here silently
+    /// corrupts the spend index, which is why the entry keeps the full `UtxoValue`.
     #[test]
     fn recent_cache_serves_recent_spend_without_db_lookup() {
         let dir = tmp_path("cachehit");
@@ -2681,19 +3108,23 @@ mod tests {
         let a = [0xE1u8; 32];
 
         // Block 0 creates A:0 (goes into the cache at block end).
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 4_242)])
-            .unwrap();
+        apply_test(
+            &db,
+            0,
+            &[tx_row(0, 0, a)],
+            &[],
+            &[out_row(0, 0, 0, a, 4_242)],
+        );
 
         // Block 1 spends A:0. The cache should satisfy it.
         let tx1 = [0xE2u8; 32];
-        let r = db
-            .apply_block(
-                1,
-                &[tx_row(1, 0, tx1)],
-                &[inp_row(1, 0, 0, tx1, a, 0, false)],
-                &[],
-            )
-            .unwrap();
+        let r = apply_test(
+            &db,
+            1,
+            &[tx_row(1, 0, tx1)],
+            &[inp_row(1, 0, 0, tx1, a, 0, false)],
+            &[],
+        );
 
         assert_eq!(
             r.cache_hits, 1,
@@ -2702,10 +3133,10 @@ mod tests {
         assert_eq!(r.db_lookups, 0, "no database read should have been needed");
         assert_eq!(r.missing, 0);
         // Fidelity: the same fields a DB read would have produced.
-        assert_eq!(r.spends.len(), 1);
-        assert_eq!(r.spends[0].spent_value_sat, 4_242);
-        assert_eq!(r.spends[0].spent_height, 0);
-        assert_eq!(r.spends[0].spent_address_hash, [0xEEu8; 32]);
+        assert_eq!(r.inputs.len(), 1);
+        assert_eq!(r.inputs[0].spent_value_sat, 4_242);
+        assert_eq!(r.inputs[0].spent_height, 0);
+        assert_eq!(r.inputs[0].spent_address_hash, [0xEEu8; 32]);
         assert_eq!(r.fees[0], 4_242, "fee comes from the cached input value");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2717,20 +3148,18 @@ mod tests {
         let dir = tmp_path("cachemiss");
         let db = UtxoStore::open(&dir).unwrap();
         let a = [0xE3u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 100)])
-            .unwrap();
+        apply_test(&db, 0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 100)]);
         let tx1 = [0xE4u8; 32];
-        let r = db
-            .apply_block(
-                1,
-                &[tx_row(1, 0, tx1)],
-                &[inp_row(1, 0, 0, tx1, a, 0, false)],
-                &[],
-            )
-            .unwrap();
+        let r = apply_test(
+            &db,
+            1,
+            &[tx_row(1, 0, tx1)],
+            &[inp_row(1, 0, 0, tx1, a, 0, false)],
+            &[],
+        );
         assert_eq!(r.cache_hits, 0);
         assert_eq!(r.db_lookups, 1, "no cache means the database must be read");
-        assert_eq!(r.spends[0].spent_value_sat, 100);
+        assert_eq!(r.inputs[0].spent_value_sat, 100);
         assert!(db.cache_stats().is_none(), "cache is disabled");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2743,14 +3172,18 @@ mod tests {
         // Budget for ~4 entries; create many more so eviction is forced.
         let db = UtxoStore::open_cached(&dir, 4 * CACHE_ENTRY_COST).unwrap();
         let a = [0xE5u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 999)])
-            .unwrap();
+        apply_test(&db, 0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 999)]);
 
         // 40 more single-output blocks, each evicting older entries.
         for h in 1..41u32 {
             let t = [h as u8; 32];
-            db.apply_block(h, &[tx_row(h, 0, t)], &[], &[out_row(h, 0, 0, t, 1_000)])
-                .unwrap();
+            apply_test(
+                &db,
+                h,
+                &[tx_row(h, 0, t)],
+                &[],
+                &[out_row(h, 0, 0, t, 1_000)],
+            );
         }
         let stats = db.cache_stats().expect("cache enabled");
         assert!(
@@ -2762,17 +3195,16 @@ mod tests {
 
         // A:0 was evicted, so spending it must still work via the database.
         let tx1 = [0xE6u8; 32];
-        let r = db
-            .apply_block(
-                41,
-                &[tx_row(41, 0, tx1)],
-                &[inp_row(41, 0, 0, tx1, a, 0, false)],
-                &[],
-            )
-            .unwrap();
+        let r = apply_test(
+            &db,
+            41,
+            &[tx_row(41, 0, tx1)],
+            &[inp_row(41, 0, 0, tx1, a, 0, false)],
+            &[],
+        );
         assert_eq!(r.missing, 0, "eviction must not lose data");
-        assert_eq!(r.spends[0].spent_value_sat, 999);
-        assert_eq!(r.spends[0].spent_height, 0);
+        assert_eq!(r.inputs[0].spent_value_sat, 999);
+        assert_eq!(r.inputs[0].spent_height, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2785,14 +3217,24 @@ mod tests {
         let db = UtxoStore::open_cached(&dir, 8 << 20).unwrap();
         // Fund A:0 in block 0 (cached).
         let a = [0xE7u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 10_000)])
-            .unwrap();
+        apply_test(
+            &db,
+            0,
+            &[tx_row(0, 0, a)],
+            &[],
+            &[out_row(0, 0, 0, a, 10_000)],
+        );
 
         // Block 1: creates B:0 and spends it same-block (pending), spends A:0
         // (cache), and spends an outpoint that exists only in the database.
         let d = [0xE8u8; 32];
-        db.apply_block(1, &[tx_row(1, 0, d)], &[], &[out_row(1, 0, 0, d, 7_700)])
-            .unwrap();
+        apply_test(
+            &db,
+            1,
+            &[tx_row(1, 0, d)],
+            &[],
+            &[out_row(1, 0, 0, d, 7_700)],
+        );
         // Flush the cache so D:0 and A:0 must come from RocksDB.
         db.cache_clear_for_test();
 
@@ -2812,7 +3254,7 @@ mod tests {
             tx_row(2, 2, tx2),
             tx_row(2, 3, tx3),
         ];
-        let r = db.apply_block(2, &txs, &inputs, &outputs).unwrap();
+        let r = apply_test(&db, 2, &txs, &inputs, &outputs);
         assert_eq!(
             r.pending_hits + r.db_lookups + r.cache_hits,
             3,
@@ -2839,24 +3281,29 @@ mod tests {
 
         // Create and spend, then miss once.
         let a = [0xF1u8; 32];
-        db.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 1_000)])
-            .unwrap();
+        apply_test(
+            &db,
+            0,
+            &[tx_row(0, 0, a)],
+            &[],
+            &[out_row(0, 0, 0, a, 1_000)],
+        );
         let t1 = [0xF2u8; 32];
-        db.apply_block(
+        apply_test(
+            &db,
             1,
             &[tx_row(1, 0, t1)],
             &[inp_row(1, 0, 0, t1, a, 0, false)],
             &[],
-        )
-        .unwrap();
+        );
         let t2 = [0xF3u8; 32];
-        db.apply_block(
+        apply_test(
+            &db,
             2,
             &[tx_row(2, 0, t2)],
             &[inp_row(2, 0, 0, t2, a, 0, false)],
             &[],
-        )
-        .unwrap();
+        );
 
         let stats = db.cache_stats().expect("cache enabled");
         assert_eq!(stats.hits, 1, "first spend hit");
@@ -2892,8 +3339,11 @@ mod tests {
         }
         let tx0 = tx_row(0, 0, txid);
         let tx1 = tx_row(0, 1, [0x5Bu8; 32]);
-        let r = db.apply_block(0, &[tx0, tx1], &inps, &outs).unwrap();
-        assert_eq!(r.spends.len(), N as usize / 2);
+        let r = apply_test(&db, 0, &[tx0, tx1], &inps, &outs);
+        assert_eq!(
+            r.inputs.iter().filter(|i| i.spent_value_sat > 0).count(),
+            N as usize / 2
+        );
 
         let raw = db
             .db
@@ -3286,11 +3736,9 @@ mod tests {
         // Write a 10-byte value (valid values are 45 bytes).
         db.db.put(make_key(&prev_txid, 0), [0u8; 10]).unwrap();
         let inputs = vec![inp_row(0, 0, 0, [0x88u8; 32], prev_txid, 0, false)];
-        let r = db
-            .apply_block(0, &[tx_row(0, 0, [0x88u8; 32])], &inputs, &[])
-            .unwrap();
+        let r = apply_test(&db, 0, &[tx_row(0, 0, [0x88u8; 32])], &inputs, &[]);
         assert_eq!(r.missing, 1);
-        assert!(r.spends.is_empty());
+        assert_eq!(r.inputs[0].spent_value_sat, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3342,13 +3790,13 @@ mod tests {
         let out_hi = out_row(0, 0, 0, tx_high, 10_000);
         let out_lo = out_row(0, 1, 0, tx_low, 20_000);
 
-        db.apply_block(
+        apply_test(
+            &db,
             0,
             &[tx_row(0, 0, tx_high), tx_row(0, 1, tx_low)],
             &[],
             &[out_hi, op_ret, out_lo],
-        )
-        .unwrap();
+        );
 
         // Only the 2 spendable outputs entered `RecentUtxoCache` and RocksDB;
         // the OP_RETURN output was skipped.
@@ -3362,28 +3810,29 @@ mod tests {
         // Block 2 spends `tx_high:0` at input 0 and `tx_low:0` at input 1
         // (unsorted key order!), creating one spendable 25_000-sat output and
         // one 1_000-sat burned OP_RETURN output -> fee must be
-        // (10_000 + 20_000) - (25_000 + 1_000) = 4_000 sat, and `spends` must
+        // (10_000 + 20_000) - (25_000 + 1_000) = 4_000 sat, and `inputs` must
         // preserve `[tx_high, tx_low]` input order despite sorted MultiGet.
         let spend_tx = [0x99u8; 32];
         let mut burn2 = out_row(2, 0, 1, spend_tx, 1_000);
         burn2.script_type = bidx_core::ScriptType::OpReturn as u8;
-        let res = db
-            .apply_block(
-                2,
-                &[tx_row(2, 0, spend_tx)],
-                &[
-                    inp_row(2, 0, 0, spend_tx, tx_high, 0, false),
-                    inp_row(2, 0, 1, spend_tx, tx_low, 0, false),
-                ],
-                &[out_row(2, 0, 0, spend_tx, 25_000), burn2],
-            )
-            .unwrap();
+        let res = apply_test(
+            &db,
+            2,
+            &[tx_row(2, 0, spend_tx)],
+            &[
+                inp_row(2, 0, 0, spend_tx, tx_high, 0, false),
+                inp_row(2, 0, 1, spend_tx, tx_low, 0, false),
+            ],
+            &[out_row(2, 0, 0, spend_tx, 25_000), burn2],
+        );
 
         assert_eq!(res.db_lookups, 2);
         assert_eq!(res.fees, vec![4_000]);
-        assert_eq!(res.spends.len(), 2);
-        assert_eq!(res.spends[0].spent_txid, tx_high);
-        assert_eq!(res.spends[1].spent_txid, tx_low);
+        assert_eq!(res.inputs.len(), 2);
+        assert_eq!(res.inputs[0].prev_txid, tx_high);
+        assert_eq!(res.inputs[0].spent_value_sat, 10_000);
+        assert_eq!(res.inputs[1].prev_txid, tx_low);
+        assert_eq!(res.inputs[1].spent_value_sat, 20_000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3461,13 +3910,13 @@ mod tests {
         let mut msig_out = out_row(0, 1, 1, tx_cold, 20_000);
         msig_out.script_type = bidx_core::ScriptType::BareMultisig as u8;
 
-        db.apply_block(
+        apply_test(
+            &db,
             0,
             &[tx_row(0, 0, tx_hot), tx_row(0, 1, tx_cold)],
             &[],
             &[hot_out, dust_out, msig_out],
-        )
-        .unwrap();
+        );
 
         // Only `tx_hot:0` entered `RecentUtxoCache`, and because the cache is
         // write-back, `tx_hot:0` has NOT been written to RocksDB! Meanwhile
@@ -3480,18 +3929,17 @@ mod tests {
         // Block 1 spends all three: `tx_hot:0` cancels purely in RAM (never
         // touching RocksDB!), while `tx_cold:0` and `tx_cold:1` resolve via DB.
         let spend_tx = [0xC3u8; 32];
-        let r = db
-            .apply_block(
-                1,
-                &[tx_row(1, 0, spend_tx)],
-                &[
-                    inp_row(1, 0, 0, spend_tx, tx_hot, 0, false),
-                    inp_row(1, 0, 1, spend_tx, tx_cold, 0, false),
-                    inp_row(1, 0, 2, spend_tx, tx_cold, 1, false),
-                ],
-                &[out_row(1, 0, 0, spend_tx, 70_000)],
-            )
-            .unwrap();
+        let r = apply_test(
+            &db,
+            1,
+            &[tx_row(1, 0, spend_tx)],
+            &[
+                inp_row(1, 0, 0, spend_tx, tx_hot, 0, false),
+                inp_row(1, 0, 1, spend_tx, tx_cold, 0, false),
+                inp_row(1, 0, 2, spend_tx, tx_cold, 1, false),
+            ],
+            &[out_row(1, 0, 0, spend_tx, 70_000)],
+        );
         assert_eq!(r.cache_hits, 1);
         assert_eq!(r.db_lookups, 2);
         assert_eq!(r.missing, 0);
@@ -3509,20 +3957,24 @@ mod tests {
         let tiny = UtxoStore::open_cached(&dir_tiny, 16).unwrap();
         let t0 = [0x31u8; 32];
         let t1 = [0x32u8; 32];
-        tiny.apply_block(0, &[tx_row(0, 0, t0)], &[], &[out_row(0, 0, 0, t0, 12_345)])
-            .unwrap();
+        apply_test(
+            &tiny,
+            0,
+            &[tx_row(0, 0, t0)],
+            &[],
+            &[out_row(0, 0, 0, t0, 12_345)],
+        );
         assert_eq!(tiny.cache_stats().unwrap().entries, 0);
-        let r = tiny
-            .apply_block(
-                1,
-                &[tx_row(1, 0, t1)],
-                &[inp_row(1, 0, 0, t1, t0, 0, false)],
-                &[],
-            )
-            .unwrap();
+        let r = apply_test(
+            &tiny,
+            1,
+            &[tx_row(1, 0, t1)],
+            &[inp_row(1, 0, 0, t1, t0, 0, false)],
+            &[],
+        );
         assert_eq!(r.db_lookups, 1);
         assert_eq!(r.missing, 0);
-        assert_eq!(r.spends[0].spent_value_sat, 12_345);
+        assert_eq!(r.inputs[0].spent_value_sat, 12_345);
         drop(tiny);
         let _ = std::fs::remove_dir_all(&dir_tiny);
 
@@ -3533,34 +3985,395 @@ mod tests {
         {
             let bulk = UtxoStore::open_cached(&dir_reopen, 8 << 20).unwrap();
             let a = [0x41u8; 32];
-            bulk.apply_block(0, &[tx_row(0, 0, a)], &[], &[out_row(0, 0, 0, a, 25_000)])
-                .unwrap();
+            apply_test(
+                &bulk,
+                0,
+                &[tx_row(0, 0, a)],
+                &[],
+                &[out_row(0, 0, 0, a, 25_000)],
+            );
             assert_eq!(bulk.cache_stats().unwrap().entries, 1);
             // Also verify explicit `flush()` drains the write-back cache cleanly,
             // then add a second cached output to verify `Drop` flushes too.
             bulk.flush().unwrap();
             assert_eq!(bulk.cache_stats().unwrap().entries, 0);
             let b = [0x42u8; 32];
-            bulk.apply_block(1, &[tx_row(1, 0, b)], &[], &[out_row(1, 0, 0, b, 35_000)])
-                .unwrap();
+            apply_test(
+                &bulk,
+                1,
+                &[tx_row(1, 0, b)],
+                &[],
+                &[out_row(1, 0, 0, b, 35_000)],
+            );
             assert_eq!(bulk.cache_stats().unwrap().entries, 1);
         }
         let live = UtxoStore::open_live(&dir_reopen).unwrap();
         let spend_tx = [0x43u8; 32];
-        let r = live
-            .apply_block(
-                2,
-                &[tx_row(2, 0, spend_tx)],
-                &[
-                    inp_row(2, 0, 0, spend_tx, [0x41u8; 32], 0, false),
-                    inp_row(2, 0, 1, spend_tx, [0x42u8; 32], 0, false),
-                ],
-                &[out_row(2, 0, 0, spend_tx, 59_000)],
-            )
-            .unwrap();
+        let r = apply_test(
+            &live,
+            2,
+            &[tx_row(2, 0, spend_tx)],
+            &[
+                inp_row(2, 0, 0, spend_tx, [0x41u8; 32], 0, false),
+                inp_row(2, 0, 1, spend_tx, [0x42u8; 32], 0, false),
+            ],
+            &[out_row(2, 0, 0, spend_tx, 59_000)],
+        );
         assert_eq!(r.missing, 0);
         assert_eq!(r.fees, vec![1_000]);
         live.disconnect_block(2).unwrap();
         let _ = std::fs::remove_dir_all(&dir_reopen);
+    }
+
+    #[test]
+    fn apply_window_in_place_and_live_utxo_iterator_match_sequential_apply() {
+        let dir_win = tmp_path("win_apply");
+        let dir_seq = tmp_path("seq_apply");
+        let win_db = UtxoStore::open_cached(&dir_win, 4 << 20).unwrap();
+        let seq_db = UtxoStore::open_cached(&dir_seq, 4 << 20).unwrap();
+
+        // Empty window is a clean no-op.
+        assert_eq!(
+            win_db.apply_window_in_place(&mut []).unwrap(),
+            WindowStats::default()
+        );
+
+        // Seed height 0 into both stores, then flush to RocksDB so height 2's
+        // spend exercises `window_misses` + duplicate/corrupt/missing branches.
+        let t_seed = [0x60u8; 32];
+        let t_cold = [0x61u8; 32];
+        for db in [&win_db, &seq_db] {
+            apply_test(
+                db,
+                0,
+                &[tx_row(0, 0, t_seed), tx_row(0, 1, t_cold)],
+                &[inp_row(0, 0, 0, t_seed, [0u8; 32], 0xFFFF_FFFF, true)],
+                &[
+                    out_row(0, 0, 0, t_seed, 90_000),
+                    // Dust <= 546 sat exercises the `should_cache_utxo == false`
+                    // direct-to-RocksDB path when surviving `pending`.
+                    out_row(0, 1, 0, t_cold, 500),
+                ],
+            );
+            db.flush().unwrap();
+            // Corrupt key + odd-length key in CF_UTXO exercise decode=None and
+            // k.len() != 36 guards in `apply_window_in_place` and `for_each_live_utxo`.
+            db.db.put(make_key(&[0x6Fu8; 32], 0), [0u8; 8]).unwrap();
+            db.db.put(b"short_key", [1u8; 4]).unwrap();
+        }
+
+        // Build a 3-block window (heights 1, 2, 3):
+        // - Height 1 creates `t1` (spent in height 2 -> cross-block `pending` hit!)
+        //   and `t1_keep` (survives in write-back cache) + `t1_opret` (OP_RETURN)
+        //   + `t1_dust` (cold bypass).
+        // - Height 2 spends `t1` (cross-block pending hit), `t_seed` (DB hit),
+        //   corrupt `[0x6F; 32]` (missing), absent `[0x7F; 32]` (missing).
+        // - Height 3 attempts to double-spend `t_seed` in the same window (must
+        //   count as missing!) and creates `t3_keep`.
+        let t1_cb = [0x62u8; 32];
+        let t1 = [0x63u8; 32];
+        let t2_cb = [0x64u8; 32];
+        let t2 = [0x65u8; 32];
+        let t3_cb = [0x66u8; 32];
+        let t3 = [0x67u8; 32];
+
+        let mut opret = out_row(1, 1, 2, t1, 0);
+        opret.script_type = bidx_core::ScriptType::OpReturn as u8;
+
+        // Also include an output with out-of-range tx_index (`u16::MAX`) to exercise
+        // the defensive `txs.get(...) == None` guard in both `apply_window_in_place`
+        // and `apply_block_in_place`, plus an input with `tx_index = u16::MAX` to
+        // exercise `txs.get_mut(...) == None` in `enrich_input_in_place` and
+        // `finalize_block_fees`.
+        let mut orphan_out = out_row(1, 0, 9, t1, 100);
+        orphan_out.tx_index = u16::MAX;
+        let mut orphan_inp = inp_row(2, 1, 4, t2, t_cold, 0, false);
+        orphan_inp.tx_index = u16::MAX;
+
+        let make_blocks = || {
+            (
+                (
+                    bidx_core::BlockRow {
+                        height: 1,
+                        ..Default::default()
+                    },
+                    vec![tx_row(1, 0, t1_cb), tx_row(1, 1, t1)],
+                    vec![inp_row(1, 0, 0, t1_cb, [0u8; 32], 0xFFFF_FFFF, true)],
+                    vec![
+                        out_row(1, 0, 0, t1_cb, 50_000),
+                        out_row(1, 1, 0, t1, 40_000),
+                        out_row(1, 1, 1, t1, 500),
+                        opret.clone(),
+                        orphan_out.clone(),
+                    ],
+                ),
+                (
+                    bidx_core::BlockRow {
+                        height: 2,
+                        ..Default::default()
+                    },
+                    vec![tx_row(2, 0, t2_cb), tx_row(2, 1, t2)],
+                    vec![
+                        inp_row(2, 0, 0, t2_cb, [0u8; 32], 0xFFFF_FFFF, true),
+                        inp_row(2, 1, 0, t2, t1, 0, false),
+                        inp_row(2, 1, 1, t2, t_seed, 0, false),
+                        inp_row(2, 1, 2, t2, [0x6Fu8; 32], 0, false),
+                        inp_row(2, 1, 3, t2, [0x7Fu8; 32], 0, false),
+                        orphan_inp.clone(),
+                    ],
+                    vec![
+                        out_row(2, 0, 0, t2_cb, 50_000),
+                        out_row(2, 1, 0, t2, 120_000),
+                    ],
+                ),
+                (
+                    bidx_core::BlockRow {
+                        height: 3,
+                        ..Default::default()
+                    },
+                    vec![tx_row(3, 0, t3_cb), tx_row(3, 1, t3)],
+                    vec![
+                        inp_row(3, 0, 0, t3_cb, [0u8; 32], 0xFFFF_FFFF, true),
+                        inp_row(3, 1, 0, t3, t_seed, 0, false),
+                    ],
+                    vec![out_row(3, 0, 0, t3_cb, 50_000)],
+                ),
+            )
+        };
+
+        let (mut w1, mut w2, mut w3) = make_blocks();
+        let w_stats = {
+            let mut win = [
+                WindowBlock {
+                    height: 1,
+                    block_row: &mut w1.0,
+                    txs: &mut w1.1,
+                    inputs: &mut w1.2,
+                    outputs: &w1.3,
+                },
+                WindowBlock {
+                    height: 2,
+                    block_row: &mut w2.0,
+                    txs: &mut w2.1,
+                    inputs: &mut w2.2,
+                    outputs: &w2.3,
+                },
+                WindowBlock {
+                    height: 3,
+                    block_row: &mut w3.0,
+                    txs: &mut w3.1,
+                    inputs: &mut w3.2,
+                    outputs: &w3.3,
+                },
+            ];
+            win_db.apply_window_in_place(&mut win).unwrap()
+        };
+        // `t1:0` cancelled in `pending` across blocks 1 -> 2!
+        assert_eq!(w_stats.pending_hits, 1);
+        assert_eq!(w_stats.missing, 3);
+        assert_eq!(w2.0.total_fee, 10_000);
+        assert_eq!(w2.1[0].fee, 0);
+        assert_eq!(w2.1[1].fee, 10_000);
+        assert_eq!(w2.2[1].spent_value_sat, 40_000);
+        assert_eq!(w2.2[2].spent_value_sat, 90_000);
+
+        // Compare against 1-by-1 `apply_window_in_place` (single-block path) on `seq_db`,
+        // and verify cache hit on a subsequent single-block window.
+        let (mut s1, mut s2, mut s3) = make_blocks();
+        for (h, blk) in [(1u32, &mut s1), (2, &mut s2), (3, &mut s3)] {
+            let mut single = [WindowBlock {
+                height: h,
+                block_row: &mut blk.0,
+                txs: &mut blk.1,
+                inputs: &mut blk.2,
+                outputs: &blk.3,
+            }];
+            seq_db.apply_window_in_place(&mut single).unwrap();
+        }
+        assert_eq!(w2.0.total_fee, s2.0.total_fee);
+        assert_eq!(w2.2, s2.2);
+
+        // Spend `t2:0` (resident in `RecentUtxoCache`) in a 2-block window AND
+        // on a no-cache store to cover both `cache_hits` and `self.recent == None`.
+        let t4 = [0x68u8; 32];
+        let t5 = [0x69u8; 32];
+        let mut b4 = (
+            bidx_core::BlockRow {
+                height: 4,
+                ..Default::default()
+            },
+            vec![tx_row(4, 0, t4)],
+            vec![inp_row(4, 0, 0, t4, t2, 0, false)],
+            vec![out_row(4, 0, 0, t4, 115_000)],
+        );
+        let mut b5 = (
+            bidx_core::BlockRow {
+                height: 5,
+                ..Default::default()
+            },
+            vec![tx_row(5, 0, t5)],
+            vec![],
+            vec![out_row(5, 0, 0, t5, 10_000)],
+        );
+        let s45 = win_db
+            .apply_window_in_place(&mut [
+                WindowBlock {
+                    height: 4,
+                    block_row: &mut b4.0,
+                    txs: &mut b4.1,
+                    inputs: &mut b4.2,
+                    outputs: &b4.3,
+                },
+                WindowBlock {
+                    height: 5,
+                    block_row: &mut b5.0,
+                    txs: &mut b5.1,
+                    inputs: &mut b5.2,
+                    outputs: &b5.3,
+                },
+            ])
+            .unwrap();
+        assert_eq!(s45.cache_hits, 1);
+
+        // `for_each_live_utxo` drains `RecentUtxoCache` and yields every live entry.
+        let mut exported = Vec::new();
+        let n = win_db
+            .for_each_live_utxo::<UtxoError, _>(|txid, vout, val| {
+                exported.push((*txid, vout, val.value_sat));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(n as usize, exported.len());
+        assert!(exported
+            .iter()
+            .any(|(t, v, s)| *t == t4 && *v == 0 && *s == 115_000));
+
+        // Also exercise `apply_window_in_place` on an uncached (`self.recent == None`)
+        // store and an `undo_enabled` live store (including same-block spend +
+        // DB-corrupt value in `apply_block_in_place`).
+        let dir_nocache = tmp_path("win_nocache");
+        let nocache = UtxoStore::open(&dir_nocache).unwrap();
+        let mut nc0 = (
+            bidx_core::BlockRow::default(),
+            vec![tx_row(0, 0, t4)],
+            vec![],
+            vec![out_row(0, 0, 0, t4, 1_000)],
+        );
+        let mut nc1 = (
+            bidx_core::BlockRow::default(),
+            vec![tx_row(1, 0, t5)],
+            vec![],
+            vec![out_row(1, 0, 0, t5, 2_000)],
+        );
+        nocache
+            .apply_window_in_place(&mut [
+                WindowBlock {
+                    height: 0,
+                    block_row: &mut nc0.0,
+                    txs: &mut nc0.1,
+                    inputs: &mut nc0.2,
+                    outputs: &nc0.3,
+                },
+                WindowBlock {
+                    height: 1,
+                    block_row: &mut nc1.0,
+                    txs: &mut nc1.1,
+                    inputs: &mut nc1.2,
+                    outputs: &nc1.3,
+                },
+            ])
+            .unwrap();
+
+        let dir_live = tmp_path("win_live");
+        let live_s = UtxoStore::open_live(&dir_live).unwrap();
+        live_s.db.put(make_key(&[0x99u8; 32], 0), [0u8; 6]).unwrap();
+        live_s
+            .db
+            .put(
+                make_key(&[0x98u8; 32], 0),
+                UtxoValue {
+                    value_sat: 9_000,
+                    script_type: 2,
+                    height: 0,
+                    address_hash: [1u8; 32],
+                }
+                .encode(),
+            )
+            .unwrap();
+        let mut l0 = (
+            bidx_core::BlockRow {
+                height: 1,
+                ..Default::default()
+            },
+            vec![tx_row(1, 0, t4), tx_row(1, 1, t5)],
+            vec![
+                inp_row(1, 1, 0, t5, t4, 0, false),
+                inp_row(1, 1, 1, t5, [0x99u8; 32], 0, false),
+                inp_row(1, 1, 2, t5, [0x97u8; 32], 0, false),
+                inp_row(1, 1, 3, t5, [0x98u8; 32], 0, false),
+            ],
+            vec![
+                out_row(1, 0, 0, t4, 5_000),
+                {
+                    let mut o = out_row(1, 0, 1, t4, 0);
+                    o.script_type = bidx_core::ScriptType::OpReturn as u8;
+                    o
+                },
+                out_row(1, 1, 0, t5, 13_000),
+            ],
+        );
+        let ls = live_s
+            .apply_window_in_place(&mut [WindowBlock {
+                height: 1,
+                block_row: &mut l0.0,
+                txs: &mut l0.1,
+                inputs: &mut l0.2,
+                outputs: &l0.3,
+            }])
+            .unwrap();
+        assert_eq!(ls.pending_hits, 1);
+        assert_eq!(ls.missing, 2);
+        live_s.disconnect_block(1).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir_win);
+        let _ = std::fs::remove_dir_all(&dir_seq);
+        let _ = std::fs::remove_dir_all(&dir_nocache);
+        let _ = std::fs::remove_dir_all(&dir_live);
+
+        // Exercise write-back FIFO eviction AND cache-bypass inside `apply_window_in_place`
+        // using a tiny 1-slot cache (one dust output bypasses the cache directly to `batch.put`,
+        // and two standard outputs exceed the 1-slot capacity).
+        let dir_evict = tmp_path("win_evict");
+        let tiny = UtxoStore::open_cached(&dir_evict, CACHE_ENTRY_COST).unwrap();
+        let mut p2wpkh0 = out_row(0, 0, 0, t4, 50_000);
+        p2wpkh0.script_type = bidx_core::ScriptType::P2WPKH as u8;
+        let mut p2wpkh1 = out_row(0, 0, 1, t4, 60_000);
+        p2wpkh1.script_type = bidx_core::ScriptType::P2WPKH as u8;
+        let mut dust_out = out_row(0, 0, 2, t4, 100);
+        dust_out.script_type = bidx_core::ScriptType::P2WPKH as u8;
+        let mut eb0_tx = tx_row(0, 0, t4);
+        eb0_tx.output_count = 3;
+        let mut eb0 = (
+            bidx_core::BlockRow::default(),
+            vec![eb0_tx],
+            vec![],
+            vec![p2wpkh0, p2wpkh1, dust_out],
+        );
+        tiny.apply_window_in_place(&mut [WindowBlock {
+            height: 0,
+            block_row: &mut eb0.0,
+            txs: &mut eb0.1,
+            inputs: &mut eb0.2,
+            outputs: &eb0.3,
+        }])
+        .unwrap();
+        assert_eq!(tiny.cache_stats().unwrap().entries, 1);
+        // The evicted output AND the cache-bypassed dust output were written to RocksDB.
+        assert!(
+            tiny.db.get_pinned(make_key(&t4, 0)).unwrap().is_some()
+                || tiny.db.get_pinned(make_key(&t4, 1)).unwrap().is_some()
+        );
+        assert!(tiny.db.get_pinned(make_key(&t4, 2)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir_evict);
     }
 }
